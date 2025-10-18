@@ -7,6 +7,11 @@
     "icon": "./assets/images/icon.png",
     "scheme": "projectgrace",
     "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/images/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0a7ea4"
+    },
     "newArchEnabled": true,
     "ios": {
       "supportsTablet": true
