@@ -1,7 +1,7 @@
 import { useAuth } from '@/context/AuthContext';
 import { auth, db } from '@/firebaseConfig';
 import { Image as ExpoImage } from 'expo-image';
-import { Redirect } from 'expo-router';
+import { Redirect, router } from 'expo-router';
 import { createUserWithEmailAndPassword } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
 import React, { useState } from 'react';
@@ -27,7 +27,9 @@ export default function SignupScreen() {
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
+  const [loading, setLoading] = useState(false);
 
+  // ✅ Redirect logged-in users directly to home
   if (user) {
     return <Redirect href="/(tabs)" />;
   }
@@ -38,9 +40,14 @@ export default function SignupScreen() {
       return;
     }
 
+    setLoading(true);
+
     try {
+      // Create user in Firebase Auth
       const userCred = await createUserWithEmailAndPassword(auth, email, password);
       const uid = userCred.user.uid;
+
+      // Save team data in Firestore under users/<uid>
       await setDoc(doc(db, 'users', uid), {
         uid,
         name,
@@ -49,13 +56,22 @@ export default function SignupScreen() {
         email,
         homeColor,
         awayColor,
+        createdAt: new Date(),
       });
+
       alert('Team registered successfully!');
+
+      // Redirect immediately to the home screen
+      router.replace('/(tabs)');
     } catch (e: any) {
       alert('Signup failed: ' + e.message);
+      console.error(e);
+    } finally {
+      setLoading(false);
     }
   };
 
+  // Small jersey preview component
   const Jersey = ({ color, label }: { color: string; label: string }) => (
     <View style={styles.jerseyCard}>
       <View style={styles.jerseyBox}>
@@ -77,6 +93,7 @@ export default function SignupScreen() {
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
+      {/* RHGS logo */}
       <ExpoImage
         source={require('@/assets/images/splash.png')}
         style={styles.logo}
@@ -85,6 +102,7 @@ export default function SignupScreen() {
 
       <Text style={styles.title}>Register Your Team</Text>
 
+      {/* Input fields */}
       <TextInput
         style={styles.input}
         placeholder="Your Name"
@@ -119,6 +137,7 @@ export default function SignupScreen() {
         onChangeText={setPassword}
       />
 
+      {/* Colour selection */}
       <View style={styles.kitSection}>
         <Text style={styles.subtitle}>Team Colours</Text>
         <View style={styles.kitRow}>
@@ -132,6 +151,7 @@ export default function SignupScreen() {
         </View>
       </View>
 
+      {/* Colour picker modal */}
       <Modal visible={!!activePicker} animationType="slide">
         <View style={styles.modalContainer}>
           <Text style={styles.modalTitle}>
@@ -157,7 +177,12 @@ export default function SignupScreen() {
         </View>
       </Modal>
 
-      <Button title="Create Account" onPress={handleSignup} />
+      {/* Submit button */}
+      <Button
+        title={loading ? 'Creating Account...' : 'Create Account'}
+        onPress={handleSignup}
+        disabled={loading}
+      />
     </ScrollView>
   );
 }
@@ -165,7 +190,13 @@ export default function SignupScreen() {
 const styles = StyleSheet.create({
   container: { flexGrow: 1, justifyContent: 'center', padding: 20, backgroundColor: '#fff' },
   logo: { width: 200, height: 100, alignSelf: 'center', marginBottom: 10 },
-  title: { fontSize: 26, fontWeight: 'bold', textAlign: 'center', marginBottom: 20, color: '#0a7ea4' },
+  title: {
+    fontSize: 26,
+    fontWeight: 'bold',
+    textAlign: 'center',
+    marginBottom: 20,
+    color: '#0a7ea4',
+  },
   input: {
     borderWidth: 1,
     borderColor: '#ccc',
@@ -174,7 +205,13 @@ const styles = StyleSheet.create({
     borderRadius: 6,
   },
   kitSection: { marginVertical: 20 },
-  subtitle: { fontSize: 18, fontWeight: '600', marginBottom: 10, color: '#333', textAlign: 'center' },
+  subtitle: {
+    fontSize: 18,
+    fontWeight: '600',
+    marginBottom: 10,
+    color: '#333',
+    textAlign: 'center',
+  },
   kitRow: { flexDirection: 'row', justifyContent: 'space-around' },
   jerseyCard: { alignItems: 'center' },
   jerseyBox: { width: 110, height: 110, position: 'relative' },

@@ -1,8 +1,9 @@
-// src/firebaseConfig.ts
+// firebaseConfig.ts
 import { getApp, getApps, initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import { getAuth, initializeAuth } from 'firebase/auth';
+import { getFirestore, initializeFirestore } from 'firebase/firestore';
 
+// --- Your Firebase Web config ---
 const firebaseConfig = {
   apiKey: "AIzaSyC0ZosmSPU1_KTd-eSAlZdCN2S_oSYQ3-Q",
   authDomain: "project-grace-475412.firebaseapp.com",
@@ -12,8 +13,24 @@ const firebaseConfig = {
   appId: "1:646265469239:android:b0fa646716cd912deb02b2",
 };
 
-// ✅ initialize once only
+// ✅ Initialize only once
 const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
-export const auth = getAuth(app);
-export const db = getFirestore(app);
+// ✅ Use initializeAuth ONLY if not yet initialized
+let auth;
+try {
+  auth = initializeAuth(app, { persistence: 'none' as any }); // 👈 force in-memory mode
+} catch (e) {
+  auth = getAuth(app);
+}
+
+// ✅ Firestore (Expo-safe)
+let db;
+try {
+  db = initializeFirestore(app, { experimentalForceLongPolling: true });
+} catch (e) {
+  db = getFirestore(app);
+}
+
+export { app, auth, db };
+
