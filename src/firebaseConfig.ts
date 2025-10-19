@@ -1,9 +1,12 @@
-// firebaseConfig.ts
-import { getApp, getApps, initializeApp } from 'firebase/app';
-import { getAuth, initializeAuth } from 'firebase/auth';
-import { getFirestore, initializeFirestore } from 'firebase/firestore';
+// src/firebaseConfig.ts
+import { initializeApp } from 'firebase/app';
+import {
+  browserLocalPersistence,
+  initializeAuth
+} from 'firebase/auth';
+import { getFirestore } from 'firebase/firestore';
 
-// --- Your Firebase Web config ---
+// ✅ Your Firebase configuration (replace with your real keys)
 const firebaseConfig = {
   apiKey: "AIzaSyC0ZosmSPU1_KTd-eSAlZdCN2S_oSYQ3-Q",
   authDomain: "project-grace-475412.firebaseapp.com",
@@ -13,24 +16,18 @@ const firebaseConfig = {
   appId: "1:646265469239:android:b0fa646716cd912deb02b2",
 };
 
-// ✅ Initialize only once
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
+// ✅ Initialize Firebase
+const app = initializeApp(firebaseConfig);
 
-// ✅ Use initializeAuth ONLY if not yet initialized
-let auth;
-try {
-  auth = initializeAuth(app, { persistence: 'none' as any }); // 👈 force in-memory mode
-} catch (e) {
-  auth = getAuth(app);
-}
+// ✅ Initialize Auth
+// For Expo, we use browserLocalPersistence — works on Web, iOS, and Android in Expo Go.
+const auth = initializeAuth(app, {
+  persistence: browserLocalPersistence,
+});
 
-// ✅ Firestore (Expo-safe)
-let db;
-try {
-  db = initializeFirestore(app, { experimentalForceLongPolling: true });
-} catch (e) {
-  db = getFirestore(app);
-}
+// ✅ Initialize Firestore
+const db = getFirestore(app);
 
+// ✅ Export properly typed instances
 export { app, auth, db };
 
