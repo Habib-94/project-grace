@@ -3,7 +3,6 @@ import { useRouter } from 'expo-router';
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import React, { useState } from 'react';
 import {
-  Button,
   Image,
   KeyboardAvoidingView,
   Platform,
@@ -11,20 +10,43 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  View,
+  TouchableOpacity
 } from 'react-native';
+import Toast from 'react-native-toast-message';
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
   const router = useRouter();
 
   const handleLogin = async () => {
+    if (!email || !password) {
+      Toast.show({
+        type: 'error',
+        text1: 'Missing fields',
+        text2: 'Please enter both email and password.',
+      });
+      return;
+    }
+
     try {
+      setLoading(true);
       await signInWithEmailAndPassword(auth, email, password);
-      // AuthContext handles routing automatically
-    } catch (e: any) {
-      alert('Login failed: ' + e.message);
+      Toast.show({
+        type: 'success',
+        text1: 'Welcome back!',
+      });
+      router.replace('/(tabs)');
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      Toast.show({
+        type: 'error',
+        text1: 'Login failed',
+        text2: message,
+      });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -34,25 +56,23 @@ export default function LoginScreen() {
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
     >
       <ScrollView contentContainerStyle={styles.container}>
-        {/* ✅ RHGS Splash logo */}
         <Image
           source={require('@/assets/images/splash.png')}
           style={styles.logo}
           resizeMode="contain"
         />
 
-        {/* Title */}
         <Text style={styles.title}>Team Login</Text>
 
-        {/* Login form */}
         <TextInput
           style={styles.input}
           placeholder="Email"
           value={email}
           onChangeText={setEmail}
-          autoCapitalize="none"
           keyboardType="email-address"
+          autoCapitalize="none"
         />
+
         <TextInput
           style={styles.input}
           placeholder="Password"
@@ -61,12 +81,22 @@ export default function LoginScreen() {
           secureTextEntry
         />
 
-        <View style={styles.buttonContainer}>
-          <Button title="Login" onPress={handleLogin} />
-        </View>
-        <View style={styles.buttonContainer}>
-          <Button title="Sign up" onPress={() => router.push('/(auth)/SignupScreen')} />
-        </View>
+        <TouchableOpacity
+          style={[styles.button, loading && styles.buttonDisabled]}
+          onPress={handleLogin}
+          disabled={loading}
+        >
+          <Text style={styles.buttonText}>
+            {loading ? 'Logging in…' : 'Login'}
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.button, styles.secondaryButton]}
+          onPress={() => router.push('/(auth)/SignupScreen')}
+        >
+          <Text style={styles.buttonText}>Sign Up</Text>
+        </TouchableOpacity>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -99,8 +129,23 @@ const styles = StyleSheet.create({
     padding: 12,
     marginBottom: 10,
   },
-  buttonContainer: {
+  button: {
     width: '100%',
-    marginTop: 5,
+    backgroundColor: '#0a7ea4',
+    paddingVertical: 14,
+    borderRadius: 8,
+    marginTop: 10,
+    alignItems: 'center',
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
+  secondaryButton: {
+    backgroundColor: '#444',
+  },
+  buttonText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 16,
   },
 });

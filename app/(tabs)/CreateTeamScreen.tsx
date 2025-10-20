@@ -1,221 +1,221 @@
-import { auth, db } from '@/firebaseConfig';
+// app/(tabs)/CreateTeamScreen.tsx
+import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
-import { addDoc, collection, doc, getDocs, query, updateDoc, where } from 'firebase/firestore';
-import React, { useState } from 'react';
+import { useRouter } from 'expo-router';
 import {
-    Alert,
-    Button,
-    KeyboardAvoidingView,
-    Modal,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  addDoc,
+  collection,
+  doc,
+  getDocs,
+  query,
+  updateDoc,
+  where,
+} from 'firebase/firestore';
+import React, { useRef, useState } from 'react';
+import {
+  Button,
+  Modal,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
 import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
+import MapView, { Marker } from 'react-native-maps';
+import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
-const GOOGLE_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey;
+const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey;
 
 export default function CreateTeamScreen() {
+  const router = useRouter();
   const [teamName, setTeamName] = useState('');
-  const [rink, setRink] = useState<any>(null);
+  const [location, setLocation] = useState('');
+  const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
   const [loading, setLoading] = useState(false);
+  const autocompleteRef = useRef<any>(null);
 
-  // ✅ Check if team already exists
-  const checkTeamExists = async (name: string) => {
-    const q = query(collection(db, 'teams'), where('teamName', '==', name));
-    const snapshot = await getDocs(q);
-    return !snapshot.empty;
-  };
+  const user = auth.currentUser;
 
-  // ✅ Create team and assign to user
   const handleCreateTeam = async () => {
-    if (!teamName || !rink) {
-      Alert.alert('Missing Information', 'Please enter a team name and select a rink.');
+    if (!user) return;
+    if (!teamName.trim() || !location.trim()) {
+      Toast.show({
+        type: 'error',
+        text1: 'Missing fields',
+        text2: 'Please enter a team name and select a location.',
+      });
       return;
     }
 
     setLoading(true);
+
     try {
-      const exists = await checkTeamExists(teamName.trim());
-      if (exists) {
-        Alert.alert('Duplicate Team', 'A team with this name already exists.');
+      await ensureFirestoreOnline();
+
+      // ✅ Check for existing team name
+      const teamQuery = query(collection(db, 'teams'), where('teamName', '==', teamName.trim()));
+      const existingTeams = await getDocs(teamQuery);
+
+      if (!existingTeams.empty) {
         setLoading(false);
+        Toast.show({
+          type: 'error',
+          text1: 'Team name taken',
+          text2: 'Please choose a different name.',
+        });
         return;
       }
 
-      const user = auth.currentUser;
-      if (!user) {
-        Alert.alert('Not Logged In', 'You must be logged in to create a team.');
-        setLoading(false);
-        return;
-      }
-
-      const teamData = {
+      // ✅ Create team in Firestore
+      const teamRef = await addDoc(collection(db, 'teams'), {
         teamName: teamName.trim(),
-        rink,
+        location,
+        latitude: coords?.lat || null,
+        longitude: coords?.lng || null,
         homeColor,
         awayColor,
-        coordinatorUid: user.uid,
-        coordinatorEmail: user.email,
-        createdAt: new Date(),
-      };
+        createdBy: user.uid,
+        createdAt: new Date().toISOString(),
+      });
 
-      // ✅ Create team document
-      const teamRef = await addDoc(collection(db, 'teams'), teamData);
-
-      // ✅ Update user with teamId and role
+      // ✅ Update user record
       const userRef = doc(db, 'users', user.uid);
       await updateDoc(userRef, {
         teamId: teamRef.id,
-        role: 'coordinator',
+        isCoordinator: true,
       });
 
-      Alert.alert('Success', 'Team created successfully and assigned to your account.');
-      setTeamName('');
-      setRink(null);
-      setHomeColor('#0a7ea4');
-      setAwayColor('#ffffff');
-    } catch (error: any) {
-      console.error('Error creating team:', error);
-      Alert.alert('Error', 'Failed to create team: ' + error.message);
+      Toast.show({
+        type: 'success',
+        text1: 'Team Created!',
+        text2: 'You are now the coordinator.',
+      });
+
+      router.replace('/(tabs)/CoordinatorDashboardScreen');
+    } catch (e: any) {
+      console.error('❌ Error creating team:', e);
+      Toast.show({
+        type: 'error',
+        text1: 'Error creating team',
+        text2: e.message || 'Something went wrong.',
+      });
     } finally {
       setLoading(false);
     }
   };
 
   const Jersey = ({ color, label }: { color: string; label: string }) => (
-    <View style={styles.jerseyCard}>
-      <View style={styles.jerseyBox}>
-        <ExpoImage
-          source={require('@/assets/images/jersey_fill.png')}
-          style={[styles.jerseyImg, { tintColor: color }]}
-          contentFit="contain"
-        />
-        <ExpoImage
-          source={require('@/assets/images/jersey_outline.png')}
-          style={styles.jerseyImg}
-          contentFit="contain"
-        />
+    <TouchableOpacity onPress={() => setActivePicker(label.toLowerCase() as 'home' | 'away')}>
+      <View style={styles.jerseyCard}>
+        <View style={styles.jerseyBox}>
+          <ExpoImage
+            source={require('@/assets/images/jersey_fill.png')}
+            style={[styles.jerseyImg, { tintColor: color }]}
+            contentFit="contain"
+          />
+          <ExpoImage
+            source={require('@/assets/images/jersey_outline.png')}
+            style={styles.jerseyImg}
+            contentFit="contain"
+          />
+        </View>
+        <Text style={styles.jerseyLabel}>{label}</Text>
       </View>
-      <Text style={styles.jerseyLabel}>{label}</Text>
-    </View>
+    </TouchableOpacity>
   );
 
   return (
-    <KeyboardAvoidingView
-      style={{ flex: 1 }}
-      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-    >
-      <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>Create a New Team</Text>
+    <ScrollView contentContainerStyle={styles.container}>
+      <Text style={styles.title}>Create a New Team</Text>
 
-        <TextInput
-          style={styles.input}
-          placeholder="Team Name"
-          value={teamName}
-          onChangeText={setTeamName}
-        />
+      <TextInput
+        style={styles.input}
+        placeholder="Team Name"
+        value={teamName}
+        onChangeText={setTeamName}
+      />
 
-        <Text style={styles.subtitle}>Select Home Ice Rink</Text>
-        <GooglePlacesAutocomplete
-          placeholder="Search Ice Rink"
-          fetchDetails={true}
-          onPress={(data, details = null) => {
-            setRink({
-              name: data.structured_formatting.main_text,
-              address: details?.formatted_address,
-              lat: details?.geometry.location.lat,
-              lng: details?.geometry.location.lng,
-              placeId: data.place_id,
-            });
+      <GooglePlacesAutocomplete
+        ref={autocompleteRef}
+        placeholder="Search rink or arena..."
+        fetchDetails
+        onPress={(data, details = null) => {
+          const lat = details?.geometry?.location?.lat;
+          const lng = details?.geometry?.location?.lng;
+          setLocation(data.description);
+          setCoords({ lat, lng });
+        }}
+        query={{ key: GOOGLE_MAPS_API_KEY, language: 'en', types: 'establishment' }}
+        styles={{
+          textInput: styles.input,
+          container: { marginBottom: 10 },
+        }}
+      />
+
+      {coords && (
+        <MapView
+          style={styles.map}
+          region={{
+            latitude: coords.lat,
+            longitude: coords.lng,
+            latitudeDelta: 0.01,
+            longitudeDelta: 0.01,
           }}
-          query={{
-            key: GOOGLE_API_KEY,
-            language: 'en',
-            types: 'establishment',
-          }}
-          styles={{
-            textInput: styles.input,
-            listView: { backgroundColor: 'white' },
-          }}
-        />
+        >
+          <Marker coordinate={{ latitude: coords.lat, longitude: coords.lng }} title={location} />
+        </MapView>
+      )}
 
-        {rink && (
-          <View style={styles.rinkPreview}>
-            <Text style={styles.rinkText}>🏒 {rink.name}</Text>
-            <Text style={styles.rinkAddress}>{rink.address}</Text>
-          </View>
-        )}
+      <View style={styles.kitRow}>
+        <Jersey color={homeColor} label="Home" />
+        <Jersey color={awayColor} label="Away" />
+      </View>
 
-        <Text style={styles.subtitle}>Team Colours</Text>
-        <View style={styles.kitRow}>
-          <TouchableOpacity onPress={() => setActivePicker('home')}>
-            <Jersey color={homeColor} label="Home" />
-          </TouchableOpacity>
-
-          <TouchableOpacity onPress={() => setActivePicker('away')}>
-            <Jersey color={awayColor} label="Away" />
-          </TouchableOpacity>
+      <Modal visible={!!activePicker} animationType="slide">
+        <View style={styles.modalContainer}>
+          <Text style={styles.modalTitle}>
+            Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
+          </Text>
+          <ColorPicker
+            color={activePicker === 'home' ? homeColor : awayColor}
+            onColorChangeComplete={(color: string) => {
+              if (activePicker === 'home') setHomeColor(color);
+              else setAwayColor(color);
+            }}
+            thumbSize={30}
+            sliderSize={30}
+            noSnap
+            row={false}
+            swatches
+          />
+          <Button title="Done" onPress={() => setActivePicker(null)} />
         </View>
+      </Modal>
 
-        <Modal visible={!!activePicker} animationType="slide">
-          <View style={styles.modalContainer}>
-            <Text style={styles.modalTitle}>
-              Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
-            </Text>
-
-            <ColorPicker
-              color={activePicker === 'home' ? homeColor : awayColor}
-              onColorChangeComplete={(color: string) => {
-                if (activePicker === 'home') setHomeColor(color);
-                else if (activePicker === 'away') setAwayColor(color);
-              }}
-              thumbSize={30}
-              sliderSize={30}
-              noSnap
-              row={false}
-              swatches
-            />
-
-            <View style={styles.modalButtons}>
-              <Button title="Done" onPress={() => setActivePicker(null)} />
-            </View>
-          </View>
-        </Modal>
-
+      <View style={{ marginTop: 20 }}>
         <Button
           title={loading ? 'Creating...' : 'Create Team'}
           onPress={handleCreateTeam}
           disabled={loading}
+          color="#0a7ea4"
         />
-      </ScrollView>
-    </KeyboardAvoidingView>
+      </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flexGrow: 1, justifyContent: 'center', padding: 20, backgroundColor: '#fff' },
+  container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
   title: { fontSize: 26, fontWeight: 'bold', color: '#0a7ea4', textAlign: 'center', marginBottom: 20 },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    padding: 10,
-    marginBottom: 10,
-    borderRadius: 6,
-  },
-  subtitle: { fontSize: 18, fontWeight: '600', marginTop: 20, marginBottom: 10, textAlign: 'center' },
-  rinkPreview: { marginVertical: 10, alignItems: 'center' },
-  rinkText: { fontSize: 16, fontWeight: '600', color: '#0a7ea4' },
-  rinkAddress: { fontSize: 14, color: '#666', textAlign: 'center' },
+  input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 10, borderRadius: 6 },
+  map: { width: '100%', height: 200, borderRadius: 10, marginBottom: 20 },
   kitRow: { flexDirection: 'row', justifyContent: 'space-around', marginBottom: 20 },
   jerseyCard: { alignItems: 'center' },
   jerseyBox: { width: 110, height: 110, position: 'relative' },
@@ -223,5 +223,4 @@ const styles = StyleSheet.create({
   jerseyLabel: { marginTop: 8, fontSize: 16, fontWeight: '600', color: '#000' },
   modalContainer: { flex: 1, justifyContent: 'center', padding: 20, backgroundColor: '#fff' },
   modalTitle: { fontSize: 20, fontWeight: '600', marginBottom: 20, textAlign: 'center' },
-  modalButtons: { marginTop: 20, alignItems: 'center' },
 });
