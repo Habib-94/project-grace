@@ -1,9 +1,8 @@
 // src/firebaseConfig.ts
-import { initializeApp } from 'firebase/app';
-import { browserLocalPersistence, initializeAuth } from 'firebase/auth';
-import { enableNetwork, getFirestore } from 'firebase/firestore';
+import { FirebaseApp, getApp, getApps, initializeApp } from 'firebase/app';
+import { Auth, getAuth } from 'firebase/auth';
+import { enableNetwork, Firestore, getFirestore } from 'firebase/firestore';
 
-// ✅ Your Firebase config
 const firebaseConfig = {
   apiKey: 'AIzaSyC0ZosmSPU1_KTd-eSAlZdCN2S_oSYQ3-Q',
   authDomain: 'project-grace-475412.firebaseapp.com',
@@ -13,23 +12,30 @@ const firebaseConfig = {
   appId: '1:646265469239:android:b0fa646716cd912deb02b2',
 };
 
-// ✅ Initialize Firebase
-const app = initializeApp(firebaseConfig);
+// Ensure single app instance across HMR / Fast Refresh
+let app: FirebaseApp;
+if (!getApps().length) {
+  app = initializeApp(firebaseConfig);
+} else {
+  app = getApp();
+}
 
-// ✅ Auth setup (browserLocalPersistence works for web + Expo Go)
-const auth = initializeAuth(app, {
-  persistence: browserLocalPersistence,
-});
+// Use simple getAuth for Expo Go (memory persistence). Switch to initializeAuth + AsyncStorage only in custom dev client.
+const auth: Auth = getAuth(app);
 
-// ✅ Firestore setup with forced online mode
-const db = getFirestore(app);
+// Single Firestore instance
+const db: Firestore = getFirestore(app);
 
-export async function ensureFirestoreOnline() {
+// Safe enable network helper (defensive)
+export async function ensureFirestoreOnline(): Promise<void> {
   try {
+    if (!db) return;
     await enableNetwork(db);
-    console.log('✅ Firestore forced online');
+    // small delay to let SDK settle after switching network
+    await new Promise((r) => setTimeout(r, 50));
+    console.log('Firestore network enabled');
   } catch (err) {
-    console.warn('⚠️ Firestore enableNetwork failed:', err);
+    console.warn('ensureFirestoreOnline error', err);
   }
 }
 

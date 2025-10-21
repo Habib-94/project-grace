@@ -1,29 +1,28 @@
-// app/(tabs)/JoinTeamScreen.tsx
 import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import { useRouter } from 'expo-router';
 import {
-  addDoc,
-  collection,
-  doc,
-  getDoc,
-  getDocs,
-  limit,
-  orderBy,
-  query,
-  where,
+    addDoc,
+    collection,
+    doc,
+    getDoc,
+    getDocs,
+    limit,
+    orderBy,
+    query,
+    where,
 } from 'firebase/firestore';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  Button,
-  FlatList,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Alert,
+    Button,
+    FlatList,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 
@@ -36,7 +35,7 @@ interface Team {
   awayColor?: string;
 }
 
-export default function JoinTeamScreen() {
+export default function FindATeam() {
   const [searchTerm, setSearchTerm] = useState('');
   const [searching, setSearching] = useState(false);
   const [results, setResults] = useState<Team[]>([]);
@@ -322,7 +321,3 @@ const styles = StyleSheet.create({
   selectedContainer: { marginTop: 20 },
   selectedTitle: { fontSize: 20, fontWeight: '600', marginBottom: 10, textAlign: 'center' },
 });
-
-// small alias to preserve imports while codebase updates
-export { default } from './FindATeam';
-

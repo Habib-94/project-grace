@@ -22,7 +22,7 @@ export default function TeamDetailScreen() {
 
         if (!userSnap.exists()) {
           Toast.show({ type: 'error', text1: 'No user record found' });
-          router.replace('/(tabs)/ManageTeamScreen');
+          router.replace('/(tabs)/HomeScreen');
           return;
         }
 
@@ -33,7 +33,7 @@ export default function TeamDetailScreen() {
             text1: 'Access Denied',
             text2: 'You must be a coordinator to access this page.',
           });
-          router.replace('/(tabs)/ManageTeamScreen');
+          router.replace('/(tabs)/HomeScreen');
         } else {
           setAllowed(true);
         }
@@ -44,7 +44,7 @@ export default function TeamDetailScreen() {
           text1: 'Error',
           text2: 'Failed to verify permissions.',
         });
-        router.replace('/(tabs)/ManageTeamScreen');
+        router.replace('/(tabs)/HomeScreen');
       }
     };
 

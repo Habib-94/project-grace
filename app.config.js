@@ -41,8 +41,11 @@ export default {
       output: 'static',
       favicon: './assets/images/favicon.png',
     },
+
+    // ✅ Add expo-maps plugin here
     plugins: [
       'expo-router',
+      'expo-maps',
       [
         'expo-splash-screen',
         {
@@ -54,12 +57,13 @@ export default {
         },
       ],
     ],
+
     experiments: {
       typedRoutes: true,
       reactCompiler: true,
     },
+
     extra: {
-      // Optional: helpful for debugging
       googleMapsApiKey: process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY,
       eas: {
         projectId: 'project-grace-475412', // optional, if you use EAS

@@ -2,14 +2,15 @@
 import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
-import { MapView, Marker } from 'expo-maps';
 import { useRouter } from 'expo-router';
 import {
   addDoc,
   collection,
   doc,
+  getDoc,
   getDocs,
   query,
+  setDoc,
   updateDoc,
   where,
 } from 'firebase/firestore';
@@ -22,9 +23,8 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from 'react-native';
-import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
@@ -32,19 +32,24 @@ const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey;
 
 export default function CreateTeamScreen() {
   const router = useRouter();
+
+  // ✅ Stable initial states (avoid undefined issues)
   const [teamName, setTeamName] = useState('');
   const [location, setLocation] = useState('');
-  const [coords, setCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
   const [loading, setLoading] = useState(false);
   const autocompleteRef = useRef<any>(null);
-
   const user = auth.currentUser;
 
   const handleCreateTeam = async () => {
-    if (!user) return;
+    if (!user) {
+      Toast.show({ type: 'error', text1: 'You must be logged in.' });
+      return;
+    }
+
     if (!teamName.trim() || !location.trim()) {
       Toast.show({
         type: 'error',
@@ -59,8 +64,11 @@ export default function CreateTeamScreen() {
     try {
       await ensureFirestoreOnline();
 
-      // ✅ Check for existing team name
-      const teamQuery = query(collection(db, 'teams'), where('teamName', '==', teamName.trim()));
+      // ✅ Check if team name already exists
+      const teamQuery = query(
+        collection(db, 'teams'),
+        where('teamName', '==', teamName.trim())
+      );
       const existingTeams = await getDocs(teamQuery);
 
       if (!existingTeams.empty) {
@@ -73,24 +81,32 @@ export default function CreateTeamScreen() {
         return;
       }
 
-      // ✅ Create team in Firestore
+      // ✅ Create team document
       const teamRef = await addDoc(collection(db, 'teams'), {
         teamName: teamName.trim(),
         location,
-        latitude: coords?.lat || null,
-        longitude: coords?.lng || null,
+        latitude: coords?.latitude || null,
+        longitude: coords?.longitude || null,
         homeColor,
         awayColor,
         createdBy: user.uid,
         createdAt: new Date().toISOString(),
       });
 
-      // ✅ Update user record
+      // ✅ Create or update user profile in Firestore
       const userRef = doc(db, 'users', user.uid);
-      await updateDoc(userRef, {
-        teamId: teamRef.id,
-        isCoordinator: true,
-      });
+      const userSnap = await getDoc(userRef);
+      if (!userSnap.exists()) {
+        await setDoc(userRef, {
+          uid: user.uid,
+          email: user.email,
+          teamId: teamRef.id,
+          isCoordinator: true,
+          createdAt: new Date().toISOString(),
+        });
+      } else {
+        await updateDoc(userRef, { teamId: teamRef.id, isCoordinator: true });
+      }
 
       Toast.show({
         type: 'success',
@@ -104,7 +120,7 @@ export default function CreateTeamScreen() {
       Toast.show({
         type: 'error',
         text1: 'Error creating team',
-        text2: e.message || 'Something went wrong.',
+        text2: e?.message || 'Something went wrong.',
       });
     } finally {
       setLoading(false);
@@ -142,42 +158,41 @@ export default function CreateTeamScreen() {
         onChangeText={setTeamName}
       />
 
-      <GooglePlacesAutocomplete
+      {/* ✅ Location Autocomplete */}
+      {/* <GooglePlacesAutocomplete
         ref={autocompleteRef}
         placeholder="Search rink or arena..."
         fetchDetails
         onPress={(data, details = null) => {
-          const lat = details?.geometry?.location?.lat;
-          const lng = details?.geometry?.location?.lng;
+          const lat = details?.geometry?.location?.lat ?? 0;
+          const lng = details?.geometry?.location?.lng ?? 0;
           setLocation(data.description);
-          setCoords({ lat, lng });
+          setCoords({ latitude: lat, longitude: lng });
         }}
-        query={{ key: GOOGLE_MAPS_API_KEY, language: 'en', types: 'establishment' }}
+        query={{
+          key: GOOGLE_MAPS_API_KEY,
+          language: 'en',
+          types: 'establishment',
+        }}
         styles={{
           textInput: styles.input,
           container: { marginBottom: 10 },
         }}
-      />
+      /> */}
 
-      {coords && (
-        <MapView
-          style={styles.map}
-          region={{
-            latitude: coords.lat,
-            longitude: coords.lng,
-            latitudeDelta: 0.01,
-            longitudeDelta: 0.01,
-          }}
-        >
-          <Marker coordinate={{ latitude: coords.lat, longitude: coords.lng }} title={location} />
-        </MapView>
-      )}
+      <TextInput
+        style={styles.input}
+        placeholder="Location (rink or arena)"
+        value={location}
+        onChangeText={(text) => setLocation(text)}
+      />
 
       <View style={styles.kitRow}>
         <Jersey color={homeColor} label="Home" />
         <Jersey color={awayColor} label="Away" />
       </View>
 
+      {/* ✅ Color Picker Modal */}
       <Modal visible={!!activePicker} animationType="slide">
         <View style={styles.modalContainer}>
           <Text style={styles.modalTitle}>
@@ -213,9 +228,14 @@ export default function CreateTeamScreen() {
 
 const styles = StyleSheet.create({
   container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
-  title: { fontSize: 26, fontWeight: 'bold', color: '#0a7ea4', textAlign: 'center', marginBottom: 20 },
+  title: {
+    fontSize: 26,
+    fontWeight: 'bold',
+    color: '#0a7ea4',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
   input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 10, borderRadius: 6 },
-  map: { width: '100%', height: 200, borderRadius: 10, marginBottom: 20 },
   kitRow: { flexDirection: 'row', justifyContent: 'space-around', marginBottom: 20 },
   jerseyCard: { alignItems: 'center' },
   jerseyBox: { width: 110, height: 110, position: 'relative' },

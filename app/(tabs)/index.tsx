@@ -2,7 +2,7 @@ import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import { signOut } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, onSnapshot } from 'firebase/firestore';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Button, StyleSheet, Text, View } from 'react-native';
 
@@ -14,43 +14,70 @@ export default function HomeScreen() {
   const user = auth.currentUser;
 
   useEffect(() => {
-    let isMounted = true;
+    let userUnsub: (() => void) | null = null;
+    let teamUnsub: (() => void) | null = null;
 
-    const fetchData = async () => {
-      if (!user) return;
-      await ensureFirestoreOnline(); // 👈 Fix: make sure Firestore is online
+    if (!user) {
+      setLoading(false);
+      return;
+    }
 
-      try {
-        const userRef = doc(db, 'users', user.uid);
-        const userSnap = await getDoc(userRef);
+    (async () => {
+      await ensureFirestoreOnline();
 
-        if (!userSnap.exists()) {
-          console.warn('⚠️ No user document found for:', user.uid);
-          return;
-        }
-
-        const userInfo = userSnap.data();
-        if (isMounted) setUserData(userInfo);
-
-        if (userInfo.teamId) {
-          const teamRef = doc(db, 'teams', userInfo.teamId);
-          const teamSnap = await getDoc(teamRef);
-          if (teamSnap.exists() && isMounted) {
-            setTeamData(teamSnap.data());
+      // subscribe to user doc so we react to teamId/isCoordinator changes
+      const uRef = doc(db, 'users', user.uid);
+      userUnsub = onSnapshot(
+        uRef,
+        (uSnap) => {
+          if (!uSnap.exists()) {
+            setUserData(null);
+            setTeamData(null);
+            setLoading(false);
+            return;
           }
-        }
-      } catch (error: any) {
-        console.error('❌ Failed to fetch team data:', error);
-      } finally {
-        if (isMounted) setLoading(false);
-      }
-    };
+          const u = uSnap.data() as any;
+          setUserData(u);
 
-    fetchData();
+          // subscribe to team doc when teamId present
+          if (teamUnsub) {
+            teamUnsub();
+            teamUnsub = null;
+          }
+          if (u?.teamId) {
+            const tRef = doc(db, 'teams', u.teamId);
+            teamUnsub = onSnapshot(
+              tRef,
+              (tSnap) => {
+                if (tSnap.exists()) {
+                  setTeamData({ id: tSnap.id, ...(tSnap.data() as any) });
+                } else {
+                  setTeamData(null);
+                }
+                setLoading(false);
+              },
+              (err) => {
+                console.warn('Team onSnapshot error', err);
+                setLoading(false);
+              }
+            );
+          } else {
+            setTeamData(null);
+            setLoading(false);
+          }
+        },
+        (err) => {
+          console.warn('User onSnapshot error', err);
+          setLoading(false);
+        }
+      );
+    })();
+
     return () => {
-      isMounted = false;
+      if (userUnsub) userUnsub();
+      if (teamUnsub) teamUnsub();
     };
-  }, [user]);
+  }, [user?.uid]);
 
   const handleLogout = async () => {
     try {
@@ -94,9 +121,9 @@ export default function HomeScreen() {
       return <Button title="Create Team" onPress={() => router.push('/(tabs)/CreateTeamScreen')} />;
     }
     if (userData?.isCoordinator) {
-      return <Button title="Manage Team" onPress={() => router.push('/(tabs)/ManageTeamScreen')} />;
+      return <Button title="Manage Team" onPress={() => router.push('/(tabs)/CoordinatorDashboardScreen')} />;
     }
-    return <Button title="Join Team" onPress={() => router.push('/(tabs)/JoinTeamScreen')} />;
+    return <Button title="Join Team" onPress={() => router.push('/(tabs)/FindATeam')} />;
   };
 
   return (
@@ -109,6 +136,32 @@ export default function HomeScreen() {
           <View style={styles.kitRow}>
             <Jersey color={homeColor} label="Home" />
             <Jersey color={awayColor} label="Away" />
+          </View>
+
+          {/* New summary box: role and kit colours */}
+          <View style={styles.summaryBox}>
+            <Text style={styles.summaryTitle}>Your Team Summary</Text>
+
+            <View style={styles.summaryRow}>
+              <Text style={styles.summaryLabel}>Role:</Text>
+              <Text style={styles.summaryValue}>
+                {userData?.isCoordinator ? 'Coordinator' : 'Member'}
+              </Text>
+            </View>
+
+            <View style={styles.summaryRow}>
+              <Text style={styles.summaryLabel}>Kit Colours:</Text>
+              <View style={styles.swatches}>
+                <View style={styles.swatchItem}>
+                  <View style={[styles.kitSwatch, { backgroundColor: homeColor }]} />
+                  <Text style={styles.swatchLabel}>Home</Text>
+                </View>
+                <View style={styles.swatchItem}>
+                  <View style={[styles.kitSwatch, { backgroundColor: awayColor }]} />
+                  <Text style={styles.swatchLabel}>Away</Text>
+                </View>
+              </View>
+            </View>
           </View>
         </>
       ) : (
@@ -136,4 +189,35 @@ const styles = StyleSheet.create({
   jerseyOutline: { width: 120, height: 120 },
   jerseyLabel: { marginTop: 8, fontSize: 16, fontWeight: '600', color: '#0a7ea4' },
   noTeamText: { fontSize: 16, color: '#888', textAlign: 'center', marginBottom: 30 },
+
+  /* New styles for summary */
+  summaryBox: {
+    width: '100%',
+    padding: 16,
+    borderRadius: 8,
+    backgroundColor: '#f7fbfd',
+    borderColor: '#e6f2f6',
+    borderWidth: 1,
+    marginTop: 10,
+  },
+  summaryTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#0a7ea4',
+    marginBottom: 10,
+    textAlign: 'center',
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  summaryLabel: { fontSize: 14, color: '#333', fontWeight: '600' },
+  summaryValue: { fontSize: 14, color: '#333' },
+
+  swatches: { flexDirection: 'row', gap: 16 },
+  swatchItem: { alignItems: 'center', marginLeft: 8 },
+  kitSwatch: { width: 34, height: 34, borderRadius: 6, borderWidth: 1, borderColor: '#ddd' },
+  swatchLabel: { marginTop: 6, fontSize: 12, color: '#333' },
 });
