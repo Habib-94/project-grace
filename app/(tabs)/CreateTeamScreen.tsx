@@ -2,6 +2,7 @@
 import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
+import { MapView, Marker } from 'expo-maps';
 import { useRouter } from 'expo-router';
 import {
   addDoc,
@@ -24,7 +25,6 @@ import {
   View
 } from 'react-native';
 import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
-import MapView, { Marker } from 'react-native-maps';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
