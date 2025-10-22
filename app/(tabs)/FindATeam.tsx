@@ -1,38 +1,30 @@
 import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import { useRouter } from 'expo-router';
-import {
-    addDoc,
-    collection,
-    doc,
-    getDoc,
-    getDocs,
-    limit,
-    orderBy,
-    query,
-    where,
-} from 'firebase/firestore';
+import { addDoc, collection } from 'firebase/firestore';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    Button,
-    FlatList,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  Button,
+  FlatList,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
+import { debugAuthState, getDocument, queryTeams, runCollectionQuery } from '../../src/firestoreRest';
 
-// ✅ Define a proper TypeScript interface for teams
+// Team type includes rating (previously called ELO)
 interface Team {
   id: string;
   teamName: string;
   location?: string;
   homeColor?: string;
   awayColor?: string;
+  elo?: number; // numeric score stored in Firestore; UI label will show "Rating"
 }
 
 export default function FindATeam() {
@@ -74,27 +66,37 @@ export default function FindATeam() {
     }, 300) as unknown as number;
   }, [searchTerm]);
 
+  const normalizeDocToTeam = (d: any): Team | null => {
+    if (!d || !d.id) return null;
+    return {
+      id: String(d.id),
+      teamName: String(d.teamName ?? ''),
+      location: d.location ?? undefined,
+      homeColor: d.homeColor ?? undefined,
+      awayColor: d.awayColor ?? undefined,
+      elo: d?.elo != null ? Number(d.elo) : undefined,
+    };
+  };
+
   const fetchDirectory = async () => {
     setDirLoading(true);
     try {
       await ensureFirestoreOnline();
-      const q = query(collection(db, 'teams'), orderBy('teamName'), limit(50));
-      const snap = await getDocs(q);
-      const teams: Team[] = [];
-      snap.forEach((s) => {
-        const d = s.data() as any;
-        teams.push({
-          id: s.id,
-          teamName: d.teamName,
-          location: d.location,
-          homeColor: d.homeColor,
-          awayColor: d.awayColor,
-        });
-      });
-      setDirectory(teams);
+
+      // diagnostic: log auth/token presence before query
+      try {
+        const dbg = await debugAuthState('FindATeam.fetchDirectory');
+        console.log('[FindATeam] debugAuthState:', dbg);
+      } catch (dbgErr) {
+        console.warn('[FindATeam] debugAuthState failed', dbgErr);
+      }
+
+      const docs = await queryTeams({ limit: 50 });
+      const items = (docs as any[]).map((d: any) => normalizeDocToTeam(d)).filter(Boolean) as Team[];
+      setDirectory(items);
     } catch (e: any) {
-      console.warn('Failed to load directory', e);
-      Toast.show({ type: 'error', text1: 'Failed to load teams' });
+      console.error('Failed to load directory', e);
+      Toast.show({ type: 'error', text1: 'Failed to load teams', text2: e?.message ?? String(e) });
       setDirectory([]);
     } finally {
       setDirLoading(false);
@@ -111,28 +113,17 @@ export default function FindATeam() {
     try {
       await ensureFirestoreOnline();
 
-      const teamQuery = query(
-        collection(db, 'teams'),
-        where('teamName', '>=', qTerm),
-        where('teamName', '<=', qTerm + '\uf8ff'),
-        orderBy('teamName'),
-        limit(50)
-      );
-
-      const snap = await getDocs(teamQuery);
-      const teams: Team[] = [];
-      snap.forEach((docSnap) => {
-        const data = docSnap.data() as any;
-        teams.push({
-          id: docSnap.id,
-          teamName: data.teamName,
-          location: data.location,
-          homeColor: data.homeColor,
-          awayColor: data.awayColor,
-        });
+      const docs = await runCollectionQuery({
+        collectionId: 'teams',
+        // helper expects arrays for where/orderBy
+        where: [{ fieldPath: 'teamName', op: 'GREATER_THAN_OR_EQUAL', value: qTerm }],
+        orderBy: [{ fieldPath: 'teamName', direction: 'ASCENDING' }],
+        limit: 50,
       });
 
+      const teams = (docs as any[]).map((d: any) => normalizeDocToTeam(d)).filter(Boolean) as Team[];
       setResults(teams);
+
       if (teams.length === 0) {
         Toast.show({ type: 'info', text1: 'No teams found', text2: 'Try another name.' });
       }
@@ -145,21 +136,28 @@ export default function FindATeam() {
   };
 
   const handleSendRequest = async () => {
-    if (!selectedTeam || !user) return;
+    if (!selectedTeam) {
+      Toast.show({ type: 'info', text1: 'Select a team first' });
+      return;
+    }
+    if (!user) {
+      router.replace('/(auth)/LoginScreen');
+      return;
+    }
 
     try {
       setSending(true);
       await ensureFirestoreOnline();
 
-      const userRef = doc(db, 'users', user.uid);
-      const userSnap = await getDoc(userRef);
+      // read user via REST helper
+      const userDoc = await getDocument(`users/${user.uid}`);
 
-      if (!userSnap.exists()) {
+      if (!userDoc) {
         Alert.alert('Error', 'User record not found.');
         return;
       }
 
-      const userData = userSnap.data() as any;
+      const userData = userDoc as any;
 
       if (userData.teamId) {
         Toast.show({
@@ -170,17 +168,16 @@ export default function FindATeam() {
         return;
       }
 
-      // Prevent duplicate requests
-      const existingRequests = await getDocs(
-        query(
-          collection(db, 'requests'),
-          where('userId', '==', user.uid),
-          where('teamId', '==', selectedTeam.id),
-          where('status', '==', 'pending')
-        )
+      // Prevent duplicate requests: use REST helper to fetch recent requests and filter client-side
+      const reqDocs = await runCollectionQuery({
+        collectionId: 'requests',
+        limit: 200,
+      });
+      const duplicate = (reqDocs as any[]).some(
+        (r: any) => r.userId === user.uid && r.teamId === selectedTeam.id && r.status === 'pending'
       );
 
-      if (!existingRequests.empty) {
+      if (duplicate) {
         Toast.show({
           type: 'info',
           text1: 'Request already sent',
@@ -189,10 +186,10 @@ export default function FindATeam() {
         return;
       }
 
-      // ✅ Create join request
+      // ✅ Create join request (write still uses Firestore write API)
       await addDoc(collection(db, 'requests'), {
         userId: user.uid,
-        userEmail: user.email,
+        userEmail: user.email ?? '',
         teamId: selectedTeam.id,
         teamName: selectedTeam.teamName,
         status: 'pending',
@@ -219,12 +216,16 @@ export default function FindATeam() {
     }
   };
 
-  const renderTeamCard = ({ item }: { item: Team }) => (
-    <TouchableOpacity style={styles.teamCard} onPress={() => setSelectedTeam(item)}>
-      <Text style={styles.teamName}>{item.teamName}</Text>
-      {item.location ? <Text style={styles.teamLocation}>{item.location}</Text> : null}
-    </TouchableOpacity>
-  );
+  const renderTeamCard = ({ item }: { item: Team }) => {
+    const rating = Math.min(Math.max(item.elo ?? 1500, 800), 3000);
+    return (
+      <TouchableOpacity style={styles.teamCard} onPress={() => setSelectedTeam(item)}>
+        <Text style={styles.teamName}>{item.teamName}</Text>
+        {item.location ? <Text style={styles.teamLocation}>{item.location}</Text> : null}
+        <Text style={styles.teamRating}>Rating: {rating}</Text>
+      </TouchableOpacity>
+    );
+  };
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
@@ -251,7 +252,7 @@ export default function FindATeam() {
           <Text style={styles.sectionTitle}>Search results</Text>
           <FlatList
             data={results}
-            keyExtractor={(i) => i.id}
+            keyExtractor={(i) => String(i.id)}
             renderItem={renderTeamCard}
             scrollEnabled={false}
           />
@@ -269,7 +270,7 @@ export default function FindATeam() {
           ) : (
             <FlatList
               data={directory}
-              keyExtractor={(i) => i.id}
+              keyExtractor={(i) => String(i.id)}
               renderItem={renderTeamCard}
               scrollEnabled={false}
             />
@@ -283,6 +284,7 @@ export default function FindATeam() {
           <Text style={styles.selectedTitle}>Selected Team</Text>
           <Text style={styles.teamName}>{selectedTeam.teamName}</Text>
           {selectedTeam.location && <Text style={styles.teamLocation}>{selectedTeam.location}</Text>}
+          <Text style={{ marginTop: 6 }}>Rating: {Math.min(Math.max(selectedTeam.elo ?? 1500, 800), 3000)}</Text>
 
           <View style={{ marginTop: 15 }}>
             <Button
@@ -318,6 +320,7 @@ const styles = StyleSheet.create({
   },
   teamName: { fontSize: 18, fontWeight: 'bold', color: '#0a7ea4' },
   teamLocation: { fontSize: 14, color: '#666' },
+  teamRating: { marginTop: 6, fontSize: 14, color: '#333', fontWeight: '600' },
   selectedContainer: { marginTop: 20 },
   selectedTitle: { fontSize: 20, fontWeight: '600', marginBottom: 10, textAlign: 'center' },
 });

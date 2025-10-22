@@ -1,10 +1,10 @@
 // app/(tabs)/TeamDetailScreen.tsx
-import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
+import { auth, ensureFirestoreOnline } from '@/firebaseConfig';
 import { useRouter } from 'expo-router';
-import { doc, getDoc } from 'firebase/firestore';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 import Toast from 'react-native-toast-message';
+import { getDocument } from '../../src/firestoreRest';
 
 export default function TeamDetailScreen() {
   const router = useRouter();
@@ -17,16 +17,15 @@ export default function TeamDetailScreen() {
 
       try {
         await ensureFirestoreOnline();
-        const userRef = doc(db, 'users', user.uid);
-        const userSnap = await getDoc(userRef);
+        const userDoc = await getDocument(`users/${user.uid}`);
 
-        if (!userSnap.exists()) {
+        if (!userDoc) {
           Toast.show({ type: 'error', text1: 'No user record found' });
           router.replace('/(tabs)/HomeScreen');
           return;
         }
 
-        const userData = userSnap.data();
+        const userData = userDoc as any;
         if (!userData.isCoordinator) {
           Toast.show({
             type: 'error',
@@ -49,7 +48,7 @@ export default function TeamDetailScreen() {
     };
 
     checkPermissions();
-  }, []);
+  }, [router, user]);
 
   if (allowed === null) {
     return (

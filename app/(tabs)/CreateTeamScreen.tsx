@@ -7,12 +7,7 @@ import {
   addDoc,
   collection,
   doc,
-  getDoc,
-  getDocs,
-  query,
-  setDoc,
   updateDoc,
-  where,
 } from 'firebase/firestore';
 import React, { useRef, useState } from 'react';
 import {
@@ -45,85 +40,40 @@ export default function CreateTeamScreen() {
   const user = auth.currentUser;
 
   const handleCreateTeam = async () => {
-    if (!user) {
-      Toast.show({ type: 'error', text1: 'You must be logged in.' });
+    if (!user?.uid) {
+      Toast.show({ type: 'error', text1: 'Not signed in' });
       return;
     }
-
-    if (!teamName.trim() || !location.trim()) {
-      Toast.show({
-        type: 'error',
-        text1: 'Missing fields',
-        text2: 'Please enter a team name and select a location.',
-      });
-      return;
-    }
-
-    setLoading(true);
 
     try {
       await ensureFirestoreOnline();
 
-      // ✅ Check if team name already exists
-      const teamQuery = query(
-        collection(db, 'teams'),
-        where('teamName', '==', teamName.trim())
-      );
-      const existingTeams = await getDocs(teamQuery);
-
-      if (!existingTeams.empty) {
-        setLoading(false);
-        Toast.show({
-          type: 'error',
-          text1: 'Team name taken',
-          text2: 'Please choose a different name.',
-        });
-        return;
-      }
-
-      // ✅ Create team document
-      const teamRef = await addDoc(collection(db, 'teams'), {
+      const payload = {
         teamName: teamName.trim(),
-        location,
-        latitude: coords?.latitude || null,
-        longitude: coords?.longitude || null,
-        homeColor,
-        awayColor,
-        createdBy: user.uid,
+        location: location?.trim() ?? '',
+        latitude: coords?.latitude ?? null,
+        longitude: coords?.longitude ?? null,
+        homeColor: homeColor ?? '#0a7ea4',
+        awayColor: awayColor ?? '#ffffff',
+        // placeholder Rating for future ranking feature
+        elo: 1500,
         createdAt: new Date().toISOString(),
-      });
+        createdBy: user.uid, // <- ensure createdBy set
+      };
 
-      // ✅ Create or update user profile in Firestore
+      // create team
+      const teamRef = await addDoc(collection(db, 'teams'), payload);
+
+      // assign current user as coordinator of the new team
       const userRef = doc(db, 'users', user.uid);
-      const userSnap = await getDoc(userRef);
-      if (!userSnap.exists()) {
-        await setDoc(userRef, {
-          uid: user.uid,
-          email: user.email,
-          teamId: teamRef.id,
-          isCoordinator: true,
-          createdAt: new Date().toISOString(),
-        });
-      } else {
-        await updateDoc(userRef, { teamId: teamRef.id, isCoordinator: true });
-      }
+      await updateDoc(userRef, { teamId: teamRef.id, isCoordinator: true });
 
-      Toast.show({
-        type: 'success',
-        text1: 'Team Created!',
-        text2: 'You are now the coordinator.',
-      });
-
+      Toast.show({ type: 'success', text1: 'Team created' });
+      // navigate to coordinator dashboard
       router.replace('/(tabs)/CoordinatorDashboardScreen');
     } catch (e: any) {
-      console.error('❌ Error creating team:', e);
-      Toast.show({
-        type: 'error',
-        text1: 'Error creating team',
-        text2: e?.message || 'Something went wrong.',
-      });
-    } finally {
-      setLoading(false);
+      console.error('Create team failed', e);
+      Toast.show({ type: 'error', text1: 'Create team failed', text2: e?.message || '' });
     }
   };
 

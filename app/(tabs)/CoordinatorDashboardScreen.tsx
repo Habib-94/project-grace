@@ -3,36 +3,101 @@ import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
-import {
-  addDoc,
-  collection,
-  deleteDoc,
-  doc,
-  getDoc,
-  getDocs,
-  orderBy,
-  query,
-  updateDoc,
-  where,
-  writeBatch,
-} from 'firebase/firestore';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Button,
   FlatList,
   Modal,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
-// removed static import to avoid bundler crashes; will require at runtime if available
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
+import { getDocument, runCollectionQuery } from '../../src/firestoreRest';
 
-// ✅ Define types
+// Read API key from app config or env
+const GOOGLE_MAPS_API_KEY =
+  Constants.expoConfig?.extra?.googleMapsApiKey ??
+  (process.env.GOOGLE_MAPS_API_KEY as string) ??
+  '';
+
+// --- Safe write helpers (work for native @react-native-firebase and web modular SDK) ---
+async function addDocSafe(collectionPath: string, data: any) {
+  if (db && typeof (db as any).collection === 'function') {
+    // native RN Firebase
+    return (db as any).collection(collectionPath).add(data);
+  } else {
+    const { collection, addDoc } = await import('firebase/firestore');
+    return addDoc(collection(db as any, collectionPath), data);
+  }
+}
+
+async function updateDocSafe(path: string, data: any) {
+  const parts = path.split('/');
+  const col = parts[0];
+  const id = parts[1];
+  if (!col || !id) throw new Error('updateDocSafe expects "collection/docId" path');
+
+  if (db && typeof (db as any).collection === 'function') {
+    return (db as any).collection(col).doc(id).update(data);
+  } else {
+    const { doc, updateDoc } = await import('firebase/firestore');
+    return updateDoc(doc(db as any, col, id), data);
+  }
+}
+
+async function deleteDocSafe(path: string) {
+  const parts = path.split('/');
+  const col = parts[0];
+  const id = parts[1];
+  if (!col || !id) throw new Error('deleteDocSafe expects "collection/docId" path');
+
+  if (db && typeof (db as any).collection === 'function') {
+    return (db as any).collection(col).doc(id).delete();
+  } else {
+    const { doc, deleteDoc } = await import('firebase/firestore');
+    return deleteDoc(doc(db as any, col, id));
+  }
+}
+
+/**
+ * Run a batch of updates/deletes. On web uses writeBatch for atomic commit;
+ * on native it performs the operations sequentially (best-effort fallback).
+ * ops: { op: 'update' | 'delete', path: 'collection/docId', data?: any }
+ */
+async function runBatchSafe(ops: Array<{ op: 'update' | 'delete'; path: string; data?: any }>) {
+  if (db && typeof (db as any).collection === 'function') {
+    // native: do sequential (no guaranteed atomicity)
+    for (const o of ops) {
+      try {
+        if (o.op === 'update') await updateDocSafe(o.path, o.data);
+        else if (o.op === 'delete') await deleteDocSafe(o.path);
+      } catch (e) {
+        // non-fatal for batch fallback; log and continue
+        console.warn('[runBatchSafe] native op failed', o, e);
+      }
+    }
+    return;
+  } else {
+    const { writeBatch, doc } = await import('firebase/firestore');
+    const batch = writeBatch(db as any);
+    for (const o of ops) {
+      const [col, id] = o.path.split('/');
+      if (o.op === 'update') batch.update(doc(db as any, col, id), o.data ?? {});
+      else if (o.op === 'delete') batch.delete(doc(db as any, col, id));
+    }
+    await batch.commit();
+  }
+}
+// --- end helpers ---
+
+// Types
 interface Team {
   id: string;
   teamName?: string;
@@ -41,6 +106,7 @@ interface Team {
   longitude?: number;
   homeColor?: string;
   awayColor?: string;
+  elo?: number;
 }
 
 interface Request {
@@ -50,8 +116,6 @@ interface Request {
   teamId: string;
   status: string;
 }
-
-const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey;
 
 export default function CoordinatorDashboardScreen() {
   const router = useRouter();
@@ -66,20 +130,57 @@ export default function CoordinatorDashboardScreen() {
   const [placesComponent, setPlacesComponent] = useState<any>(null);
   const autocompleteRef = useRef<any>(null);
   const [games, setGames] = useState<any[]>([]);
-  const [creatingGame, setCreatingGame] = useState(false);
-  const [newGameTitle, setNewGameTitle] = useState('Game');
-  const [newGameDate, setNewGameDate] = useState(''); // YYYY-MM-DD
-  const [newGameTime, setNewGameTime] = useState('20:00'); // HH:MM
-  const [newGameType, setNewGameType] = useState<'home' | 'away'>('home');
-  const [newGameRecurring, setNewGameRecurring] = useState<'none' | 'monthly'>('monthly');
   const [saving, setSaving] = useState(false);
 
-  // ✅ Load team and coordinator data safely
+  const originalTeamRef = useRef<any>(null);
+
+  // Error boundary for Places component
+  class PlacesErrorBoundary extends React.Component<{ children: React.ReactNode; onError?: () => void }, { hasError: boolean }> {
+    constructor(props: any) {
+      super(props);
+      this.state = { hasError: false };
+    }
+    static getDerivedStateFromError() {
+      return { hasError: true };
+    }
+    componentDidCatch(error: any, info: any) {
+      console.warn('[PlacesErrorBoundary] caught error rendering PlacesComp', error, info);
+      try { this.props.onError?.(); } catch (e) { /* ignore */ }
+    }
+    render() {
+      if (this.state.hasError) {
+        return null; // fall back to text input in parent
+      }
+      return this.props.children as any;
+    }
+  }
+
+  // Dynamic loader for GooglePlacesAutocomplete
+  useEffect(() => {
+    let mounted = true;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const mod = require('react-native-google-places-autocomplete');
+      // store the component type directly (not a wrapper)
+      if (mounted) setPlacesComponent(mod?.GooglePlacesAutocomplete ?? mod ?? null);
+    } catch (e) {
+      if (__DEV__) console.warn('GooglePlacesAutocomplete not available:', e);
+      if (mounted) setPlacesComponent(null);
+    }
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   useEffect(() => {
     let isMounted = true;
 
     const loadData = async () => {
-      if (!user) {
+      const currentUser = await waitForAuthUser(3000);
+      console.log('[Coordinator] resolved currentUser before loading:', !!currentUser, currentUser?.uid ?? null);
+
+      if (!currentUser) {
+        // No signed-in user after waiting — navigate to login (or show message)
         router.replace('/(auth)/LoginScreen');
         return;
       }
@@ -87,18 +188,17 @@ export default function CoordinatorDashboardScreen() {
       try {
         await ensureFirestoreOnline();
 
-        const userRef = doc(db, 'users', user.uid);
-        const userSnap = await getDoc(userRef);
-
-        if (!userSnap.exists()) {
+        // Read user via REST helper (avoids web streaming)
+        const userDoc = await getDocument(`users/${currentUser.uid}`);
+        if (!userDoc) {
           if (isMounted) {
             Toast.show({ type: 'error', text1: 'User record not found' });
-            router.replace('/(tabs)/HomeScreen');
+            router.replace('/(tabs)');
           }
           return;
         }
-    
-        const userData = userSnap.data();
+
+        const userData = userDoc as any;
         if (!userData?.isCoordinator) {
           if (isMounted) {
             Toast.show({
@@ -106,22 +206,23 @@ export default function CoordinatorDashboardScreen() {
               text1: 'Access Denied',
               text2: 'You must be a coordinator to access this page.',
             });
-            router.replace('/(tabs)/HomeScreen');
-          }
-          return;
-        }
-    
-        const teamRef = doc(db, 'teams', userData.teamId);
-        const teamSnap = await getDoc(teamRef);
-        if (!teamSnap.exists()) {
-          if (isMounted) {
-            Toast.show({ type: 'error', text1: 'Team not found' });
-            router.replace('/(tabs)/HomeScreen');
+            router.replace('/(tabs)');
           }
           return;
         }
 
-        const team: Team = { id: teamRef.id, ...(teamSnap.data() as Omit<Team, 'id'>) };
+        // Read team via REST helper
+        const teamId = userData.teamId;
+        const teamDoc = await getDocument(`teams/${teamId}`);
+        if (!teamDoc) {
+          if (isMounted) {
+            Toast.show({ type: 'error', text1: 'Team not found' });
+            router.replace('/(tabs)');
+          }
+          return;
+        }
+
+        const team: Team = { id: teamDoc.id, ...(teamDoc as any) };
         if (isMounted) {
           setTeamData(team);
 
@@ -133,18 +234,14 @@ export default function CoordinatorDashboardScreen() {
           }
         }
 
-        // ✅ Fetch pending requests safely
-        const q = query(
-          collection(db, 'requests'),
-          where('teamId', '==', teamRef.id),
-          where('status', '==', 'pending')
-        );
-        const reqSnap = await getDocs(q);
-        const fetchedRequests: Request[] = [];
-        reqSnap.forEach((r) => {
-          const data = r.data() as Omit<Request, 'id'>;
-          fetchedRequests.push({ id: r.id, ...data });
+        // Fetch pending requests via REST and filter client-side
+        const reqDocs = await runCollectionQuery({
+          collectionId: 'requests',
+          limit: 500,
         });
+        const fetchedRequests: Request[] = reqDocs
+          .filter((r: any) => r.teamId === team.id && r.status === 'pending')
+          .map((r: any) => ({ id: r.id, ...r }));
 
         if (isMounted) setRequests(fetchedRequests);
       } catch (e) {
@@ -159,21 +256,21 @@ export default function CoordinatorDashboardScreen() {
     return () => {
       isMounted = false;
     };
-  }, [user]);
+  }, [user, router]);
 
-  // Fetch games for the current team
+  // Fetch games for the current team (uses REST)
   const fetchGames = async (teamId?: string) => {
     if (!teamId) return setGames([]);
     try {
-      const q = query(
-        collection(db, 'games'),
-        where('teamId', '==', teamId),
-        orderBy('startISO', 'asc')
-      );
-      const snap = await getDocs(q);
-      const items: any[] = [];
-      snap.forEach((s) => items.push({ id: s.id, ...(s.data() as any) }));
-      setGames(items);
+      await ensureFirestoreOnline();
+      const docs = await runCollectionQuery({
+        collectionId: 'games',
+        // supply where/orderBy as arrays (helper expects arrays)
+        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
+        orderBy: [{ fieldPath: 'startISO', direction: 'ASCENDING' }],
+        limit: 500,
+      });
+      setGames(docs as any[]);
     } catch (err: any) {
       console.warn('Failed to load games', err);
       const msg = err?.message ?? '';
@@ -192,20 +289,128 @@ export default function CoordinatorDashboardScreen() {
     }
   };
 
-  // call fetchGames after teamData loads
   useEffect(() => {
     if (teamData?.id) fetchGames(teamData.id);
   }, [teamData?.id]);
 
-  // ✅ Save team changes
+  // --- Game request types + state ---
+  interface GameRequest {
+    id: string;
+    teamId?: string;
+    requestingTeamId?: string;
+    requestingTeamName?: string;
+    requestedBy?: string;
+    requestedByName?: string;
+    title?: string;
+    startISO?: string;
+    type?: 'home' | 'away';
+    kitColor?: string;
+    status?: string;
+    createdAt?: string;
+  }
+
+  const [gameRequests, setGameRequests] = useState<GameRequest[]>([]);
+  const [loadingGameRequests, setLoadingGameRequests] = useState(false);
+  const [selectedGameRequest, setSelectedGameRequest] = useState<GameRequest | null>(null);
+  const [requestModalVisible, setRequestModalVisible] = useState(false);
+
+  // Fetch game requests for this team (REST)
+  const fetchGameRequests = async (teamId?: string) => {
+    if (!teamId) {
+      setGameRequests([]);
+      return;
+    }
+    setLoadingGameRequests(true);
+    try {
+      await ensureFirestoreOnline();
+      const docs = await runCollectionQuery({
+        collectionId: 'gameRequests',
+        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
+        limit: 500,
+      });
+      const items: GameRequest[] = (docs as any[]).map((d) => ({ id: d.id, ...(d as any) }));
+      setGameRequests(items);
+    } catch (e: any) {
+      console.warn('Failed to load game requests', e);
+      setGameRequests([]);
+    } finally {
+      setLoadingGameRequests(false);
+    }
+  };
+
+  useEffect(() => {
+    if (teamData?.id) fetchGameRequests(teamData.id);
+    else setGameRequests([]);
+  }, [teamData?.id]);
+
+  // Approve a game request: create a game from the request, mark request approved (or delete)
+  const handleApproveGameRequest = async (req: GameRequest) => {
+    if (!teamData?.id) return;
+    try {
+      await ensureFirestoreOnline();
+
+      const payload: any = {
+        teamId: teamData.id,
+        title: req.title ?? 'Game Request',
+        type: req.type ?? 'home',
+        startISO: req.startISO ?? new Date().toISOString(),
+        location: teamData.location ?? '',
+        createdBy: req.requestedBy ?? user?.uid,
+        createdAt: new Date().toISOString(),
+      };
+      if (req.kitColor) payload.kitColor = req.kitColor;
+
+      // create the game (safe helper)
+      await addDocSafe('games', payload);
+
+      // mark request approved (or delete) using safe update/delete
+      try {
+        await updateDocSafe(`gameRequests/${req.id}`, { status: 'approved' });
+      } catch {
+        try {
+          await deleteDocSafe(`gameRequests/${req.id}`);
+        } catch (err) {
+          console.warn('Failed to remove game request after approval', err);
+        }
+      }
+
+      Toast.show({ type: 'success', text1: 'Game created', text2: `${req.requestingTeamName ?? 'Team'} — scheduled` });
+      await fetchGames(teamData.id);
+      await fetchGameRequests(teamData.id);
+      setRequestModalVisible(false);
+      setSelectedGameRequest(null);
+    } catch (e: any) {
+      console.error('Approve game request failed', e);
+      Toast.show({ type: 'error', text1: 'Approve failed', text2: e?.message || '' });
+    }
+  };
+
+  // Reject a game request: mark rejected or delete
+  const handleRejectGameRequest = async (reqId: string) => {
+    try {
+      await ensureFirestoreOnline();
+      try {
+        await updateDocSafe(`gameRequests/${reqId}`, { status: 'rejected' });
+      } catch {
+        await deleteDocSafe(`gameRequests/${reqId}`);
+      }
+      Toast.show({ type: 'info', text1: 'Game request rejected' });
+      if (teamData?.id) fetchGameRequests(teamData.id);
+      setRequestModalVisible(false);
+      setSelectedGameRequest(null);
+    } catch (e: any) {
+      console.error('Reject game request failed', e);
+      Toast.show({ type: 'error', text1: 'Reject failed', text2: e?.message || '' });
+    }
+  };
+
+  // Save team changes
   const handleSaveTeam = async () => {
     if (!teamData?.id) return;
     setSaving(true);
-    const teamRef = doc(db, 'teams', teamData.id);
-
     try {
       // 1) update the team document
-      await updateDoc(teamRef, {
+      await updateDocSafe(`teams/${teamData.id}`, {
         teamName: teamData.teamName,
         location: teamData.location ?? '',
         latitude: teamData.latitude ?? null,
@@ -216,18 +421,18 @@ export default function CoordinatorDashboardScreen() {
 
       // 2) propagate cached teamName to requests (so HomeScreen and other lists show updated name)
       try {
-        const reqQ = query(collection(db, 'requests'), where('teamId', '==', teamData.id));
-        const reqSnap = await getDocs(reqQ);
-        if (!reqSnap.empty) {
-          const batch = writeBatch(db);
-          reqSnap.forEach((r) => {
-            batch.update(doc(db, 'requests', r.id), { teamName: teamData.teamName });
-          });
-          await batch.commit();
+        const reqDocs = await runCollectionQuery({
+          collectionId: 'requests',
+          where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
+          limit: 500,
+        });
+
+        if (reqDocs.length) {
+          const ops = (reqDocs as any[]).map((r: any) => ({ op: 'update' as const, path: `requests/${r.id}`, data: { teamName: teamData.teamName } }));
+          await runBatchSafe(ops);
         }
       } catch (propErr) {
         console.warn('Failed to update cached teamName in requests', propErr);
-        // Non-fatal — team doc already saved
       }
 
       Toast.show({ type: 'success', text1: 'Team updated' });
@@ -240,25 +445,26 @@ export default function CoordinatorDashboardScreen() {
     }
   };
 
-  // ✅ Approve coordinator request
+  const handleCancelEdit = () => {
+    if (originalTeamRef.current) setTeamData(originalTeamRef.current);
+    setEditing(false);
+  };
+
+  // Approve coordinator request
   const handleApprove = async (request: Request) => {
     try {
-      const userRef = doc(db, 'users', request.userId);
-      await updateDoc(userRef, { isCoordinator: true, teamId: request.teamId });
+      await updateDocSafe(`users/${request.userId}`, { isCoordinator: true, teamId: request.teamId });
+      await updateDocSafe(`requests/${request.id}`, { status: 'approved' });
 
-      const requestRef = doc(db, 'requests', request.id);
-      await updateDoc(requestRef, { status: 'approved' });
-
-      // Remove other pending requests for same team
-      const q = query(
-        collection(db, 'requests'),
-        where('teamId', '==', request.teamId),
-        where('status', '==', 'pending')
-      );
-      const snap = await getDocs(q);
-      snap.forEach(async (docSnap) => {
-        if (docSnap.id !== request.id) await deleteDoc(docSnap.ref);
+      const snapDocs = await runCollectionQuery({
+        collectionId: 'requests',
+        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: request.teamId }],
+        limit: 500,
       });
+
+      // delete other pending requests (safe delete)
+      const deletes = (snapDocs as any[]).filter((r) => r.id !== request.id).map((r) => ({ op: 'delete' as const, path: `requests/${r.id}` }));
+      if (deletes.length) await runBatchSafe(deletes);
 
       Toast.show({
         type: 'success',
@@ -270,11 +476,10 @@ export default function CoordinatorDashboardScreen() {
       Toast.show({ type: 'error', text1: 'Error approving request', text2: e.message });
     }
   };
-  
+
   const handleReject = async (id: string) => {
     try {
-      const requestRef = doc(db, 'requests', id);
-      await updateDoc(requestRef, { status: 'rejected' });
+      await updateDocSafe(`requests/${id}`, { status: 'rejected' });
       setRequests((prev) => (Array.isArray(prev) ? prev.filter((r) => r.id !== id) : []));
       Toast.show({ type: 'info', text1: 'Request Rejected' });
     } catch (e: any) {
@@ -282,67 +487,126 @@ export default function CoordinatorDashboardScreen() {
     }
   };
 
-  // create a single or recurring game document
-  const handleCreateGame = async () => {
-    if (!teamData?.id || !user?.uid) {
-      Toast.show({ type: 'error', text1: 'Missing team or user' });
-      return;
-    }
-    if (!newGameDate || !newGameTime) {
-      Toast.show({ type: 'error', text1: 'Enter date and time' });
-      return;
-    }
-
-    setCreatingGame(true);
-    try {
-      // parse date/time locally (assume local timezone)
-      const [y, m, d] = newGameDate.split('-').map(Number);
-      const [hh, mm] = newGameTime.split(':').map(Number);
-      const dt = new Date(y, (m || 1) - 1, d, hh || 20, mm || 0, 0);
-      const payload: any = {
-        teamId: teamData.id,
-        title: newGameTitle || 'Game',
-        type: newGameType,
-        startISO: dt.toISOString(),
-        location: teamData.location ?? '',
-        createdBy: user.uid,
-        createdAt: new Date().toISOString(),
-      };
-
-      if (newGameRecurring === 'monthly') {
-        payload.recurring = { freq: 'monthly', dayOfMonth: dt.getDate() };
-      }
-
-      await addDoc(collection(db, 'games'), payload);
-      Toast.show({ type: 'success', text1: 'Game created' });
-      // refresh list
-      await fetchGames(teamData.id);
-      // reset minimal fields
-      setNewGameTitle('Game');
-      setNewGameDate('');
-      setNewGameTime('20:00');
-      setNewGameRecurring('monthly');
-    } catch (e: any) {
-      Toast.show({ type: 'error', text1: 'Create failed', text2: e.message || '' });
-    } finally {
-      setCreatingGame(false);
-    }
-  };
-
   const handleDeleteGame = async (id: string) => {
     try {
-      await deleteDoc(doc(db, 'games', id));
+      await deleteDocSafe(`games/${id}`);
       Toast.show({ type: 'info', text1: 'Game removed' });
       setGames((prev) => (Array.isArray(prev) ? prev.filter((g) => g.id !== id) : []));
     } catch (e: any) {
-      Toast.show({ type: 'error', text1: 'Delete failed', text2: e.message || '' });
+      Toast.show({ type: 'error', text1: 'Delete failed', text2: e?.message || '' });
     }
   };
 
-  // ensure dynamic places component is available and capitalized for JSX
+  // Count coordinators by querying users for teamId
+  const countCoordinators = async (teamId: string) => {
+    const docs = await runCollectionQuery({
+      collectionId: 'users',
+      where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
+      limit: 1000,
+    });
+    return docs.filter((d: any) => !!d.isCoordinator).length;
+  };
+
+  const handleLeaveTeam = async () => {
+    if (!user?.uid || !teamData?.id) return;
+    try {
+      const coordCount = await countCoordinators(teamData.id);
+      if (coordCount <= 1) {
+        Toast.show({
+          type: 'info',
+          text1: 'Cannot leave',
+          text2: 'You are the last coordinator — delete the team instead.',
+        });
+        return;
+      }
+
+      Alert.alert(
+        'Leave Team',
+        'Are you sure you want to leave this team as a coordinator? You will lose coordinator privileges.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Leave',
+            style: 'destructive',
+            onPress: async () => {
+              try {
+                await ensureFirestoreOnline();
+                await updateDocSafe(`users/${user.uid}`, { teamId: '', isCoordinator: false });
+                Toast.show({ type: 'success', text1: 'You left the team' });
+                router.replace('/(tabs)');
+              } catch (e: any) {
+                console.error('Leave failed', e);
+                Toast.show({ type: 'error', text1: 'Leave failed', text2: e?.message || '' });
+              }
+            },
+          },
+        ],
+        { cancelable: true }
+      );
+    } catch (e: any) {
+      console.error('Count coordinators failed', e);
+      Toast.show({ type: 'error', text1: 'Action failed', text2: e?.message || '' });
+    }
+  };
+
+  // Delete team: destructive — removes team doc + games + requests, and clears teamId for users
+  const handleDeleteTeam = async () => {
+    if (!user?.uid || !teamData?.id) return;
+    Alert.alert(
+      'Delete Team',
+      'This will permanently delete the team, its games and requests, and remove the team from member profiles. This action cannot be undone. Continue?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await ensureFirestoreOnline();
+
+              // gather docs (use arrays for where)
+              const gamesDocs = await runCollectionQuery({
+                collectionId: 'games',
+                where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
+                limit: 1000,
+              });
+              const reqDocs = await runCollectionQuery({
+                collectionId: 'requests',
+                where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
+                limit: 1000,
+              });
+              const usersDocs = await runCollectionQuery({
+                collectionId: 'users',
+                where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
+                limit: 1000,
+              });
+
+              const ops: Array<{ op: 'update' | 'delete'; path: string; data?: any }> = [];
+
+              gamesDocs.forEach((g: any) => ops.push({ op: 'delete', path: `games/${g.id}` }));
+              reqDocs.forEach((r: any) => ops.push({ op: 'delete', path: `requests/${r.id}` }));
+              usersDocs.forEach((u: any) => ops.push({ op: 'update', path: `users/${u.id}`, data: { teamId: '', isCoordinator: false } }));
+
+              // finally delete the team doc
+              ops.push({ op: 'delete', path: `teams/${teamData.id}` });
+
+              await runBatchSafe(ops);
+
+              Toast.show({ type: 'success', text1: 'Team deleted' });
+              router.replace('/(tabs)/HomeScreen');
+            } catch (e: any) {
+              console.error('Delete team failed', e);
+              Toast.show({ type: 'error', text1: 'Delete failed', text2: e?.message || '' });
+            }
+          },
+        },
+      ],
+      { cancelable: true }
+    );
+  };
+
   const PlacesComp: any = (placesComponent as any) ?? null;
 
-  // --- Jersey component (accepts optional onPress) ---
   const Jersey = ({
     color,
     label,
@@ -377,9 +641,7 @@ export default function CoordinatorDashboardScreen() {
       </TouchableOpacity>
     );
   };
-  // --- end Jersey ---
 
-  // Basic runtime guards to avoid crashes when user/team data are not loaded
   if (loading) {
     return (
       <View style={styles.center}>
@@ -388,15 +650,12 @@ export default function CoordinatorDashboardScreen() {
       </View>
     );
   }
-  
-  // If there's no signed-in user, send to login
+
   if (!user) {
-    // don't render anything while router navigates
     router.replace('/(auth)/LoginScreen');
     return null;
   }
 
-  // If user is signed-in but team data missing, show a friendly message and navigation
   if (!teamData?.id) {
     return (
       <View style={styles.center}>
@@ -405,16 +664,43 @@ export default function CoordinatorDashboardScreen() {
         </Text>
         <Button title="Create Team" onPress={() => router.push('/(tabs)/CreateTeamScreen')} />
         <View style={{ height: 8 }} />
-        <Button title="Join Team" onPress={() => router.push('/(tabs)/JoinTeamScreen')} />
+        <Button title="Find a Team" onPress={() => router.push('/(tabs)/FindATeam')} />
       </View>
     );
   }
 
   return (
-    <View style={styles.container}>
+    <ScrollView
+      contentContainerStyle={styles.container}
+      keyboardShouldPersistTaps="handled"
+      showsVerticalScrollIndicator={true}
+    >
       <Text style={styles.title}>Coordinator Dashboard</Text>
 
-      {/* Team name: editable only when editing */}
+      <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 10, marginBottom: 12 }}>
+        {!editing ? (
+          <Button
+            title="Edit Team"
+            onPress={() => {
+              originalTeamRef.current = { ...(teamData || {}) };
+              setEditing(true);
+            }}
+            color="#0a7ea4"
+          />
+        ) : (
+          <>
+            <Button title={saving ? 'Saving...' : 'Save'} onPress={handleSaveTeam} disabled={saving} color="#0a7ea4" />
+            <View style={{ width: 10 }} />
+            <Button title="Cancel" onPress={handleCancelEdit} color="#FF3B30" />
+          </>
+        )}
+      </View>
+
+      <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginBottom: 16 }}>
+        <Button title="Leave Team" onPress={handleLeaveTeam} color="#FF9500" />
+        <Button title="Delete Team" onPress={handleDeleteTeam} color="#FF3B30" />
+      </View>
+
       {editing ? (
         <TextInput
           style={styles.input}
@@ -424,24 +710,38 @@ export default function CoordinatorDashboardScreen() {
           placeholder="Team Name"
         />
       ) : (
-        <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
+        <>
+          <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
+          <Text style={[styles.readOnlyText, { marginTop: 6, fontSize: 14 }]}>
+            Rating: {Math.min(Math.max(teamData?.elo ?? 1500, 800), 3000)}
+          </Text>
+        </>
       )}
 
-      {/* Location: editable only when editing */}
       {editing ? (
+        // Location: editable only when editing
         PlacesComp ? (
-          <PlacesComp
-            ref={autocompleteRef}
-            placeholder="Search ice rink..."
-            fetchDetails
-            onPress={(data: any, details: any = null) => {
-              const lat = details?.geometry?.location?.lat ?? 0;
-              const lng = details?.geometry?.location?.lng ?? 0;
-              setTeamData({ ...teamData, location: data.description, latitude: lat, longitude: lng });
-            }}
-            query={{ key: GOOGLE_MAPS_API_KEY, language: 'en', types: 'establishment' }}
-            styles={{ textInput: styles.input, container: { marginBottom: 10 } }}
-          />
+          // Wrap in boundary so if the third-party component throws we don't crash the whole screen
+          <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
+            <PlacesComp
+              ref={autocompleteRef}
+              placeholder="Search ice rink..."
+              fetchDetails
+              onPress={(data: any, details: any = null) => {
+                const lat = details?.geometry?.location?.lat ?? 0;
+                const lng = details?.geometry?.location?.lng ?? 0;
+                setTeamData({ ...teamData, location: data.description, latitude: lat, longitude: lng });
+              }}
+              query={{
+                ...(GOOGLE_MAPS_API_KEY ? { key: GOOGLE_MAPS_API_KEY } : {}),
+                language: 'en',
+                // `types` historically supported; new APIs may require `type` or different query config.
+                // Keep it conservative so the component can decide. If you see warnings, try removing `types`.
+                types: 'establishment',
+              }}
+              styles={{ textInput: styles.input, container: { marginBottom: 10 } }}
+            />
+          </PlacesErrorBoundary>
         ) : (
           <TextInput
             style={styles.input}
@@ -453,7 +753,7 @@ export default function CoordinatorDashboardScreen() {
       ) : (
         <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
       )}
-      
+
       <View style={styles.kitRow}>
         <Jersey
           color={teamData.homeColor ?? '#0a7ea4'}
@@ -493,113 +793,150 @@ export default function CoordinatorDashboardScreen() {
         </View>
       </Modal>
 
-      {editing ? (
-        <Button title="Save Changes" onPress={handleSaveTeam} />
-      ) : (
-        <Button title="Edit Team" onPress={() => setEditing(true)} />
-      )}
-
       <Text style={styles.subtitle}>Pending Coordinator Requests</Text>
-      {requests.length === 0 ? (
-        <Text style={styles.noRequests}>No pending requests</Text>
-      ) : (
-        <FlatList
-          data={requests}
-          keyExtractor={(item) => item.id}
-          renderItem={({ item }) => (
-            <View style={styles.requestCard}>
-              <Text style={styles.requestEmail}>{item.userEmail}</Text>
-              <View style={styles.requestButtons}>
-                <TouchableOpacity
-                  style={[styles.actionButton, { backgroundColor: '#0a7ea4' }]}
-                  onPress={() => handleApprove(item)}
-                >
-                  <Text style={styles.buttonText}>Approve</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  style={[styles.actionButton, { backgroundColor: '#FF3B30' }]}
-                  onPress={() => handleReject(item.id)}
-                >
-                  <Text style={styles.buttonText}>Reject</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          )}
-        />
-      )}
-
-      <Text style={styles.subtitle}>Games / Availability</Text>
-
-      {/* Create game form */}
-      <View style={{ borderWidth: 1, borderColor: '#eee', padding: 10, borderRadius: 8, marginBottom: 12 }}>
-        <TextInput
-          style={styles.input}
-          placeholder="Title"
-          value={newGameTitle}
-          onChangeText={setNewGameTitle}
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Date (YYYY-MM-DD)"
-          value={newGameDate}
-          onChangeText={setNewGameDate}
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Time (HH:MM)"
-          value={newGameTime}
-          onChangeText={setNewGameTime}
-        />
-
-        <View style={{ flexDirection: 'row', gap: 8, marginVertical: 6 }}>
-          <Button
-            title={newGameType === 'home' ? 'Home' : 'Away'}
-            onPress={() => setNewGameType((t) => (t === 'home' ? 'away' : 'home'))}
-            color={newGameType === 'home' ? '#0a7ea4' : '#999'}
-          />
-          <Button
-            title={newGameRecurring === 'monthly' ? 'Monthly' : 'Single'}
-            onPress={() => setNewGameRecurring((r) => (r === 'monthly' ? 'none' : 'monthly'))}
-            color={newGameRecurring === 'monthly' ? '#0a7ea4' : '#999'}
-          />
-        </View>
-
-        <View style={{ marginTop: 6 }}>
-          <Button title={creatingGame ? 'Creating...' : 'Create Game'} onPress={handleCreateGame} disabled={creatingGame} />
-        </View>
-      </View>
-
-      {/* Upcoming games list */}
-      {games.length === 0 ? (
-        <Text style={styles.noRequests}>No scheduled games</Text>
-      ) : (
-        <FlatList
-          data={games}
-          keyExtractor={(item) => item.id}
-          renderItem={({ item }) => {
-            const dt = new Date(item.startISO);
-            return (
+      <View style={styles.listPanel}>
+        {requests.length === 0 ? (
+          <Text style={styles.noRequests}>No pending requests</Text>
+        ) : (
+          <FlatList
+            data={requests}
+            keyExtractor={(item) => item.id}
+            nestedScrollEnabled
+            contentContainerStyle={{ paddingBottom: 8 }}
+            renderItem={({ item }) => (
               <View style={styles.requestCard}>
-                <Text style={{ fontWeight: '600' }}>{item.title} — {item.type?.toUpperCase()}</Text>
-                <Text>{dt.toLocaleString()}</Text>
-                {item.recurring && <Text style={{ color: '#666' }}>Recurring: {item.recurring.freq}</Text>}
-                <View style={{ flexDirection: 'row', marginTop: 8 }}>
-                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#FF3B30' }]} onPress={() => handleDeleteGame(item.id)}>
-                    <Text style={styles.buttonText}>Delete</Text>
+                <Text style={styles.requestEmail}>{item.userEmail}</Text>
+                <View style={styles.requestButtons}>
+                  <TouchableOpacity
+                    style={[styles.actionButton, { backgroundColor: '#0a7ea4' }]}
+                    onPress={() => handleApprove(item)}
+                  >
+                    <Text style={styles.buttonText}>Approve</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.actionButton, { backgroundColor: '#FF3B30' }]}
+                    onPress={() => handleReject(item.id)}
+                  >
+                    <Text style={styles.buttonText}>Reject</Text>
                   </TouchableOpacity>
                 </View>
               </View>
-            );
-          }}
+            )}
+          />
+        )}
+      </View>
+
+      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
+        <Text style={styles.subtitle}>Game Requests</Text>
+        <Button
+          title="Open Scheduler"
+          onPress={() => router.push('/(tabs)/GameSchedulerScreen')}
+          color="#0a7ea4"
         />
-      )}
-    </View>
+      </View>
+
+      <View style={styles.listPanel}>
+        {loadingGameRequests ? (
+          <ActivityIndicator size="small" color="#0a7ea4" />
+        ) : gameRequests.length === 0 ? (
+          <Text style={styles.noRequests}>No game requests</Text>
+        ) : (
+          <FlatList
+            data={gameRequests}
+            keyExtractor={(item) => item.id}
+            nestedScrollEnabled
+            contentContainerStyle={{ paddingBottom: 8 }}
+            renderItem={({ item }) => {
+              if (!item) return null;
+              const dtText = item.startISO ? new Date(item.startISO).toLocaleString() : 'No time';
+              const requesting = item.requestingTeamName ?? item.requestingTeamId ?? 'Unknown Team';
+              return (
+                <TouchableOpacity
+                  style={styles.requestCard}
+                  onPress={() => {
+                    setSelectedGameRequest(item);
+                    setRequestModalVisible(true);
+                  }}
+                >
+                  <Text style={{ fontWeight: '700' }}>Game Request — {requesting}</Text>
+                  <Text style={{ color: '#444' }}>{dtText} • { (item.type ?? 'home').toUpperCase() }</Text>
+                </TouchableOpacity>
+              );
+            }}
+          />
+        )}
+      </View>
+
+      <Modal visible={requestModalVisible} animationType="slide" onRequestClose={() => { setRequestModalVisible(false); setSelectedGameRequest(null); }}>
+        <View style={styles.modalContainer}>
+          <Text style={styles.modalTitle}>Game Request</Text>
+          {selectedGameRequest ? (
+            <>
+              <Text style={{ fontSize: 18, fontWeight: '700', marginBottom: 8 }}>{selectedGameRequest.title ?? 'Game'}</Text>
+              <Text>Requesting Team: {selectedGameRequest.requestingTeamName ?? 'Unknown'}</Text>
+              <Text>Requester: {selectedGameRequest.requestedByName ?? selectedGameRequest.requestedBy ?? 'Unknown'}</Text>
+              <Text>Type: {(selectedGameRequest.type ?? 'home').toUpperCase()}</Text>
+              <Text>Kit Color: {selectedGameRequest.kitColor ?? 'n/a'}</Text>
+              <Text>Time: {selectedGameRequest.startISO ? new Date(selectedGameRequest.startISO).toLocaleString() : 'n/a'}</Text>
+
+              <View style={{ height: 12 }} />
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+                <Button title="Approve" color="#0a7ea4" onPress={() => selectedGameRequest && handleApproveGameRequest(selectedGameRequest)} />
+                <Button title="Reject" color="#FF3B30" onPress={() => selectedGameRequest && handleRejectGameRequest(selectedGameRequest.id)} />
+                <Button title="Close" color="#999" onPress={() => { setRequestModalVisible(false); setSelectedGameRequest(null); }} />
+              </View>
+            </>
+          ) : (
+            <Text>No request selected</Text>
+          )}
+        </View>
+      </Modal>
+
+      <Text style={styles.subtitle}>Games / Availability</Text>
+
+      <View style={styles.listPanel}>
+        {games.length === 0 ? (
+          <Text style={styles.noRequests}>No scheduled games</Text>
+        ) : (
+          <FlatList
+            data={games}
+            keyExtractor={(item) => item.id}
+            nestedScrollEnabled
+            contentContainerStyle={{ paddingBottom: 8 }}
+            renderItem={({ item }) => {
+              if (!item) return null;
+
+              const dt = item?.startISO ? new Date(item.startISO) : null;
+              const title = item?.title ?? 'Game';
+              const typeLabel = (item?.type ?? '').toString().toUpperCase() || 'N/A';
+              const recurringFreq = item?.recurring?.freq ?? null;
+
+              return (
+                <View style={styles.requestCard}>
+                  <Text style={{ fontWeight: '600' }}>{title} — {typeLabel}</Text>
+                  <Text>{dt ? dt.toLocaleString() : 'No time set'}</Text>
+                  {recurringFreq ? <Text style={{ color: '#666' }}>Recurring: {String(recurringFreq)}</Text> : null}
+                  <View style={{ flexDirection: 'row', marginTop: 8 }}>
+                    <TouchableOpacity
+                      style={[styles.actionButton, { backgroundColor: '#FF3B30' }]}
+                      onPress={() => item?.id && handleDeleteGame(item.id)}
+                    >
+                      <Text style={styles.buttonText}>Delete</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            }}
+          />
+        )}
+      </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  container: { flex: 1, padding: 20, backgroundColor: '#fff' },
+  container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
   title: {
     fontSize: 26,
     fontWeight: 'bold',
@@ -660,4 +997,57 @@ const styles = StyleSheet.create({
     color: '#333',
     fontSize: 16,
   },
+  listPanel: {
+    maxHeight: 220,
+    marginBottom: 12,
+  },
 });
+
+// --- place this inside CoordinatorDashboardScreen, just after originalTeamRef declaration ---
+async function waitForAuthUser(timeoutMs = 3000): Promise<any | null> {
+  const a = auth as any;
+  if (!a) return null;
+
+  // fast-path
+  if (a.currentUser) return a.currentUser;
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (u: any) => {
+      if (!done) {
+        done = true;
+        resolve(u ?? null);
+      }
+    };
+
+    try {
+      // Native SDK: auth.onAuthStateChanged exists on the auth object
+      if (typeof a.onAuthStateChanged === 'function') {
+        const unsub = a.onAuthStateChanged((u: any) => {
+          finish(u);
+          try { unsub(); } catch {}
+        });
+        // guaranteed timeout fallback
+        setTimeout(() => { finish(a.currentUser ?? null); try { unsub(); } catch {} }, timeoutMs);
+        return;
+      }
+
+      // Web modular: import onAuthStateChanged and subscribe
+      import('firebase/auth')
+        .then(({ onAuthStateChanged }) => {
+          try {
+            const unsub = onAuthStateChanged(a, (u: any) => {
+              finish(u);
+              try { unsub(); } catch {}
+            });
+            setTimeout(() => { finish(a.currentUser ?? null); try { unsub(); } catch {} }, timeoutMs);
+          } catch {
+            finish(a.currentUser ?? null);
+          }
+        })
+        .catch(() => finish(a.currentUser ?? null));
+    } catch {
+      finish(a.currentUser ?? null);
+    }
+  });
+}
