@@ -1,5 +1,5 @@
 import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
-import { debugAuthState, getDocument, runCollectionQuery } from '@/firestoreRest';
+import { debugAuthState, getDocument, listTopLevelCollection } from '@/firestoreRest';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useState } from 'react';
@@ -42,14 +42,39 @@ export default function HomeScreen() {
       // ignore debug helper errors
     }
 
+    // diagnostic: print auth token/payload and caller user doc to debug 403
+    try {
+      const dbg = await debugAuthState?.('Home.fetchGameRequests-before-runQuery');
+      console.log('[Home] debugAuthState:', dbg);
+    } catch (dbgErr) {
+      console.warn('[Home] debugAuthState failed', dbgErr);
+    }
+
+    try {
+      const callerUid = (auth as any)?.currentUser?.uid ?? null;
+      console.log('[Home] callerUid:', callerUid, 'teamId being queried:', teamId);
+      if (callerUid) {
+        try {
+          const myUser = await getDocument(`users/${callerUid}`);
+          console.log('[Home] users doc for caller:', myUser);
+        } catch (udErr) {
+          console.warn('[Home] getDocument users/<uid> failed', udErr);
+        }
+      } else {
+        console.warn('[Home] no auth.currentUser.uid available before runCollectionQuery');
+      }
+    } catch (err) {
+      console.warn('[Home] diagnostics failed', err);
+    }
+
     try {
       await ensureFirestoreOnline();
-      const docs = await runCollectionQuery({
-        collectionId: 'gameRequests',
-        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
-        limit: 50,
-      });
-      const items = (docs as any[]).map((d) => ({ id: d.id, ...(d as any) }));
+
+      // List the top-level 'gameRequests' collection and filter client-side for this teamId.
+      // We use listTopLevelCollection to avoid runQuery -> rules mismatch issues.
+      const all = await listTopLevelCollection('gameRequests', 500);
+      const teamOnly = (all as any[]).filter((d) => d.teamId === teamId);
+      const items = teamOnly.map((d) => ({ id: d.id, ...(d as any) }));
       setGameRequests(items);
       setLoadingGameRequests(false);
     } catch (e: any) {
@@ -64,12 +89,9 @@ export default function HomeScreen() {
         await new Promise((r) => setTimeout(r, 1200));
         try {
           await ensureFirestoreOnline();
-          const docs = await runCollectionQuery({
-            collectionId: 'gameRequests',
-            where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
-            limit: 50,
-          });
-          const items = (docs as any[]).map((d) => ({ id: d.id, ...(d as any) }));
+          const all = await listTopLevelCollection('gameRequests', 500);
+          const teamOnly = (all as any[]).filter((d) => d.teamId === teamId);
+          const items = teamOnly.map((d) => ({ id: d.id, ...(d as any) }));
           setGameRequests(items);
         } catch (e2: any) {
           console.warn('Home: retry also failed for gameRequests', e2);
@@ -86,9 +108,15 @@ export default function HomeScreen() {
   }
 
   useEffect(() => {
-    if (teamData?.id) fetchGameRequests(teamData.id);
-    else setGameRequests([]);
-  }, [teamData?.id]);
+    // Only attempt to fetch pending game requests for team coordinators.
+    // Our security rules require the caller to be a coordinator for the team.
+    if (teamData?.id && userData?.isCoordinator) {
+      fetchGameRequests(teamData.id);
+    } else {
+      // Ensure we clear any stale preview for non-coordinators
+      setGameRequests([]);
+    }
+  }, [teamData?.id, userData?.isCoordinator]);
 
   useEffect(() => {
     let mounted = true;

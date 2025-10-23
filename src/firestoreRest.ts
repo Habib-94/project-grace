@@ -210,9 +210,33 @@ export async function runCollectionQuery({
   }
   if (limit != null) structured.structuredQuery.limit = limit;
 
+  // ====== DEBUG LOGGING ADDED START ======
+  try {
+    // Print the structuredQuery body so we can compare with rules expectations
+    console.log('[firestoreRest] runCollectionQuery structuredQuery:', JSON.stringify(structured));
+    // Print auth/debug info (uid + token payload)
+    try {
+      const dbg = await debugAuthState('runCollectionQuery-before-fetch');
+      console.log('[firestoreRest] debugAuthState (runCollectionQuery):', {
+        hasCurrentUser: !!dbg.currentUser,
+        uid: dbg.payload?.user_id ?? dbg.payload?.uid ?? null,
+        tokenPresent: !!dbg.token,
+        tokenPayload: dbg.payload ? { uid: dbg.payload?.user_id ?? dbg.payload?.uid, exp: dbg.payload?.exp } : null,
+      });
+    } catch (e) {
+      console.warn('[firestoreRest] debugAuthState failed during runCollectionQuery logging', e);
+    }
+  } catch (e) {
+    // logging must not break production flows
+    console.warn('[firestoreRest] failed to log structuredQuery for debugging', e);
+  }
+  // ====== DEBUG LOGGING ADDED END ======
+
   const res = await fetchWithAuth(url, { method: 'POST', body: JSON.stringify(structured) });
   if (!res.ok) {
-    const text = await res.text();
+    const text = await res.text().catch(() => '<no body>');
+    // Log the response body for diagnostics (helps identify permission reasons)
+    console.warn('[firestoreRest] runCollectionQuery non-ok response', { status: res.status, body: text });
     throw new Error(`REST runQuery failed ${res.status}: ${text}`);
   }
   const lines = (await res.text()).split('\n').filter(Boolean);
@@ -329,8 +353,61 @@ export async function queryTeams({ limit = 50 } = {}) {
   return runCollectionQuery({ collectionId: 'teams', orderBy: [{ fieldPath: 'teamName' }], limit });
 }
 
+/**
+ * List documents in a subcollection of a specific parent document.
+ * Returns an array of parsed document objects.
+ */
+export async function listDocumentsInSubcollection(parentPath: string, collectionId: string, pageSize?: number) {
+  if (!PROJECT_ID) throw new Error('Missing PROJECT_ID for Firestore REST');
+  // Build URL for listing a collection under a parent doc, e.g.:
+  // GET https://firestore.googleapis.com/v1/projects/PROJECT_ID/databases/(default)/documents/{parentPath}/{collectionId}?pageSize=50
+  const base = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+  const url = `${base}/${parentPath}/${collectionId}${pageSize ? `?pageSize=${pageSize}` : ''}`;
+  const res = await fetchWithAuth(url, { method: 'GET' });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '<no body>');
+    console.warn('[firestoreRest] listDocumentsInSubcollection non-ok response', { status: res.status, body: text });
+    throw new Error(`REST list documents failed ${res.status}: ${text}`);
+  }
+  const json = await res.json().catch(() => null);
+  const docs: any[] = [];
+  if (json && Array.isArray(json.documents)) {
+    for (const docJson of json.documents) {
+      docs.push(parseDocumentJson(docJson));
+    }
+  }
+  return docs;
+}
+
+/**
+ * List documents in a top-level collection, e.g. GET /projects/.../documents/{collectionId}
+ * Returns parsed documents array.
+ */
+export async function listTopLevelCollection(collectionId: string, pageSize?: number) {
+  if (!PROJECT_ID) throw new Error('Missing PROJECT_ID for Firestore REST');
+  const base = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
+  const url = `${base}/${collectionId}${pageSize ? `?pageSize=${pageSize}` : ''}`;
+  const res = await fetchWithAuth(url, { method: 'GET' });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '<no body>');
+    console.warn('[firestoreRest] listTopLevelCollection non-ok response', { status: res.status, body: text });
+    throw new Error(`REST list top-level collection failed ${res.status}: ${text}`);
+  }
+  const json = await res.json().catch(() => null);
+  const docs: any[] = [];
+  if (json && Array.isArray(json.documents)) {
+    for (const docJson of json.documents) {
+      docs.push(parseDocumentJson(docJson));
+    }
+  }
+  return docs;
+}
+
+// Export default (add new helper if you export default at bottom)
 export default {
   getDocument,
   runCollectionQuery,
   queryTeams,
+  listDocumentsInSubcollection,
+  listTopLevelCollection,
 };

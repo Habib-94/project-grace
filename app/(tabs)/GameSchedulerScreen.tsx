@@ -2,18 +2,19 @@ import DateTimePicker from '@react-native-community/datetimepicker';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
-    ActivityIndicator,
-    FlatList,
-    Pressable,
-    StyleSheet,
-    Text,
-    TextInput,
-    View
+  ActivityIndicator,
+  Alert,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from 'react-native';
 
 import Toast from 'react-native-toast-message';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig'; // db/auth/ensure helper
-import { debugAuthState, getDocument, runCollectionQuery } from '../../src/firestoreRest';
+import { debugAuthState, getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
 
 // Minimal types for this screen
 type Game = {
@@ -23,6 +24,9 @@ type Game = {
   location?: { lat?: number; lng?: number; label?: string };
   kitColor?: string | null;
   teamId?: string;
+  teamName?: string;      // NEW: human-readable team name
+  teamLocation?: string;  // human-readable location for the team (teams/{teamId}.location)
+  type?: string;          // game type (e.g. 'home'|'away'|'open')
   elo?: number;
   createdBy?: string;
 };
@@ -111,6 +115,49 @@ export default function GameSchedulerScreen() {
     }
   }
 
+  // runtime-safe delete helper (same pattern as other safe helpers)
+  async function deleteDocSafe(path: string) {
+    const parts = path.split('/');
+    const col = parts[0];
+    const id = parts[1];
+    if (!col || !id) throw new Error('deleteDocSafe expects "collection/docId" path');
+
+    if (db && typeof (db as any).collection === 'function') {
+      return (db as any).collection(col).doc(id).delete();
+    } else {
+      const { doc, deleteDoc } = await import('firebase/firestore');
+      return deleteDoc(doc(db as any, col, id));
+    }
+  }
+
+  // Confirm + delete a created game, update UI
+  function deleteCreatedGame(id: string) {
+    if (!id) return;
+    Alert.alert(
+      'Delete Game',
+      'Are you sure you want to delete this game? This action cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await ensureFirestoreOnline();
+              await deleteDocSafe(`games/${id}`);
+              setCreatedGames((prev) => prev.filter((g) => g.id !== id));
+              Toast.show({ type: 'info', text1: 'Game removed' });
+            } catch (e: any) {
+              console.error('[GameScheduler] deleteCreatedGame failed', e);
+              Toast.show({ type: 'error', text1: 'Delete failed', text2: e?.message ?? '' });
+            }
+          },
+        },
+      ],
+      { cancelable: true }
+    );
+  }
+
   // Create games for each preview occurrence
   async function createGames() {
     try {
@@ -133,6 +180,16 @@ export default function GameSchedulerScreen() {
       if (!isCoordinator || !teamId) {
         Toast.show({ type: 'error', text1: 'Permission denied', text2: 'You must be a coordinator with a team to create games.' });
         return;
+      }
+
+      // after `const teamId = userDoc.teamId;`
+      let teamName = '';
+      try {
+        const teamDoc = await getDocument(`teams/${teamId}`);
+        teamName = (teamDoc?.teamName as string) ?? '';
+      } catch (e) {
+        // ignore; we'll fall back to showing teamId in the UI
+        teamName = '';
       }
 
       let created = 0;
@@ -163,7 +220,18 @@ export default function GameSchedulerScreen() {
               // If we got a doc back, immediately prepend it to createdGames so UI shows the new slot
               if (doc) {
                 setCreatedGames((prev) => [
-                  { id: createdId, title: doc.title, startISO: doc.startISO, location: doc.location, kitColor: doc.kitColor ?? null, teamId: doc.teamId, elo: doc.elo, createdBy: doc.createdBy },
+                  {
+                    id: createdId,
+                    title: doc.title,
+                    startISO: doc.startISO,
+                    location: doc.location,
+                    kitColor: doc.kitColor ?? null,
+                    teamId: doc.teamId,
+                    teamName: teamName || (doc.teamName ?? ''), // prefer teamName we fetched, else any teamName on the doc
+                    teamLocation: doc.teamLocation ?? '',
+                    elo: doc.elo,
+                    createdBy: doc.createdBy,
+                  },
                   ...prev,
                 ]);
               }
@@ -218,31 +286,73 @@ export default function GameSchedulerScreen() {
       }
 
       const uid = auth.currentUser.uid;
-      // Use REST runCollectionQuery to find games createdBy == uid
-      const docs = await runCollectionQuery({
-        collectionId: 'games',
-        where: [{ fieldPath: 'createdBy', op: 'EQUAL', value: uid }],
-        limit: 1000,
-      });
 
-      const items: Game[] = (docs as any[]).map((d) => ({
-        id: d.id,
-        title: d.title,
-        startISO: d.startISO,
-        location: d.location,
-        kitColor: d.kitColor ?? null,
-        teamId: d.teamId,
-        elo: d.elo,
-        createdBy: d.createdBy,
-      }));
+      // Prefer listing the top-level collection (avoids runQuery structuredQuery + rules mismatch)
+      let docs: any[] = [];
+      try {
+        docs = await listTopLevelCollection('games', 1000);
+      } catch (listErr) {
+        console.warn('[GameScheduler] listTopLevelCollection failed, falling back to runCollectionQuery', listErr);
+        // Fallback: try the structured runQuery as before (may still be blocked by rules)
+        try {
+          docs = await runCollectionQuery({
+            collectionId: 'games',
+            where: [{ fieldPath: 'createdBy', op: 'EQUAL', value: uid }],
+            limit: 1000,
+          });
+        } catch (qErr) {
+          console.warn('[GameScheduler] runCollectionQuery fallback failed', qErr);
+          docs = [];
+        }
+      }
 
-      // Client-side sort by startISO (docs without startISO go to the end)
-      items.sort((a, b) => {
-        if (!a.startISO && !b.startISO) return 0;
-        if (!a.startISO) return 1;
-        if (!b.startISO) return -1;
-        return a.startISO.localeCompare(b.startISO);
-      });
+      // Keep only docs created by current user
+      const myDocs = (docs as any[]).filter((d) => d?.createdBy === uid);
+
+      // Collect unique teamIds present in the results
+      const teamIds = Array.from(new Set(myDocs.map((d) => d?.teamId).filter(Boolean)));
+
+      // Fetch team docs in parallel to get the team's name + location (if available)
+      const teamInfoMap: Record<string, { name: string; location: string }> = {};
+      if (teamIds.length) {
+        await Promise.all(
+          teamIds.map(async (tid) => {
+            try {
+              const teamDoc = await getDocument(`teams/${tid}`);
+              teamInfoMap[tid] = {
+                name: (teamDoc?.teamName as string) ?? '',
+                location: (teamDoc?.location as string) ?? '',
+              };
+            } catch (e) {
+              console.warn('[GameScheduler] failed to read team doc for', tid, e);
+              teamInfoMap[tid] = { name: '', location: '' };
+            }
+          })
+        );
+      }
+
+      // Map into typed items and attach teamLocation (falls back to game's own location.label)
+      const items: Game[] = myDocs
+        .map((d) => ({
+          id: d.id,
+          title: d.title,
+          startISO: d.startISO,
+          location: d.location,
+          kitColor: d.kitColor ?? null,
+          teamId: d.teamId,
+          teamName: d.teamId ? teamInfoMap[d.teamId]?.name ?? '' : '',
+          teamLocation: d.teamId ? teamInfoMap[d.teamId]?.location ?? '' : (d.location?.label ?? ''),
+          type: d.type ?? 'open',
+          elo: d.elo,
+          createdBy: d.createdBy,
+        }))
+        // Client-side sort by startISO (docs without startISO go to the end)
+        .sort((a, b) => {
+          if (!a.startISO && !b.startISO) return 0;
+          if (!a.startISO) return 1;
+          if (!b.startISO) return -1;
+          return a.startISO.localeCompare(b.startISO);
+        });
 
       setCreatedGames(items);
     } catch (e: any) {
@@ -354,34 +464,53 @@ export default function GameSchedulerScreen() {
 
   return (
     <View style={styles.container}>
-      <FlatList
-        data={[]} // no in-page available games anymore; header contains scheduler UI
-        renderItem={() => null}          // <- add this no-op renderItem to satisfy types
-        ListHeaderComponent={renderHeader}
-        ListFooterComponent={() => (
-          <View style={{ padding: 16 }}>
-            <Text style={{ fontWeight: '700', marginBottom: 8 }}>Your created games</Text>
-            {fetchingCreatedGames ? (
-              <ActivityIndicator />
-            ) : createdGames.length === 0 ? (
-              <Text style={{ color: '#666' }}>No games created by you</Text>
-            ) : (
-              <FlatList
-                data={createdGames}
-                keyExtractor={(i) => i.id}
-                renderItem={({ item }) => (
-                  <View style={{ padding: 8, borderWidth: 1, borderColor: '#eee', borderRadius: 6, marginBottom: 8 }}>
-                    <Text style={{ fontWeight: '600' }}>{item.title}</Text>
-                    <Text style={{ color: '#666' }}>{item.startISO ? new Date(item.startISO).toLocaleString() : 'TBA'}</Text>
-                    <Text style={{ color: '#666' }}>Team: {item.teamId ?? '—'}</Text>
-                  </View>
-                )}
-              />
-            )}
-          </View>
-        )}
+      <ScrollView
         contentContainerStyle={{ padding: 16 }}
-      />
+        keyboardShouldPersistTaps="handled"
+        showsVerticalScrollIndicator={false}
+      >
+        {renderHeader()}
+
+        <View style={{ padding: 16 }}>
+          <Text style={{ fontWeight: '700', marginBottom: 8 }}>Your created games</Text>
+          {fetchingCreatedGames ? (
+            <ActivityIndicator />
+          ) : createdGames.length === 0 ? (
+            <Text style={{ color: '#666' }}>No games created by you</Text>
+          ) : (
+            createdGames.map((item) => {
+              const dt = item.startISO ? new Date(item.startISO) : null;
+              const title = item.title ?? 'Game';
+              const typeLabel = (item.type ?? '').toString().toUpperCase() || 'N/A';
+
+              return (
+                <View key={item.id} style={styles.gameCard}>
+                  {/* Delete button top-right */}
+                  <View style={{ position: 'absolute', right: 10, top: 10 }}>
+                    <Pressable onPress={() => deleteCreatedGame(item.id)} style={{ paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#FF3B30', borderRadius: 6 }}>
+                      <Text style={{ color: 'white', fontWeight: '600' }}>Delete</Text>
+                    </Pressable>
+                  </View>
+
+                  {/* kit color pill */}
+                  <View style={[styles.colorPill, { backgroundColor: item.kitColor ?? '#ccc', marginBottom: 8 }]} />
+
+                  <Text style={styles.gameTitle}>{title}</Text>
+
+                  {/* main meta: date and type */}
+                  <Text style={styles.gameMeta}>{dt ? dt.toLocaleString() : 'TBA'} • {typeLabel}</Text>
+
+                  {/* Team and Team Location (prefer attached teamLocation, else fall back to game's own location.label or teamId) */}
+                  <Text style={styles.gameMeta}>Team: {item.teamName ?? item.teamId ?? '—'}</Text>
+                  <Text style={styles.gameMeta}>
+                    Location: {item.teamLocation ? item.teamLocation : (item.location?.label ?? '—')}
+                  </Text>
+                </View>
+              );
+            })
+          )}
+        </View>
+      </ScrollView>
     </View>
   );
 }

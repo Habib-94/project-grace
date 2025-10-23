@@ -8,18 +8,17 @@ import {
   ActivityIndicator,
   Alert,
   Button,
-  FlatList,
   Modal,
-  ScrollView,
+  SectionList,
   StyleSheet,
   Text,
   TextInput,
   TouchableOpacity,
-  View,
+  View
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
-import { getDocument, runCollectionQuery } from '../../src/firestoreRest';
+import { getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
 
 // Read API key from app config or env
 const GOOGLE_MAPS_API_KEY =
@@ -234,12 +233,9 @@ export default function CoordinatorDashboardScreen() {
           }
         }
 
-        // Fetch pending requests via REST and filter client-side
-        const reqDocs = await runCollectionQuery({
-          collectionId: 'requests',
-          limit: 500,
-        });
-        const fetchedRequests: Request[] = reqDocs
+        // Fetch pending coordinator-join requests from top-level 'requests' and filter client-side
+        const reqDocs = await listTopLevelCollection('requests', 500);
+        const fetchedRequests: Request[] = (reqDocs as any[])
           .filter((r: any) => r.teamId === team.id && r.status === 'pending')
           .map((r: any) => ({ id: r.id, ...r }));
 
@@ -263,14 +259,20 @@ export default function CoordinatorDashboardScreen() {
     if (!teamId) return setGames([]);
     try {
       await ensureFirestoreOnline();
-      const docs = await runCollectionQuery({
-        collectionId: 'games',
-        // supply where/orderBy as arrays (helper expects arrays)
-        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
-        orderBy: [{ fieldPath: 'startISO', direction: 'ASCENDING' }],
-        limit: 500,
+      // Note: remove server-side orderBy to avoid composite index requirement.
+      // List top-level games and filter for this team
+      const docs = await listTopLevelCollection('games', 500);
+
+      // Parse and client-sort by startISO (docs without startISO go to the end)
+      const parsed = (docs as any[]).map((d) => ({ id: d.id, ...(d as any) }));
+      parsed.sort((a, b) => {
+        if (!a.startISO && !b.startISO) return 0;
+        if (!a.startISO) return 1;
+        if (!b.startISO) return -1;
+        return String(a.startISO).localeCompare(String(b.startISO));
       });
-      setGames(docs as any[]);
+
+      setGames(parsed);
     } catch (err: any) {
       console.warn('Failed to load games', err);
       const msg = err?.message ?? '';
@@ -323,12 +325,8 @@ export default function CoordinatorDashboardScreen() {
     setLoadingGameRequests(true);
     try {
       await ensureFirestoreOnline();
-      const docs = await runCollectionQuery({
-        collectionId: 'gameRequests',
-        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
-        limit: 500,
-      });
-      const items: GameRequest[] = (docs as any[]).map((d) => ({ id: d.id, ...(d as any) }));
+      const docs = await listTopLevelCollection('gameRequests', 500);
+      const items: GameRequest[] = (docs as any[]).filter((d) => d.teamId === teamId).map((d) => ({ id: d.id, ...(d as any) }));
       setGameRequests(items);
     } catch (e: any) {
       console.warn('Failed to load game requests', e);
@@ -456,14 +454,10 @@ export default function CoordinatorDashboardScreen() {
       await updateDocSafe(`users/${request.userId}`, { isCoordinator: true, teamId: request.teamId });
       await updateDocSafe(`requests/${request.id}`, { status: 'approved' });
 
-      const snapDocs = await runCollectionQuery({
-        collectionId: 'requests',
-        where: [{ fieldPath: 'teamId', op: 'EQUAL', value: request.teamId }],
-        limit: 500,
-      });
+      const snapDocs = await listTopLevelCollection('requests', 1000);
 
       // delete other pending requests (safe delete)
-      const deletes = (snapDocs as any[]).filter((r) => r.id !== request.id).map((r) => ({ op: 'delete' as const, path: `requests/${r.id}` }));
+      const deletes = (snapDocs as any[]).filter((r) => r.teamId === request.teamId && r.id !== request.id).map((r) => ({ op: 'delete' as const, path: `requests/${r.id}` }));
       if (deletes.length) await runBatchSafe(deletes);
 
       Toast.show({
@@ -669,104 +663,15 @@ export default function CoordinatorDashboardScreen() {
     );
   }
 
+  const sections: Array<{ key: string; title: string; data: any[] }> = [
+    { key: 'requests', title: 'Pending Coordinator Requests', data: requests },
+    { key: 'gameRequests', title: 'Game Requests', data: gameRequests },
+    { key: 'games', title: 'Created Game Events', data: games },
+  ];
+
   return (
-    <ScrollView
-      contentContainerStyle={styles.container}
-      keyboardShouldPersistTaps="handled"
-      showsVerticalScrollIndicator={true}
-    >
-      <Text style={styles.title}>Coordinator Dashboard</Text>
-
-      <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 10, marginBottom: 12 }}>
-        {!editing ? (
-          <Button
-            title="Edit Team"
-            onPress={() => {
-              originalTeamRef.current = { ...(teamData || {}) };
-              setEditing(true);
-            }}
-            color="#0a7ea4"
-          />
-        ) : (
-          <>
-            <Button title={saving ? 'Saving...' : 'Save'} onPress={handleSaveTeam} disabled={saving} color="#0a7ea4" />
-            <View style={{ width: 10 }} />
-            <Button title="Cancel" onPress={handleCancelEdit} color="#FF3B30" />
-          </>
-        )}
-      </View>
-
-      <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginBottom: 16 }}>
-        <Button title="Leave Team" onPress={handleLeaveTeam} color="#FF9500" />
-        <Button title="Delete Team" onPress={handleDeleteTeam} color="#FF3B30" />
-      </View>
-
-      {editing ? (
-        <TextInput
-          style={styles.input}
-          value={teamData.teamName}
-          onChangeText={(text) => setTeamData({ ...teamData, teamName: text })}
-          editable
-          placeholder="Team Name"
-        />
-      ) : (
-        <>
-          <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
-          <Text style={[styles.readOnlyText, { marginTop: 6, fontSize: 14 }]}>
-            Rating: {Math.min(Math.max(teamData?.elo ?? 1500, 800), 3000)}
-          </Text>
-        </>
-      )}
-
-      {editing ? (
-        // Location: editable only when editing
-        PlacesComp ? (
-          // Wrap in boundary so if the third-party component throws we don't crash the whole screen
-          <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
-            <PlacesComp
-              ref={autocompleteRef}
-              placeholder="Search ice rink..."
-              fetchDetails
-              onPress={(data: any, details: any = null) => {
-                const lat = details?.geometry?.location?.lat ?? 0;
-                const lng = details?.geometry?.location?.lng ?? 0;
-                setTeamData({ ...teamData, location: data.description, latitude: lat, longitude: lng });
-              }}
-              query={{
-                ...(GOOGLE_MAPS_API_KEY ? { key: GOOGLE_MAPS_API_KEY } : {}),
-                language: 'en',
-                // `types` historically supported; new APIs may require `type` or different query config.
-                // Keep it conservative so the component can decide. If you see warnings, try removing `types`.
-                types: 'establishment',
-              }}
-              styles={{ textInput: styles.input, container: { marginBottom: 10 } }}
-            />
-          </PlacesErrorBoundary>
-        ) : (
-          <TextInput
-            style={styles.input}
-            placeholder="Location (rink or arena)"
-            value={teamData?.location ?? ''}
-            onChangeText={(t) => setTeamData({ ...teamData, location: t })}
-          />
-        )
-      ) : (
-        <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
-      )}
-
-      <View style={styles.kitRow}>
-        <Jersey
-          color={teamData.homeColor ?? '#0a7ea4'}
-          label="Home"
-          onPress={editing ? () => setActivePicker('home') : undefined}
-        />
-        <Jersey
-          color={teamData.awayColor ?? '#ffffff'}
-          label="Away"
-          onPress={editing ? () => setActivePicker('away') : undefined}
-        />
-      </View>
-
+    <>
+      {/* Keep modals outside so they overlay the whole screen */}
       <Modal visible={!!activePicker} animationType="slide">
         <View style={styles.modalContainer}>
           <Text style={styles.modalTitle}>
@@ -779,8 +684,7 @@ export default function CoordinatorDashboardScreen() {
                 : teamData.awayColor ?? '#ffffff'
             }
             onColorChangeComplete={(color: string) => {
-              if (activePicker === 'home')
-                setTeamData({ ...teamData, homeColor: color });
+              if (activePicker === 'home') setTeamData({ ...teamData, homeColor: color });
               else setTeamData({ ...teamData, awayColor: color });
             }}
             thumbSize={30}
@@ -792,80 +696,6 @@ export default function CoordinatorDashboardScreen() {
           <Button title="Done" onPress={() => setActivePicker(null)} />
         </View>
       </Modal>
-
-      <Text style={styles.subtitle}>Pending Coordinator Requests</Text>
-      <View style={styles.listPanel}>
-        {requests.length === 0 ? (
-          <Text style={styles.noRequests}>No pending requests</Text>
-        ) : (
-          <FlatList
-            data={requests}
-            keyExtractor={(item) => item.id}
-            nestedScrollEnabled
-            contentContainerStyle={{ paddingBottom: 8 }}
-            renderItem={({ item }) => (
-              <View style={styles.requestCard}>
-                <Text style={styles.requestEmail}>{item.userEmail}</Text>
-                <View style={styles.requestButtons}>
-                  <TouchableOpacity
-                    style={[styles.actionButton, { backgroundColor: '#0a7ea4' }]}
-                    onPress={() => handleApprove(item)}
-                  >
-                    <Text style={styles.buttonText}>Approve</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity
-                    style={[styles.actionButton, { backgroundColor: '#FF3B30' }]}
-                    onPress={() => handleReject(item.id)}
-                  >
-                    <Text style={styles.buttonText}>Reject</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            )}
-          />
-        )}
-      </View>
-
-      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
-        <Text style={styles.subtitle}>Game Requests</Text>
-        <Button
-          title="Open Scheduler"
-          onPress={() => router.push('/(tabs)/GameSchedulerScreen')}
-          color="#0a7ea4"
-        />
-      </View>
-
-      <View style={styles.listPanel}>
-        {loadingGameRequests ? (
-          <ActivityIndicator size="small" color="#0a7ea4" />
-        ) : gameRequests.length === 0 ? (
-          <Text style={styles.noRequests}>No game requests</Text>
-        ) : (
-          <FlatList
-            data={gameRequests}
-            keyExtractor={(item) => item.id}
-            nestedScrollEnabled
-            contentContainerStyle={{ paddingBottom: 8 }}
-            renderItem={({ item }) => {
-              if (!item) return null;
-              const dtText = item.startISO ? new Date(item.startISO).toLocaleString() : 'No time';
-              const requesting = item.requestingTeamName ?? item.requestingTeamId ?? 'Unknown Team';
-              return (
-                <TouchableOpacity
-                  style={styles.requestCard}
-                  onPress={() => {
-                    setSelectedGameRequest(item);
-                    setRequestModalVisible(true);
-                  }}
-                >
-                  <Text style={{ fontWeight: '700' }}>Game Request — {requesting}</Text>
-                  <Text style={{ color: '#444' }}>{dtText} • { (item.type ?? 'home').toUpperCase() }</Text>
-                </TouchableOpacity>
-              );
-            }}
-          />
-        )}
-      </View>
 
       <Modal visible={requestModalVisible} animationType="slide" onRequestClose={() => { setRequestModalVisible(false); setSelectedGameRequest(null); }}>
         <View style={styles.modalContainer}>
@@ -892,45 +722,204 @@ export default function CoordinatorDashboardScreen() {
         </View>
       </Modal>
 
-      <Text style={styles.subtitle}>Games / Availability</Text>
+      <SectionList
+        sections={sections}
+        keyExtractor={(item, index) => (item?.id ? String(item.id) : `${index}-${item?.title ?? ''}`)}
+        contentContainerStyle={styles.container}
+        stickySectionHeadersEnabled={false}
+        ListHeaderComponent={() => (
+          <>
+            <Text style={styles.title}>Coordinator Dashboard</Text>
 
-      <View style={styles.listPanel}>
-        {games.length === 0 ? (
-          <Text style={styles.noRequests}>No scheduled games</Text>
-        ) : (
-          <FlatList
-            data={games}
-            keyExtractor={(item) => item.id}
-            nestedScrollEnabled
-            contentContainerStyle={{ paddingBottom: 8 }}
-            renderItem={({ item }) => {
-              if (!item) return null;
+            <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 10, marginBottom: 12 }}>
+              {!editing ? (
+                <Button
+                  title="Edit Team"
+                  onPress={() => {
+                    originalTeamRef.current = { ...(teamData || {}) };
+                    setEditing(true);
+                  }}
+                  color="#0a7ea4"
+                />
+              ) : (
+                <>
+                  <Button title={saving ? 'Saving...' : 'Save'} onPress={handleSaveTeam} disabled={saving} color="#0a7ea4" />
+                  <View style={{ width: 10 }} />
+                  <Button title="Cancel" onPress={handleCancelEdit} color="#FF3B30" />
+                </>
+              )}
+            </View>
 
-              const dt = item?.startISO ? new Date(item.startISO) : null;
-              const title = item?.title ?? 'Game';
-              const typeLabel = (item?.type ?? '').toString().toUpperCase() || 'N/A';
-              const recurringFreq = item?.recurring?.freq ?? null;
+            <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginBottom: 16 }}>
+              <Button title="Leave Team" onPress={handleLeaveTeam} color="#FF9500" />
+              <Button title="Delete Team" onPress={handleDeleteTeam} color="#FF3B30" />
+            </View>
 
-              return (
-                <View style={styles.requestCard}>
-                  <Text style={{ fontWeight: '600' }}>{title} — {typeLabel}</Text>
-                  <Text>{dt ? dt.toLocaleString() : 'No time set'}</Text>
-                  {recurringFreq ? <Text style={{ color: '#666' }}>Recurring: {String(recurringFreq)}</Text> : null}
-                  <View style={{ flexDirection: 'row', marginTop: 8 }}>
-                    <TouchableOpacity
-                      style={[styles.actionButton, { backgroundColor: '#FF3B30' }]}
-                      onPress={() => item?.id && handleDeleteGame(item.id)}
-                    >
-                      <Text style={styles.buttonText}>Delete</Text>
-                    </TouchableOpacity>
-                  </View>
-                </View>
-              );
-            }}
-          />
+            {editing ? (
+              <TextInput
+                style={styles.input}
+                value={teamData.teamName}
+                onChangeText={(text) => setTeamData({ ...teamData, teamName: text })}
+                editable
+                placeholder="Team Name"
+              />
+            ) : (
+              <>
+                <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
+                <Text style={[styles.readOnlyText, { marginTop: 6, fontSize: 14 }]}>
+                  Rating: {Math.min(Math.max(teamData?.elo ?? 1500, 800), 3000)}
+                </Text>
+              </>
+            )}
+
+            {editing ? (
+              // Location: editable only when editing
+              PlacesComp ? (
+                // Wrap in boundary so if the third-party component throws we don't crash the whole screen
+                <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
+                  <PlacesComp
+                    ref={autocompleteRef}
+                    placeholder="Search ice rink..."
+                    fetchDetails
+                    onPress={(data: any, details: any = null) => {
+                      const lat = details?.geometry?.location?.lat ?? 0;
+                      const lng = details?.geometry?.location?.lng ?? 0;
+                      setTeamData({ ...teamData, location: data.description, latitude: lat, longitude: lng });
+                    }}
+                    query={{
+                      ...(GOOGLE_MAPS_API_KEY ? { key: GOOGLE_MAPS_API_KEY } : {}),
+                      language: 'en',
+                      types: 'establishment',
+                    }}
+                    styles={{ textInput: styles.input, container: { marginBottom: 10 } }}
+                  />
+                </PlacesErrorBoundary>
+              ) : (
+                <TextInput
+                  style={styles.input}
+                  placeholder="Location (rink or arena)"
+                  value={teamData?.location ?? ''}
+                  onChangeText={(t) => setTeamData({ ...teamData, location: t })}
+                />
+              )
+            ) : (
+              <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
+            )}
+
+            <View style={styles.kitRow}>
+              <Jersey
+                color={teamData.homeColor ?? '#0a7ea4'}
+                label="Home"
+                onPress={editing ? () => setActivePicker('home') : undefined}
+              />
+              <Jersey
+                color={teamData.awayColor ?? '#ffffff'}
+                label="Away"
+                onPress={editing ? () => setActivePicker('away') : undefined}
+              />
+            </View>
+          </>
         )}
-      </View>
-    </ScrollView>
+        renderSectionHeader={({ section }) => (
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
+            <Text style={styles.subtitle}>{section.title}</Text>
+            {section.key === 'gameRequests' ? (
+              <Button title="Open Scheduler" onPress={() => router.push('/(tabs)/GameSchedulerScreen')} color="#0a7ea4" />
+            ) : null}
+          </View>
+        )}
+        renderItem={({ item, section }) => {
+          if (!item) return null;
+
+          // Pending coordinator join requests
+          if (section.key === 'requests') {
+            return (
+              <View style={styles.requestCard}>
+                <Text style={styles.requestEmail}>{item.userEmail}</Text>
+                <View style={styles.requestButtons}>
+                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#0a7ea4' }]} onPress={() => handleApprove(item)}>
+                    <Text style={styles.buttonText}>Approve</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#FF3B30' }]} onPress={() => handleReject(item.id)}>
+                    <Text style={styles.buttonText}>Reject</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          }
+
+          // Team game requests
+          if (section.key === 'gameRequests') {
+            const dtText = item.startISO ? new Date(item.startISO).toLocaleString() : 'No time';
+            const requesting = item.requestingTeamName ?? item.requestingTeamId ?? 'Unknown Team';
+            return (
+              <TouchableOpacity
+                style={styles.requestCard}
+                onPress={() => {
+                  setSelectedGameRequest(item);
+                  setRequestModalVisible(true);
+                }}
+              >
+                <Text style={{ fontWeight: '700' }}>Game Request — {requesting}</Text>
+                <Text style={{ color: '#444' }}>{dtText} • {(item.type ?? 'home').toUpperCase()}</Text>
+              </TouchableOpacity>
+            );
+          }
+
+          // Games / availability
+          if (section.key === 'games') {
+            const dt = item?.startISO ? new Date(item.startISO) : null;
+            const title = item?.title ?? 'Game';
+            const typeLabel = (item?.type ?? '').toString().toUpperCase() || 'N/A';
+            const recurringFreq = item?.recurring?.freq ?? null;
+
+            return (
+              <View style={styles.requestCard}>
+                <Text style={{ fontWeight: '600' }}>{title} — {typeLabel}</Text>
+                <Text>{dt ? dt.toLocaleString() : 'No time set'}</Text>
+                {recurringFreq ? <Text style={{ color: '#666' }}>Recurring: {String(recurringFreq)}</Text> : null}
+                <View style={{ flexDirection: 'row', marginTop: 8 }}>
+                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#FF3B30' }]} onPress={() => item?.id && handleDeleteGame(item.id)}>
+                    <Text style={styles.buttonText}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          }
+
+          return null;
+        }}
+        renderSectionFooter={({ section }) => {
+          if (!section || !Array.isArray(section.data)) return null;
+
+          // Requests (coordinator join requests) empty message
+          if (section.key === 'requests' && section.data.length === 0) {
+            return (
+              <View style={{ paddingVertical: 8 }}>
+                <Text style={{ textAlign: 'center', color: '#666' }}>No pending coordinator requests</Text>
+              </View>
+            );
+          }
+
+          // Game requests empty message
+          if (section.key === 'gameRequests' && section.data.length === 0) {
+            return (
+              <View style={{ paddingVertical: 8 }}>
+                <Text style={{ textAlign: 'center', color: '#666' }}>No game requests</Text>
+              </View>
+            );
+          }
+
+          // For other sections, show nothing here
+          return null;
+        }}
+        ListEmptyComponent={() => (
+          <View style={{ paddingVertical: 12 }}>
+            <Text style={{ textAlign: 'center', color: '#999' }}>No items</Text>
+          </View>
+        )}
+      />
+    </>
   );
 }
 
