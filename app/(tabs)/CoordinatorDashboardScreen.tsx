@@ -1,5 +1,3 @@
-// app/(tabs)/CoordinatorDashboardScreen.tsx
-import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
@@ -18,7 +16,9 @@ import {
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
-import { getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
+import { onAppEvent } from '../../src/appEvents';
+import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
+import { getDocument, listTopLevelCollection } from '../../src/firestoreRest';
 
 // Read API key from app config or env
 const GOOGLE_MAPS_API_KEY =
@@ -171,6 +171,7 @@ export default function CoordinatorDashboardScreen() {
     };
   }, []);
 
+  // initial load: wait for auth and fetch team + requests
   useEffect(() => {
     let isMounted = true;
 
@@ -259,12 +260,36 @@ export default function CoordinatorDashboardScreen() {
     if (!teamId) return setGames([]);
     try {
       await ensureFirestoreOnline();
-      // Note: remove server-side orderBy to avoid composite index requirement.
       // List top-level games and filter for this team
       const docs = await listTopLevelCollection('games', 500);
+      const all = Array.isArray(docs) ? (docs as any[]) : [];
 
-      // Parse and client-sort by startISO (docs without startISO go to the end)
-      const parsed = (docs as any[]).map((d) => ({ id: d.id, ...(d as any) }));
+      // Helper: robustly check whether a game doc belongs to the current teamId
+      const belongsToTeam = (d: any) => {
+        if (!d) return false;
+        const tid = String(teamId);
+        // direct top-level field
+        if (d.teamId != null && String(d.teamId) === tid) return true;
+        // nested team object
+        if (d.team && (String(d.team.id ?? d.team.teamId ?? '') === tid || String(d.teamId ?? '') === tid)) return true;
+        // web/REST shape: fields.teamId.stringValue or fields.teamId.integerValue
+        const teamField = d.fields?.teamId;
+        if (teamField) {
+          if (teamField.stringValue != null && String(teamField.stringValue) === tid) return true;
+          if (teamField.integerValue != null && String(teamField.integerValue) === tid) return true;
+        }
+        // some shapes might store ownerTeam or requestingTeamId
+        if (d.requestingTeamId != null && String(d.requestingTeamId) === tid) return true;
+        if (d.ownerTeam != null && String(d.ownerTeam) === tid) return true;
+        return false;
+      };
+
+      // Keep only games that belong to this team
+      const parsed = all
+        .filter((d) => belongsToTeam(d))
+        .map((d) => ({ id: d.id, ...(d as any) }));
+
+      // Client-side sort by startISO (docs without startISO go to the end)
       parsed.sort((a, b) => {
         if (!a.startISO && !b.startISO) return 0;
         if (!a.startISO) return 1;
@@ -291,6 +316,7 @@ export default function CoordinatorDashboardScreen() {
     }
   };
 
+  // trigger fetchGames when teamData.id changes
   useEffect(() => {
     if (teamData?.id) fetchGames(teamData.id);
   }, [teamData?.id]);
@@ -336,9 +362,37 @@ export default function CoordinatorDashboardScreen() {
     }
   };
 
+  // trigger fetchGameRequests when teamData.id changes
   useEffect(() => {
     if (teamData?.id) fetchGameRequests(teamData.id);
     else setGameRequests([]);
+  }, [teamData?.id]);
+
+  // Re-fetch games + gameRequests when other screens emit that a game was created
+  useEffect(() => {
+    if (!teamData?.id) return;
+
+    const unsub = onAppEvent('games:created', (payload: any) => {
+      try {
+        // If emitter included teamId, only refresh when relevant.
+        // If payload is absent or has no teamId, refresh unconditionally.
+        if (!payload || !payload.teamId || payload.teamId === teamData.id) {
+          // re-load both games and gameRequests for this team
+          fetchGames(teamData.id).catch((e) => console.warn('[CoordinatorDashboard] fetchGames on event failed', e));
+          fetchGameRequests(teamData.id).catch((e) => console.warn('[CoordinatorDashboard] fetchGameRequests on event failed', e));
+        }
+      } catch (e) {
+        console.warn('[CoordinatorDashboard] games:created handler error', e);
+      }
+    });
+
+    return () => {
+      try {
+        if (typeof unsub === 'function') unsub();
+      } catch {
+        // ignore
+      }
+    };
   }, [teamData?.id]);
 
   // Approve a game request: create a game from the request, mark request approved (or delete)
@@ -419,14 +473,10 @@ export default function CoordinatorDashboardScreen() {
 
       // 2) propagate cached teamName to requests (so HomeScreen and other lists show updated name)
       try {
-        const reqDocs = await runCollectionQuery({
-          collectionId: 'requests',
-          where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
-          limit: 500,
-        });
-
-        if (reqDocs.length) {
-          const ops = (reqDocs as any[]).map((r: any) => ({ op: 'update' as const, path: `requests/${r.id}`, data: { teamName: teamData.teamName } }));
+        const reqDocs = await listTopLevelCollection('requests', 1000);
+        const matchingReqs = (reqDocs as any[]).filter((r) => r.teamId === teamData.id);
+        if (matchingReqs.length) {
+          const ops = matchingReqs.map((r: any) => ({ op: 'update' as const, path: `requests/${r.id}`, data: { teamName: teamData.teamName } }));
           await runBatchSafe(ops);
         }
       } catch (propErr) {
@@ -493,12 +543,16 @@ export default function CoordinatorDashboardScreen() {
 
   // Count coordinators by querying users for teamId
   const countCoordinators = async (teamId: string) => {
-    const docs = await runCollectionQuery({
-      collectionId: 'users',
-      where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamId }],
-      limit: 1000,
-    });
-    return docs.filter((d: any) => !!d.isCoordinator).length;
+    try {
+      // listTopLevelCollection avoids runQuery structuredQuery POST
+      const docs = await listTopLevelCollection('users', 1000);
+      const filtered = (docs as any[]).filter((d) => d.teamId === teamId);
+      return filtered.filter((d: any) => !!d.isCoordinator).length;
+    } catch (e) {
+      console.warn('[countCoordinators] fallback failed', e);
+      // conservative default: 1 (prevent accidental leaves if uncertain)
+      return 1;
+    }
   };
 
   const handleLeaveTeam = async () => {
@@ -559,21 +613,15 @@ export default function CoordinatorDashboardScreen() {
               await ensureFirestoreOnline();
 
               // gather docs (use arrays for where)
-              const gamesDocs = await runCollectionQuery({
-                collectionId: 'games',
-                where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
-                limit: 1000,
-              });
-              const reqDocs = await runCollectionQuery({
-                collectionId: 'requests',
-                where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
-                limit: 1000,
-              });
-              const usersDocs = await runCollectionQuery({
-                collectionId: 'users',
-                where: [{ fieldPath: 'teamId', op: 'EQUAL', value: teamData.id }],
-                limit: 1000,
-              });
+              // list top-level collections and filter client-side
+              const allGames = await listTopLevelCollection('games', 1000);
+              const gamesDocs = (allGames as any[]).filter((g) => g.teamId === teamData.id);
+
+              const allReqs = await listTopLevelCollection('requests', 1000);
+              const reqDocs = (allReqs as any[]).filter((r) => r.teamId === teamData.id);
+
+              const allUsers = await listTopLevelCollection('users', 1000);
+              const usersDocs = (allUsers as any[]).filter((u) => u.teamId === teamData.id);
 
               const ops: Array<{ op: 'update' | 'delete'; path: string; data?: any }> = [];
 
@@ -620,12 +668,12 @@ export default function CoordinatorDashboardScreen() {
         <View style={styles.jerseyCard}>
           <View style={styles.jerseyBox}>
             <ExpoImage
-              source={require('@/assets/images/jersey_fill.png')}
+              source={require('../../assets/images/jersey_fill.png')}
               style={[styles.jerseyImg, { tintColor: color }]}
               contentFit="contain"
             />
             <ExpoImage
-              source={require('@/assets/images/jersey_outline.png')}
+              source={require('../../assets/images/jersey_outline.png')}
               style={styles.jerseyImg}
               contentFit="contain"
             />
@@ -992,7 +1040,7 @@ const styles = StyleSheet.create({
   },
 });
 
-// --- place this inside CoordinatorDashboardScreen, just after originalTeamRef declaration ---
+// --- helper: waitForAuthUser ---
 async function waitForAuthUser(timeoutMs = 3000): Promise<any | null> {
   const a = auth as any;
   if (!a) return null;

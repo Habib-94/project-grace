@@ -1,16 +1,9 @@
-// app/(tabs)/CreateTeamScreen.tsx
-import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
+import React, { useEffect, useRef, useState } from 'react';
 import {
-  addDoc,
-  collection,
-  doc,
-  updateDoc,
-} from 'firebase/firestore';
-import React, { useRef, useState } from 'react';
-import {
+  ActivityIndicator,
   Button,
   Modal,
   ScrollView,
@@ -23,57 +16,262 @@ import {
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
-const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey;
+import { emitAppEvent } from '../../src/appEvents';
+import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
+import { geocodeAddress, getPlaceDetails } from '../../src/locations';
+
+// runtime-safe add/update helpers (same pattern as elsewhere)
+async function addDocSafe(collectionPath: string, data: any) {
+  // Native RN Firebase style
+  if (db && typeof (db as any).collection === 'function') {
+    return (db as any).collection(collectionPath).add(data);
+  }
+
+  // Web modular SDK
+  const { collection, addDoc } = await import('firebase/firestore');
+  return addDoc(collection(db as any, collectionPath), data);
+}
+
+async function updateUserSafe(uid: string, data: any) {
+  // Native RN Firebase style
+  if (db && typeof (db as any).collection === 'function') {
+    return (db as any).collection('users').doc(uid).update(data);
+  }
+
+  // Web modular SDK
+  const { doc, updateDoc } = await import('firebase/firestore');
+  return updateDoc(doc(db as any, 'users', uid), data);
+}
+
+// runtime-safe upsert/set with merge
+async function upsertUserDoc(uid: string, data: any) {
+  // Native RN Firebase style
+  try {
+    if (db && typeof (db as any).collection === 'function') {
+      // native firestore supports .doc(uid).set(data, { merge: true })
+      return await (db as any).collection('users').doc(uid).set(data, { merge: true });
+    }
+  } catch (e) {
+    // fallthrough to web
+  }
+
+  // Web modular SDK
+  const { doc, setDoc } = await import('firebase/firestore');
+  return setDoc(doc(db as any, 'users', uid), data, { merge: true });
+}
+
+type Prediction = {
+  place_id: string;
+  description: string;
+  structured_formatting?: { main_text?: string; secondary_text?: string };
+};
 
 export default function CreateTeamScreen() {
   const router = useRouter();
+  const user = auth?.currentUser ?? null;
 
-  // ✅ Stable initial states (avoid undefined issues)
+  // Stable initial states (avoid undefined issues)
   const [teamName, setTeamName] = useState('');
-  const [location, setLocation] = useState('');
-  const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(null);
+  const [locationText, setLocationText] = useState('');
+  const [pickedPlace, setPickedPlace] = useState<{
+    placeId?: string;
+    name?: string;
+    formattedAddress?: string;
+    lat?: number;
+    lng?: number;
+  } | null>(null);
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
   const [loading, setLoading] = useState(false);
-  const autocompleteRef = useRef<any>(null);
-  const user = auth.currentUser;
 
-  const handleCreateTeam = async () => {
-    if (!user?.uid) {
-      Toast.show({ type: 'error', text1: 'Not signed in' });
+  // Autocomplete state
+  const [predictions, setPredictions] = useState<Prediction[]>([]);
+  const [loadingPredictions, setLoadingPredictions] = useState(false);
+  const acAbortRef = useRef<AbortController | null>(null);
+  const debounceRef = useRef<any>(null);
+
+  // derive API key (same source as src/locations.ts)
+  const API_KEY =
+    (Constants.expoConfig?.extra?.googleMapsApiKey as string) ??
+    (process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string) ??
+    (process.env.GOOGLE_MAPS_API_KEY as string) ??
+    '';
+
+  // Debounced autocomplete: fetch predictions when typing
+  useEffect(() => {
+    // If user already picked a place that matches the text, don't show predictions
+    if (!locationText || pickedPlace?.formattedAddress === locationText || pickedPlace?.name === locationText) {
+      setPredictions([]);
+      setLoadingPredictions(false);
       return;
     }
 
+    // clear previous debounce
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    // small debounce so we don't hit quota while user types
+    debounceRef.current = setTimeout(() => {
+      fetchPredictions(locationText);
+    }, 300);
+
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (acAbortRef.current) {
+        try { acAbortRef.current.abort(); } catch {}
+        acAbortRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locationText]);
+
+  async function fetchPredictions(input: string) {
+    setLoadingPredictions(true);
+    setPredictions([]);
+    if (!API_KEY || !input || input.trim().length < 2) {
+      setLoadingPredictions(false);
+      return;
+    }
+
+    // Abort previous request if any
+    if (acAbortRef.current) {
+      try { acAbortRef.current.abort(); } catch {}
+      acAbortRef.current = null;
+    }
+    const ac = new AbortController();
+    acAbortRef.current = ac;
+
+    try {
+      // Place Autocomplete endpoint (returns list of predictions)
+      // types=establishment to prefer places like arenas/centres; remove if you want broader results
+      const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(
+        input
+      )}&types=establishment&language=en&key=${API_KEY}`;
+
+      const res = await fetch(url, { signal: ac.signal });
+      const json = await res.json();
+      if (json?.status === 'OK' && Array.isArray(json.predictions)) {
+        setPredictions(json.predictions.slice(0, 6));
+      } else {
+        // not OK (ZERO_RESULTS, etc.) -> keep empty list
+        setPredictions([]);
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        // ignore
+      } else {
+        console.warn('[CreateTeam] autocomplete fetch failed', e);
+      }
+      setPredictions([]);
+    } finally {
+      setLoadingPredictions(false);
+      acAbortRef.current = null;
+    }
+  }
+
+  // When user picks a prediction, fetch details and set pickedPlace
+  const handleSelectPrediction = async (p: Prediction) => {
+    setLoading(true);
+    try {
+      const details = await getPlaceDetails(p.place_id);
+      if (!details) {
+        // fallback: set the description as location text
+        setLocationText(p.description);
+        setPickedPlace(null);
+        Toast.show({ type: 'info', text1: 'Selected place', text2: p.description });
+      } else {
+        setPickedPlace(details);
+        // prefer formattedAddress if available
+        const display = details.formattedAddress ?? details.name ?? p.description;
+        setLocationText(display);
+        Toast.show({ type: 'success', text1: 'Location selected', text2: display });
+      }
+      // clear suggestions
+      setPredictions([]);
+    } catch (e: any) {
+      console.warn('[CreateTeam] select prediction failed', e);
+      Toast.show({ type: 'error', text1: 'Lookup failed', text2: e?.message ?? String(e) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleLookupPlace = async () => {
+    // Keep the existing single-result "Find with Google" behavior as fallback
+    if (!locationText || locationText.trim().length < 3) {
+      Toast.show({ type: 'info', text1: 'Enter an address or rink name first' });
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await geocodeAddress(locationText.trim());
+      if (!res) {
+        Toast.show({ type: 'error', text1: 'No results', text2: 'Google did not return a match.' });
+        setPickedPlace(null);
+      } else {
+        setPickedPlace(res);
+        setLocationText(res.formattedAddress ?? res.name ?? locationText.trim());
+        Toast.show({ type: 'success', text1: 'Location found', text2: res.formattedAddress ?? res.name });
+        // clear predictions
+        setPredictions([]);
+      }
+    } catch (e: any) {
+      console.warn('[CreateTeam] geocodeAddress failed', e);
+      Toast.show({ type: 'error', text1: 'Lookup failed', text2: e?.message ?? String(e) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCreateTeam = async () => {
+    if (!user) {
+      Toast.show({ type: 'error', text1: 'Sign in required' });
+      router.replace('/(auth)/LoginScreen');
+      return;
+    }
+    if (!teamName || !teamName.trim()) {
+      Toast.show({ type: 'info', text1: 'Please enter a team name' });
+      return;
+    }
+    setLoading(true);
     try {
       await ensureFirestoreOnline();
-
-      const payload = {
+      const payload: any = {
         teamName: teamName.trim(),
-        location: location?.trim() ?? '',
-        latitude: coords?.latitude ?? null,
-        longitude: coords?.longitude ?? null,
-        homeColor: homeColor ?? '#0a7ea4',
-        awayColor: awayColor ?? '#ffffff',
-        // placeholder Rating for future ranking feature
-        elo: 1500,
+        location: pickedPlace?.formattedAddress ?? locationText ?? '',
+        latitude: pickedPlace?.lat ?? null,
+        longitude: pickedPlace?.lng ?? null,
+        placeId: pickedPlace?.placeId ?? '',
+        createdBy: user.uid,
         createdAt: new Date().toISOString(),
-        createdBy: user.uid, // <- ensure createdBy set
+        homeColor,
+        awayColor,
       };
 
-      // create team
-      const teamRef = await addDoc(collection(db, 'teams'), payload);
-
-      // assign current user as coordinator of the new team
-      const userRef = doc(db, 'users', user.uid);
-      await updateDoc(userRef, { teamId: teamRef.id, isCoordinator: true });
-
+      const ref: any = await addDocSafe('teams', payload);
+      const createdId = ref?.id ?? (typeof ref?.path === 'string' ? String(ref.path).split('/').pop() : null);
       Toast.show({ type: 'success', text1: 'Team created' });
-      // navigate to coordinator dashboard
-      router.replace('/(tabs)/CoordinatorDashboardScreen');
+
+      if (createdId) {
+        // update the user's profile to attach them to this team and make them a coordinator
+        try {
+          await upsertUserDoc(user.uid, { teamId: createdId, isCoordinator: true, email: user.email ?? '', name: user.displayName ?? '' });
+        } catch (uErr) {
+          console.warn('[CreateTeam] failed to upsert users/{uid}', uErr);
+        }
+
+        // Emit an event so other screens can react (e.g., refresh lists)
+        try { emitAppEvent('team:created', { teamId: createdId }); } catch {}
+
+        // Navigate to the coordinator dashboard so it can load the newly updated user/team
+        router.replace('/(tabs)/CoordinatorDashboardScreen');
+      } else {
+        router.replace('/(tabs)');
+      }
     } catch (e: any) {
-      console.error('Create team failed', e);
-      Toast.show({ type: 'error', text1: 'Create team failed', text2: e?.message || '' });
+      console.error('[CreateTeam] create failed', e);
+      Toast.show({ type: 'error', text1: 'Create failed', text2: e?.message || '' });
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -82,12 +280,12 @@ export default function CreateTeamScreen() {
       <View style={styles.jerseyCard}>
         <View style={styles.jerseyBox}>
           <ExpoImage
-            source={require('@/assets/images/jersey_fill.png')}
+            source={require('../../assets/images/jersey_fill.png')}
             style={[styles.jerseyImg, { tintColor: color }]}
             contentFit="contain"
           />
           <ExpoImage
-            source={require('@/assets/images/jersey_outline.png')}
+            source={require('../../assets/images/jersey_outline.png')}
             style={styles.jerseyImg}
             contentFit="contain"
           />
@@ -98,7 +296,7 @@ export default function CreateTeamScreen() {
   );
 
   return (
-    <ScrollView contentContainerStyle={styles.container}>
+    <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>Create a New Team</Text>
 
       <TextInput
@@ -108,41 +306,56 @@ export default function CreateTeamScreen() {
         onChangeText={setTeamName}
       />
 
-      {/* ✅ Location Autocomplete */}
-      {/* <GooglePlacesAutocomplete
-        ref={autocompleteRef}
-        placeholder="Search rink or arena..."
-        fetchDetails
-        onPress={(data, details = null) => {
-          const lat = details?.geometry?.location?.lat ?? 0;
-          const lng = details?.geometry?.location?.lng ?? 0;
-          setLocation(data.description);
-          setCoords({ latitude: lat, longitude: lng });
-        }}
-        query={{
-          key: GOOGLE_MAPS_API_KEY,
-          language: 'en',
-          types: 'establishment',
-        }}
-        styles={{
-          textInput: styles.input,
-          container: { marginBottom: 10 },
-        }}
-      /> */}
+      <View style={{ width: '100%' }}>
+        <TextInput
+          style={styles.input}
+          placeholder="Location (rink or arena)"
+          value={locationText}
+          onChangeText={(text) => {
+            setLocationText(text);
+            // If typing after a pickedPlace, clear the picked place so user can choose a different location
+            if (pickedPlace && (pickedPlace.formattedAddress !== text && pickedPlace.name !== text)) {
+              setPickedPlace(null);
+            }
+          }}
+        />
 
-      <TextInput
-        style={styles.input}
-        placeholder="Location (rink or arena)"
-        value={location}
-        onChangeText={(text) => setLocation(text)}
-      />
+        {/* Inline suggestions */}
+        {loadingPredictions ? (
+          <View style={styles.suggestions}>
+            <Text style={{ color: '#666' }}>Searching...</Text>
+          </View>
+        ) : null}
+
+        {!loadingPredictions && predictions && predictions.length > 0 ? (
+          <View style={styles.suggestions}>
+            {predictions.map((p) => (
+              <TouchableOpacity
+                key={p.place_id}
+                onPress={() => handleSelectPrediction(p)}
+                style={styles.suggestionItem}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.suggestionMain}>{p.structured_formatting?.main_text ?? p.description}</Text>
+                {p.structured_formatting?.secondary_text ? (
+                  <Text style={styles.suggestionSecondary}>{p.structured_formatting.secondary_text}</Text>
+                ) : null}
+              </TouchableOpacity>
+            ))}
+          </View>
+        ) : null}
+      </View>
+
+      <View style={styles.lookupRow}>
+        <Button title="Find with Google" onPress={handleLookupPlace} disabled={loading} />
+      </View>
 
       <View style={styles.kitRow}>
         <Jersey color={homeColor} label="Home" />
         <Jersey color={awayColor} label="Away" />
       </View>
 
-      {/* ✅ Color Picker Modal */}
+      {/* Color Picker Modal */}
       <Modal visible={!!activePicker} animationType="slide">
         <View style={styles.modalContainer}>
           <Text style={styles.modalTitle}>
@@ -172,6 +385,19 @@ export default function CreateTeamScreen() {
           color="#0a7ea4"
         />
       </View>
+
+      {loading ? <ActivityIndicator style={{ marginTop: 10 }} /> : null}
+
+      {pickedPlace ? (
+        <View style={{ marginTop: 12 }}>
+          <Text style={{ fontWeight: '600' }}>Selected</Text>
+          <Text>{pickedPlace.name ?? pickedPlace.formattedAddress}</Text>
+          <Text style={{ color: '#666' }}>{pickedPlace.formattedAddress}</Text>
+          <Text style={{ color: '#666' }}>
+            {pickedPlace.lat ?? 'n/a'}, {pickedPlace.lng ?? 'n/a'}
+          </Text>
+        </View>
+      ) : null}
     </ScrollView>
   );
 }
@@ -185,7 +411,8 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginBottom: 20,
   },
-  input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 10, borderRadius: 6 },
+  input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 6, borderRadius: 6, backgroundColor: '#fff' },
+  lookupRow: { marginBottom: 12 },
   kitRow: { flexDirection: 'row', justifyContent: 'space-around', marginBottom: 20 },
   jerseyCard: { alignItems: 'center' },
   jerseyBox: { width: 110, height: 110, position: 'relative' },
@@ -193,4 +420,22 @@ const styles = StyleSheet.create({
   jerseyLabel: { marginTop: 8, fontSize: 16, fontWeight: '600', color: '#000' },
   modalContainer: { flex: 1, justifyContent: 'center', padding: 20, backgroundColor: '#fff' },
   modalTitle: { fontSize: 20, fontWeight: '600', marginBottom: 20, textAlign: 'center' },
+
+  // suggestions UI
+  suggestions: {
+    borderWidth: 1,
+    borderColor: '#eee',
+    backgroundColor: '#fff',
+    borderRadius: 6,
+    paddingVertical: 6,
+    marginBottom: 8,
+    // small shadow
+    shadowColor: '#000',
+    shadowOpacity: 0.05,
+    shadowRadius: 6,
+    elevation: 1,
+  },
+  suggestionItem: { paddingHorizontal: 12, paddingVertical: 8 },
+  suggestionMain: { fontWeight: '600', color: '#222' },
+  suggestionSecondary: { color: '#666', fontSize: 12, marginTop: 2 },
 });

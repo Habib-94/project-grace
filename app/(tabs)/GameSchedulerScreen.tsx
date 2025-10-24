@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 
 import Toast from 'react-native-toast-message';
+import { emitAppEvent } from '../../src/appEvents'; // <- ensure emitter imported
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig'; // db/auth/ensure helper
 import { debugAuthState, getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
 
@@ -24,9 +25,9 @@ type Game = {
   location?: { lat?: number; lng?: number; label?: string };
   kitColor?: string | null;
   teamId?: string;
-  teamName?: string;      // NEW: human-readable team name
-  teamLocation?: string;  // human-readable location for the team (teams/{teamId}.location)
-  type?: string;          // game type (e.g. 'home'|'away'|'open')
+  teamName?: string;
+  teamLocation?: string;
+  type?: string;
   elo?: number;
   createdBy?: string;
 };
@@ -182,14 +183,22 @@ export default function GameSchedulerScreen() {
         return;
       }
 
-      // after `const teamId = userDoc.teamId;`
+      // try to read team doc to get coordinates/label
       let teamName = '';
+      let teamLat: number | null = null;
+      let teamLng: number | null = null;
+      let teamLabel = '';
+      let teamPlaceId = '';
+
       try {
         const teamDoc = await getDocument(`teams/${teamId}`);
         teamName = (teamDoc?.teamName as string) ?? '';
+        teamLat = teamDoc?.latitude ?? teamDoc?.lat ?? null;
+        teamLng = teamDoc?.longitude ?? teamDoc?.lng ?? null;
+        teamLabel = (teamDoc?.location as string) ?? '';
+        teamPlaceId = (teamDoc?.placeId as string) ?? '';
       } catch (e) {
-        // ignore; we'll fall back to showing teamId in the UI
-        teamName = '';
+        // ignore; best-effort enrichment
       }
 
       let created = 0;
@@ -201,14 +210,15 @@ export default function GameSchedulerScreen() {
           title: defaultTitle,
           type: 'open',
           startISO: occ.toISOString(),
-          location: null,
+          // Attach location object if we have team coords (so FindGames can use it)
+          location: teamLat != null && teamLng != null ? { lat: teamLat, lng: teamLng, label: teamLabel } : null,
+          placeId: teamPlaceId ?? null,
           kitColor: null,
           createdBy: user.uid,
           createdAt: new Date().toISOString(),
         };
         try {
           const ref: any = await addDocSafe('games', payload);
-          // try to derive an id (web/native refs expose .id, sometimes path)
           const createdId = ref?.id ?? (typeof ref?.path === 'string' ? String(ref.path).split('/').pop() : null);
           console.log('[GameScheduler] added game', { createdId, payload });
           if (createdId) {
@@ -217,7 +227,6 @@ export default function GameSchedulerScreen() {
             try {
               const doc = await getDocument(`games/${createdId}`);
               console.log('[GameScheduler] getDocument for created game returned', { createdId, doc });
-              // If we got a doc back, immediately prepend it to createdGames so UI shows the new slot
               if (doc) {
                 setCreatedGames((prev) => [
                   {
@@ -227,7 +236,7 @@ export default function GameSchedulerScreen() {
                     location: doc.location,
                     kitColor: doc.kitColor ?? null,
                     teamId: doc.teamId,
-                    teamName: teamName || (doc.teamName ?? ''), // prefer teamName we fetched, else any teamName on the doc
+                    teamName: teamName || (doc.teamName ?? ''),
                     teamLocation: doc.teamLocation ?? '',
                     elo: doc.elo,
                     createdBy: doc.createdBy,
@@ -253,13 +262,19 @@ export default function GameSchedulerScreen() {
       }
 
       // Refresh created games list
-      // Try to refresh the full createdGames list. This will log token info (helpful if the collection query is blocked).
       try {
         await debugAuthState('after createGames, before fetchCreatedGames');
       } catch {
         // ignore
       }
-      fetchCreatedGames();
+      await fetchCreatedGames();
+
+      // Notify dashboard and other listeners that games were created
+      try {
+        emitAppEvent('games:created', { teamId });
+      } catch (e) {
+        console.warn('[GameScheduler] failed to emit games:created', e);
+      }
     } catch (e: any) {
       console.error('[GameScheduler] createGames error', e);
       Toast.show({ type: 'error', text1: 'Create failed', text2: e?.message ?? String(e) });

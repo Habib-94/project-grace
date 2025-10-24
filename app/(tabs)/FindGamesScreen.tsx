@@ -1,322 +1,359 @@
+import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useState } from 'react';
-import {
-    ActivityIndicator,
-    FlatList,
-    Modal,
-    Pressable,
-    StyleSheet,
-    Text,
-    TextInput,
-    View
-} from 'react-native';
+import { ActivityIndicator, Button, FlatList, StyleSheet, Text, TextInput, View } from 'react-native';
+import Toast from 'react-native-toast-message';
+import { listTopLevelCollection } from '../../src/firestoreRest';
+import { haversineDistanceKm } from '../../src/locations';
 
-import { ensureFirestoreOnline } from '../../src/firebaseConfig';
-import { runCollectionQuery } from '../../src/firestoreRest';
-
-// Minimal type
-type Game = {
-  id: string;
-  title?: string;
-  startISO?: string;
-  location?: { lat?: number; lng?: number; label?: string };
-  kitColor?: string | null;
-  teamId?: string;
-  elo?: number;
-  createdBy?: string;
-};
+const KM_TO_MILES = 0.621371;
 
 export default function FindGamesScreen() {
   const router = useRouter();
-
-  // filters
-  const [distanceKm, setDistanceKm] = useState<number>(25);
-  const [eloMin, setEloMin] = useState<number>(800);
-  const [eloMax, setEloMax] = useState<number>(3000);
-  const [dateFilter, setDateFilter] = useState<'any' | 'today' | 'next7' | 'next30' | 'thisMonth'>('any');
-  const [dateFilterModalVisible, setDateFilterModalVisible] = useState(false);
-
-  // text inputs for free input
-  const [distanceText, setDistanceText] = useState(String(distanceKm));
-  const [eloMinText, setEloMinText] = useState(String(eloMin));
-  const [eloMaxText, setEloMaxText] = useState(String(eloMax));
-
-  useEffect(() => setDistanceText(String(distanceKm)), [distanceKm]);
-  useEffect(() => setEloMinText(String(eloMin)), [eloMin]);
-  useEffect(() => setEloMaxText(String(eloMax)), [eloMax]);
-
-  // results + loading
-  const [games, setGames] = useState<Game[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  // simple user location fallback (replace with geolocation in production)
-  const [userLocation] = useState<{ lat: number; lng: number }>({ lat: 51.509865, lng: -0.118092 });
-
-  // helpers
-  function computeEndISOForDateFilter(filter: string) {
-    const end = new Date();
-    switch (filter) {
-      case 'today':
-        end.setHours(23, 59, 59, 999);
-        return end.toISOString();
-      case 'next7':
-        end.setDate(end.getDate() + 7);
-        end.setHours(23, 59, 59, 999);
-        return end.toISOString();
-      case 'next30':
-        end.setDate(end.getDate() + 30);
-        end.setHours(23, 59, 59, 999);
-        return end.toISOString();
-      case 'thisMonth': {
-        const lastDay = new Date(end.getFullYear(), end.getMonth() + 1, 0);
-        lastDay.setHours(23, 59, 59, 999);
-        return lastDay.toISOString();
-      }
-      case 'any':
-      default:
-        return undefined;
-    }
-  }
-
-  function haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
-    const toRad = (v: number) => (v * Math.PI) / 180;
-    const R = 6371;
-    const dLat = toRad(lat2 - lat1);
-    const dLon = toRad(lon2 - lon1);
-    const a =
-      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  }
-
-  // commit handlers
-  function commitDistance() {
-    const n = parseInt(distanceText.replace(/[^\d-]/g, ''), 10);
-    const safe = Number.isFinite(n) && n > 0 ? n : 1;
-    setDistanceKm(safe);
-    setDistanceText(String(safe));
-  }
-  function commitEloMin() {
-    let n = parseInt(eloMinText.replace(/[^\d-]/g, ''), 10);
-    if (!Number.isFinite(n)) n = 800;
-    n = Math.max(800, Math.min(n, eloMax));
-    setEloMin(n);
-    setEloMinText(String(n));
-  }
-  function commitEloMax() {
-    let n = parseInt(eloMaxText.replace(/[^\d-]/g, ''), 10);
-    if (!Number.isFinite(n)) n = 3000;
-    n = Math.min(3000, Math.max(n, eloMin));
-    setEloMax(n);
-    setEloMaxText(String(n));
-  }
-
-  // load games (REST runCollectionQuery)
-  async function fetchGames() {
-    setLoading(true);
-    try {
-      await ensureFirestoreOnline();
-      const now = new Date().toISOString();
-      const endISO = computeEndISOForDateFilter(dateFilter);
-
-      // Build where filters for REST: startISO >= now and optional <= endISO
-      const where: Array<{ fieldPath: string; op: string; value: any }> = [{ fieldPath: 'startISO', op: 'GREATER_THAN_OR_EQUAL', value: now }];
-      if (endISO) where.push({ fieldPath: 'startISO', op: 'LESS_THAN_OR_EQUAL', value: endISO });
-
-      // Rating filters are applied client-side because some docs don't have elo
-      const docs = await runCollectionQuery({
-        collectionId: 'games',
-        where,
-        orderBy: [{ fieldPath: 'startISO', direction: 'ASCENDING' }],
-        limit: 500,
-      });
-
-      const parsed: Game[] = (docs as any[]).map((d) => ({
-        id: d.id,
-        title: d.title,
-        startISO: d.startISO,
-        location: d.location,
-        kitColor: d.kitColor ?? null,
-        teamId: d.teamId,
-        elo: d.elo,
-        createdBy: d.createdBy,
-      }));
-
-      // apply rating + distance client-side
-      const filtered = parsed.filter((g) => {
-        if (!g.startISO) return false;
-        if (g.elo && (g.elo < eloMin || g.elo > eloMax)) return false;
-        if (!g.location || typeof g.location.lat !== 'number' || typeof g.location.lng !== 'number') return true;
-        const dKm = haversineDistance(userLocation.lat, userLocation.lng, g.location.lat!, g.location.lng!);
-        return dKm <= distanceKm;
-      });
-
-      setGames(filtered);
-    } catch (e: any) {
-      console.warn('[FindGames] fetchGames failed', e);
-      setGames([]);
-    } finally {
-      setLoading(false);
-    }
-  }
+  const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
+  const [radiusMiles, setRadiusMiles] = useState<number>(10); // default 10 miles
+  const [loadingLocation, setLoadingLocation] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [results, setResults] = useState<any[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchGames();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [distanceKm, eloMin, eloMax, dateFilter]);
+    (async () => {
+      setLoadingLocation(true);
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          setError('Location permission not granted');
+          Toast.show({ type: 'info', text1: 'Location permission required to find nearby games' });
+          setLoadingLocation(false);
+          return;
+        }
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        setUserCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      } catch (e: any) {
+        console.warn('[FindGames] getCurrentPosition failed', e);
+        setError(String(e?.message ?? e));
+      } finally {
+        setLoadingLocation(false);
+      }
+    })();
+  }, []);
 
-  function renderGame({ item }: { item: Game }) {
-    const start = item.startISO ? new Date(item.startISO).toLocaleString() : 'TBA';
-    return (
-      <View style={styles.card}>
-        <Text style={styles.title}>{item.title ?? 'Game'}</Text>
-        <Text style={styles.meta}>{start}</Text>
-        {item.location?.label ? <Text style={styles.meta}>{item.location.label}</Text> : null}
-        <Text style={styles.meta}>Team: {item.teamId ?? '—'}</Text>
-      </View>
-    );
-  }
-
-  // add near the top of the component (before the `return`), e.g. after your helpers/state:
-  const DATE_OPTIONS = {
-    any: 'Any',
-    today: 'Today',
-    next7: 'Next 7 days',
-    next30: 'Next 30 days',
-    thisMonth: 'This month',
+  // Helpers to cope with native SDK return shapes and Firestore REST shapes (mapValue/doubleValue etc).
+  const extractIdFromResourceName = (name?: string) => {
+    if (!name) return null;
+    // resource name like: projects/PROJECT_ID/databases/(default)/documents/teams/{docId}
+    const parts = name.split('/');
+    return parts[parts.length - 1] || null;
   };
 
+  const readNumberField = (doc: any, fieldName: string): number | null => {
+    if (!doc) return null;
+    // 1) direct property (native SDK shape)
+    const v1 = doc[fieldName];
+    if (typeof v1 === 'number') return v1;
+    if (typeof v1 === 'string' && v1.trim() !== '' && !Number.isNaN(Number(v1))) return Number(v1);
+
+    // 2) nested location object (doc.location?.lat)
+    if (doc.location && typeof doc.location === 'object') {
+      const lat = fieldName === 'lat' ? doc.location.lat ?? doc.location.latitude : undefined;
+      if (typeof lat === 'number') return lat;
+    }
+
+    // 3) Firestore REST JSON shape: doc.fields?.<fieldName>.(doubleValue|integerValue|stringValue)
+    const f = doc.fields?.[fieldName];
+    if (f) {
+      if (f.doubleValue != null) return Number(f.doubleValue);
+      if (f.integerValue != null) return Number(f.integerValue);
+      if (f.stringValue != null && f.stringValue.trim() !== '') return Number(f.stringValue);
+    }
+
+    // 4) Firestore REST nested map for location: doc.fields?.location?.mapValue?.fields?.lat?.doubleValue
+    const loc = doc.fields?.location?.mapValue?.fields;
+    if (loc && loc[fieldName]) {
+      const v = loc[fieldName];
+      if (v.doubleValue != null) return Number(v.doubleValue);
+      if (v.integerValue != null) return Number(v.integerValue);
+      if (v.stringValue != null && v.stringValue.trim() !== '') return Number(v.stringValue);
+    }
+
+    return null;
+  };
+
+  const readStringField = (doc: any, fieldName: string): string | null => {
+    if (!doc) return null;
+    const v1 = doc[fieldName];
+    if (typeof v1 === 'string') return v1;
+    // "native" nested location name
+    if (fieldName === 'formattedAddress' && doc.location && typeof doc.location === 'object') {
+      return doc.location.formattedAddress ?? doc.location.address ?? doc.location.name ?? null;
+    }
+    // Firestore REST JSON shape
+    const f = doc.fields?.[fieldName];
+    if (f?.stringValue != null) return String(f.stringValue);
+    // nested mapValue.location
+    const loc = doc.fields?.location?.mapValue?.fields;
+    if (loc) {
+      const cand = loc[fieldName];
+      if (cand?.stringValue != null) return String(cand.stringValue);
+      if (cand?.doubleValue != null) return String(cand.doubleValue);
+    }
+    return null;
+  };
+
+  const getDocId = (doc: any) => {
+    if (!doc) return null;
+    if (doc.id) return String(doc.id);
+    if (doc._id) return String(doc._id);
+    // REST: name = projects/.../documents/teams/{id}
+    if (doc.name) return extractIdFromResourceName(String(doc.name));
+    return null;
+  };
+
+  const firstLineOf = (text: string | undefined | null) => {
+    if (!text) return '';
+    // Split by newline first, then take first CSV-like segment before a comma for concise single-line display
+    const byLine = String(text).split('\n').map(s => s.trim()).filter(Boolean);
+    if (byLine.length === 0) return '';
+    const first = byLine[0];
+    // if address contains commas, take up to the first comma for a short address line
+    const beforeComma = first.split(',').map(s => s.trim()).filter(Boolean)[0] ?? first;
+    return beforeComma;
+  };
+
+  const searchNearbyGames = async () => {
+    if (!userCoords) {
+      Toast.show({ type: 'info', text1: 'Current location not available' });
+      return;
+    }
+    setSearching(true);
+    try {
+      // Load games and teams (teams used to enrich teamName/homeColor/location)
+      const [gamesSettled, teamsSettled] = await Promise.allSettled([
+        listTopLevelCollection('games', 1000),
+        listTopLevelCollection('teams', 1000),
+      ]);
+
+      const gamesRaw = gamesSettled.status === 'fulfilled' ? (gamesSettled.value as any[]) : [];
+      const teamsRaw = teamsSettled.status === 'fulfilled' ? (teamsSettled.value as any[]) : [];
+
+      // Debug logging to help if nothing shows up
+      if (!Array.isArray(gamesRaw) || gamesRaw.length === 0) {
+        console.debug('[FindGames] games list empty or not array:', gamesRaw);
+      }
+      if (!Array.isArray(teamsRaw) || teamsRaw.length === 0) {
+        console.debug('[FindGames] teams list empty or not array:', teamsRaw);
+      }
+
+      // Build a map of teams by id for quick lookup (support multiple possible id keys)
+      const teamsMap = new Map<string, any>();
+      if (Array.isArray(teamsRaw)) {
+        for (const t of teamsRaw) {
+          const id = getDocId(t);
+          if (id) teamsMap.set(id, t);
+          // also try common field fallbacks
+          if (t.teamId) teamsMap.set(String(t.teamId), t);
+          if (t.id) teamsMap.set(String(t.id), t);
+        }
+      }
+
+      const enriched = (Array.isArray(gamesRaw) ? gamesRaw : [])
+        .map((g) => {
+          // Try to extract lat/lng flexibly
+          const latCandidates = [
+            readNumberField(g, 'lat'),
+            readNumberField(g, 'latitude'),
+            readNumberField(g, 'locationLat'),
+            // try nested object values:
+            g?.location?.lat,
+            g?.location?.latitude,
+          ];
+          const lngCandidates = [
+            readNumberField(g, 'lng'),
+            readNumberField(g, 'longitude'),
+            readNumberField(g, 'locationLng'),
+            g?.location?.lng,
+            g?.location?.longitude,
+          ];
+          const lat = latCandidates.find((v) => v != null) ?? null;
+          const lng = lngCandidates.find((v) => v != null) ?? null;
+          if (lat == null || lng == null) {
+            // If lat/lng not present, try to read from a "location" field that may contain an address only (skip)
+            return null;
+          }
+
+          // compute km then convert to miles
+          const dKm = haversineDistanceKm(userCoords.lat, userCoords.lng, Number(lat), Number(lng));
+          const dMiles = dKm * KM_TO_MILES;
+
+          // Determine teamId by trying several fields (teamId, team?.id, ownerTeam)
+          const rawTeamId = g.teamId ?? g.team?.id ?? g.teamIdString ?? getDocId(g.team) ?? null;
+          const teamDoc = rawTeamId ? teamsMap.get(String(rawTeamId)) : null;
+
+          // teamName fallbacks (support REST nested string fields)
+          const teamNameFromTeamDoc =
+            teamDoc && (readStringField(teamDoc, 'teamName') ?? teamDoc.teamName ?? teamDoc.name ?? teamDoc.displayName);
+          const teamName =
+            teamNameFromTeamDoc ??
+            readStringField(g, 'teamName') ??
+            g.teamName ??
+            g.team?.teamName ??
+            String(rawTeamId ?? 'Unknown Team');
+
+          // home color fallbacks
+          const homeColor =
+            (teamDoc && (readStringField(teamDoc, 'homeColor') ?? teamDoc.homeColor)) ??
+            (g.team && (g.team.homeColor ?? readStringField(g.team, 'homeColor'))) ??
+            g.homeColor ??
+            g.teamHomeColor ??
+            '#ffffff';
+
+          // raw location fallback (team doc location or game doc location)
+          const teamLocationRaw =
+            (teamDoc && (readStringField(teamDoc, 'location') ?? readStringField(teamDoc, 'formattedAddress'))) ??
+            readStringField(g, 'location') ??
+            (g.location && (g.location.formattedAddress ?? g.location.address ?? g.location.name)) ??
+            '';
+
+          const locationFirst = firstLineOf(teamLocationRaw);
+
+          return {
+            // keep original shape for debugging
+            ...g,
+            id: g.id ?? getDocId(g) ?? g._id ?? `${teamName}-${lat}-${lng}`,
+            distanceMiles: dMiles,
+            teamName,
+            teamHomeColor: homeColor,
+            teamLocationFirstLine: locationFirst,
+            teamId: rawTeamId ?? undefined,
+          };
+        })
+        .filter(Boolean)
+        .filter((g: any) => g.distanceMiles <= radiusMiles)
+        .sort((a: any, b: any) => a.distanceMiles - b.distanceMiles);
+
+      setResults(enriched);
+    } catch (e: any) {
+      console.warn('[FindGames] search failed', e);
+      Toast.show({ type: 'error', text1: 'Search failed', text2: e?.message ?? '' });
+      setResults([]);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const distanceLabel = (miles: number | null | undefined) => (miles == null ? '—' : `${miles.toFixed(1)} mi`);
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.header}>Find Available Games</Text>
+    <View style={{ flex: 1, padding: 16 }}>
+      <Text style={styles.header}>Find Games</Text>
 
-      <View style={styles.row}>
-        <View style={{ flex: 1, marginRight: 8 }}>
-          <Text style={{ marginBottom: 6 }}>Radius (km)</Text>
-          <TextInput
-            value={distanceText}
-            onChangeText={setDistanceText}
-            onBlur={commitDistance}
-            keyboardType="numeric"
-            style={styles.smallInput}
-            placeholder="km"
-          />
-        </View>
-
-        <View style={{ width: 120 }}>
-          <Text style={{ marginBottom: 6 }}>Date</Text>
-          <Pressable style={[styles.smallBtn, { backgroundColor: '#fff', borderWidth: 1, borderColor: '#0a7ea4' }]} onPress={() => setDateFilterModalVisible(true)}>
-            <Text style={[styles.smallBtnText, { color: '#0a7ea4' }]}>
-              {dateFilter === 'any' ? 'Any' : dateFilter === 'today' ? 'Today' : dateFilter === 'next7' ? 'Next 7d' : dateFilter === 'next30' ? 'Next 30d' : 'This month'}
-            </Text>
-          </Pressable>
-        </View>
-      </View>
-
-      <View style={[styles.row, { marginTop: 8 }]}>
-        <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <Text style={{ marginRight: 8 }}>Rating</Text>
-          <TextInput value={eloMinText} onChangeText={setEloMinText} onBlur={commitEloMin} keyboardType="numeric" style={[styles.smallInput, { minWidth: 80 }]} placeholder="800" />
-          <Text style={{ marginHorizontal: 8 }}>—</Text>
-          <TextInput value={eloMaxText} onChangeText={setEloMaxText} onBlur={commitEloMax} keyboardType="numeric" style={[styles.smallInput, { minWidth: 80 }]} placeholder="3000" />
-        </View>
-
-        <Pressable onPress={() => { fetchGames(); }} style={[styles.smallBtn, { marginLeft: 8 }]}>
-          <Text style={styles.smallBtnText}>Apply</Text>
-        </Pressable>
-      </View>
-
-      <View style={{ marginTop: 12 }}>
-        {loading ? (
+      <View style={{ marginBottom: 12 }}>
+        {loadingLocation ? (
           <ActivityIndicator />
-        ) : games.length === 0 ? (
-          <Text style={{ color: '#666' }}>No available games found</Text>
         ) : (
-          <FlatList data={games} keyExtractor={(i) => i.id} renderItem={renderGame} contentContainerStyle={{ paddingBottom: 80 }} />
+          // per request, do not display raw coordinates; show only if not available
+          null
         )}
+        {!loadingLocation && !userCoords ? <Text style={{ color: '#666' }}>Location not available</Text> : null}
       </View>
 
-      {/* Date filter modal */}
-      <Modal visible={dateFilterModalVisible} transparent animationType="slide" onRequestClose={() => setDateFilterModalVisible(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContainerSmall}>
-            <Text style={{ fontWeight: '700', marginBottom: 8 }}>Select Date Filter</Text>
-            <Text style={{ marginBottom: 8, fontSize: 16, color: '#333' }}>
-              {DATE_OPTIONS[dateFilter]}
-            </Text>
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
+        <TextInput
+          style={styles.input}
+          value={String(radiusMiles)}
+          keyboardType="numeric"
+          onChangeText={(t) => {
+            const n = Number(t);
+            if (!Number.isFinite(n)) setRadiusMiles(0);
+            else setRadiusMiles(Math.max(0, n));
+          }}
+        />
+        <Text style={{ marginLeft: 8 }}>miles radius</Text>
+        <View style={{ width: 12 }} />
+        <Button title="Search" onPress={searchNearbyGames} disabled={searching || loadingLocation || !userCoords} />
+      </View>
 
-            {Object.keys(DATE_OPTIONS).map((key) => (
-              <Pressable
-                key={key}
-                onPress={() => {
-                  setDateFilter(key as any);
-                  setDateFilterModalVisible(false);
-                }}
-                style={[styles.modalOption, dateFilter === key ? { backgroundColor: '#e6f7fb' } : undefined]}
-              >
-                <Text style={styles.modalOptionText}>
-                  {DATE_OPTIONS[key as keyof typeof DATE_OPTIONS]}
-                </Text>
-              </Pressable>
-            ))}
-
-            <View style={{ height: 10 }} />
-            <Pressable onPress={() => setDateFilterModalVisible(false)} style={[styles.smallBtn, { alignSelf: 'flex-end' }]}>
-              <Text style={styles.smallBtnText}>Close</Text>
-            </Pressable>
-          </View>
-        </View>
-      </Modal>
+      {searching ? (
+        <ActivityIndicator />
+      ) : (
+        <FlatList
+          data={results}
+          keyExtractor={(item) => String(item.id ?? `${item.title ?? ''}-${item.distanceMiles}`)}
+          renderItem={({ item }) => {
+            const dt = item.startISO ? new Date(item.startISO) : null;
+            const bg = item.teamHomeColor ?? '#ffffff';
+            const textColor = getReadableTextColor(bg);
+            return (
+              <View style={[styles.card, { backgroundColor: bg }]}>
+                <Text style={[{ fontWeight: '700', color: textColor }]}>{item.title ?? item.teamName ?? 'Game'}</Text>
+                <Text style={{ color: textColor }}>{dt ? dt.toLocaleString() : 'TBA'}</Text>
+                <Text style={{ color: textColor }}>Distance: {distanceLabel(item.distanceMiles)}</Text>
+                <Text style={{ color: textColor }}>Team: {item.teamName}</Text>
+                {item.teamLocationFirstLine ? <Text style={{ color: textColor }}>{item.teamLocationFirstLine}</Text> : null}
+                <View style={{ height: 8 }} />
+                <Button
+                  title="View"
+                  onPress={() =>
+                    router.push(`/(tabs)/TeamDetailScreen?teamId=${encodeURIComponent(String(item.teamId ?? item.teamId))}`)
+                  }
+                  color="#0a7ea4"
+                />
+              </View>
+            );
+          }}
+          ListEmptyComponent={() => (
+            <View style={{ padding: 12 }}>
+              <Text style={{ color: '#666' }}>No games found in the selected radius.</Text>
+            </View>
+          )}
+        />
+      )}
     </View>
   );
 }
 
+/**
+ * Very small contrast helper: if background is dark return white text, else return black.
+ * Accepts hex colors like "#rrggbb" or short "#rgb" and plain color names will default to black.
+ */
+function getReadableTextColor(bg: string) {
+  try {
+    if (!bg || typeof bg !== 'string') return '#000';
+    // strip leading '#'
+    let c = bg.trim();
+    if (c[0] === '#') c = c.slice(1);
+    if (c.length === 3) {
+      c = c.split('').map((ch) => ch + ch).join('');
+    }
+    if (c.length !== 6) return '#000';
+    const r = parseInt(c.slice(0, 2), 16);
+    const g = parseInt(c.slice(2, 4), 16);
+    const b = parseInt(c.slice(4, 6), 16);
+    // luminance per ITU-R BT.709
+    const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    return luminance < 140 ? '#fff' : '#000';
+  } catch {
+    return '#000';
+  }
+}
+
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 16, backgroundColor: '#fff' },
-  header: { fontSize: 20, fontWeight: '700', marginBottom: 12 },
-  row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  smallInput: {
-    minWidth: 84,
-    paddingHorizontal: 8,
-    paddingVertical: 8,
-    borderRadius: 6,
+  header: { fontSize: 20, fontWeight: '700', marginBottom: 10 },
+  input: {
     borderWidth: 1,
-    borderColor: '#ccc',
-    backgroundColor: '#fff',
-    marginHorizontal: 4,
-  },
-  smallBtn: {
-    paddingHorizontal: 8,
-    paddingVertical: 6,
+    borderColor: '#ddd',
+    padding: 8,
     borderRadius: 6,
-    backgroundColor: '#0a7ea4',
-    marginHorizontal: 4,
-  },
-  smallBtnText: { color: 'white', fontWeight: '600' },
-  card: { padding: 10, borderWidth: 1, borderColor: '#eee', borderRadius: 8, marginBottom: 12, backgroundColor: '#fff' },
-  title: { fontWeight: '700' },
-  meta: { color: '#666', marginTop: 4 },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  modalContainerSmall: {
-    width: '85%',
+    width: 90,
     backgroundColor: '#fff',
+  },
+  card: {
+    borderWidth: 1,
+    borderColor: '#ddd',
     borderRadius: 8,
-    padding: 16,
-    alignItems: 'stretch',
-  },
-  modalOption: {
-    paddingVertical: 10,
-    paddingHorizontal: 8,
-    borderRadius: 6,
-    marginVertical: 4,
-  },
-  modalOptionText: {
-    fontSize: 16,
+    padding: 12,
+    marginBottom: 10,
+    // backgroundColor overridden per-card by teamHomeColor
   },
 });

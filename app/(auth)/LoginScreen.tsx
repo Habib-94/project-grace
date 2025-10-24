@@ -1,4 +1,3 @@
-import { auth } from '@/firebaseConfig';
 import { useRouter } from 'expo-router';
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import React, { useState } from 'react';
@@ -13,6 +12,30 @@ import {
   TouchableOpacity
 } from 'react-native';
 import Toast from 'react-native-toast-message';
+import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
+import { getDocument } from '../../src/firestoreRest';
+
+/**
+ * Runtime-safe upsert/set with merge.
+ * Uses native RN Firebase API when available, otherwise web modular setDoc with { merge: true }.
+ */
+async function upsertUserDoc(uid: string, data: any) {
+  // Native RN Firebase style
+  try {
+    if (db && typeof (db as any).collection === 'function') {
+      // native firestore supports .doc(uid).set(data, { merge: true })
+      // Some native SDK versions accept a second "options" parameter with { merge: true }
+      return await (db as any).collection('users').doc(uid).set(data, { merge: true });
+    }
+  } catch (e) {
+    // fallthrough to web
+    console.warn('[upsertUserDoc] native set failed, falling back to web SDK', e);
+  }
+
+  // Web modular SDK
+  const { doc, setDoc } = await import('firebase/firestore');
+  return setDoc(doc(db as any, 'users', uid), data, { merge: true });
+}
 
 export default function LoginScreen() {
   const [email, setEmail] = useState('');
@@ -32,7 +55,54 @@ export default function LoginScreen() {
 
     try {
       setLoading(true);
-      await signInWithEmailAndPassword(auth, email, password);
+
+      // Sign in the user (web/native compatible; signInWithEmailAndPassword is used for web SDK path,
+      // and auth should be the native instance if native SDK is present)
+      await signInWithEmailAndPassword(auth as any, email, password);
+
+      // Make sure Firestore network is enabled before any REST/list checks or writes
+      try {
+        await ensureFirestoreOnline();
+      } catch (e) {
+        console.warn('[Login] ensureFirestoreOnline failed', e);
+      }
+
+      // Ensure a users/{uid} document exists (some flows may have missed creating it).
+      // Use REST getDocument (which attaches the ID token) to check for existence.
+      try {
+        const user = (auth as any)?.currentUser;
+        const uid = user?.uid;
+        if (uid) {
+          let existing: any = null;
+          try {
+            existing = await getDocument(`users/${uid}`);
+          } catch (e) {
+            // getDocument may throw 404 or permission errors; log and continue to attempt upsert
+            console.warn('[Login] getDocument(users/{uid}) check failed', e);
+          }
+
+          if (!existing) {
+            try {
+              await upsertUserDoc(uid, {
+                uid,
+                name: user?.displayName ?? '',
+                email: user?.email ?? '',
+                role: 'standard',
+                teamId: null,
+                isCoordinator: false,
+                createdAt: new Date().toISOString(),
+              });
+              console.log('[Login] created missing users/{uid} doc');
+            } catch (uErr) {
+              // Non-fatal — we log and continue; rules may prevent this write.
+              console.warn('[Login] upsertUserDoc failed', uErr);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[Login] ensure user doc step failed', e);
+      }
+
       Toast.show({
         type: 'success',
         text1: 'Welcome back!',
@@ -62,7 +132,7 @@ export default function LoginScreen() {
           resizeMode="contain"
         />
 
-        <Text style={styles.title}>Team Login</Text>
+        <Text style={styles.title}>Login</Text>
 
         <TextInput
           style={styles.input}
