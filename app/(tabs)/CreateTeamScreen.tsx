@@ -204,16 +204,25 @@ export default function CreateTeamScreen() {
     }
   };
 
+  // Rewritten handler with validation and clear error messages
   const handleCreateTeam = async () => {
     if (!user) {
-      Toast.show({ type: 'error', text1: 'Sign in required' });
+      Toast.show({ type: 'error', text1: 'Sign in required', text2: 'You must sign in to create a team.' });
       router.replace('/(auth)/LoginScreen');
       return;
     }
-    if (!teamName || !teamName.trim()) {
-      Toast.show({ type: 'info', text1: 'Please enter a team name' });
+
+    // Basic client-side validation for required details
+    if (!teamName || !teamName.trim() || (!pickedPlace && (!locationText || !locationText.trim()))) {
+      // More specific guidance depending on what's missing
+      if (!teamName || !teamName.trim()) {
+        Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please enter a team name.' });
+      } else {
+        Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please provide a location for the team (use "Find with Google" or enter an address).' });
+      }
       return;
     }
+
     setLoading(true);
     try {
       await ensureFirestoreOnline();
@@ -226,11 +235,35 @@ export default function CreateTeamScreen() {
         if (userDoc) {
           creatorName = (userDoc.name ?? userDoc.displayName ?? '') || null;
           creatorEmail = (userDoc.email ?? '') || null;
+
+          // BLOCK: disallow creating another team if user is already a coordinator
+          if (userDoc.isCoordinator) {
+            Toast.show({
+              type: 'error',
+              text1: 'Cannot create team',
+              text2: 'You are already a coordinator for a team and cannot create another one.',
+            });
+            setLoading(false);
+            return;
+          }
+
+          // BLOCK: disallow creating a team if user is already a member of a team
+          if (userDoc.teamId) {
+            Toast.show({
+              type: 'error',
+              text1: 'Cannot create team',
+              text2: 'You are already a member of a team. Leave your current team before creating a new one.',
+            });
+            setLoading(false);
+            return;
+          }
         }
       } catch (e) {
-        console.warn('[CreateTeam] failed to read users/{uid} for coordinator name', e);
+        // If reading the user doc fails, fall back to auth profile values but still proceed with caution.
+        console.warn('[CreateTeam] failed to read users/{uid} for coordinator check', e);
         creatorName = user.displayName ?? null;
         creatorEmail = user.email ?? null;
+        // Note: server-side rules will still enforce creation permissions; we surface helpful client messages when possible.
       }
 
       const coordEntry = { uid: user.uid, name: creatorName ?? (user.displayName ?? ''), email: creatorEmail ?? (user.email ?? '') };
@@ -272,7 +305,9 @@ export default function CreateTeamScreen() {
       }
     } catch (e: any) {
       console.error('[CreateTeam] create failed', e);
-      Toast.show({ type: 'error', text1: 'Create failed', text2: e?.message || '' });
+      // Try to show server-provided error message when available
+      const msg = e?.message ?? String(e);
+      Toast.show({ type: 'error', text1: 'Create failed', text2: msg });
     } finally {
       setLoading(false);
     }
