@@ -13,7 +13,6 @@ import {
 } from 'react-native';
 
 import Toast from 'react-native-toast-message';
-import { emitAppEvent } from '../../src/appEvents'; // <- ensure emitter imported
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig'; // db/auth/ensure helper
 import { debugAuthState, getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
 
@@ -52,7 +51,7 @@ export default function GameSchedulerScreen() {
   const [createdGames, setCreatedGames] = useState<Game[]>([]);
   const [fetchingCreatedGames, setFetchingCreatedGames] = useState(false);
 
-  // optional title for created games
+  // Optional title for created games
   const [gameTitleText, setGameTitleText] = useState<string>('');
 
   // preview occurrences
@@ -82,14 +81,116 @@ export default function GameSchedulerScreen() {
     return occurrences;
   }, [composedDate, previewCount, recurrence]);
 
+  // selection & status tracking for preview occurrences
+  const [selectedOccurrences, setSelectedOccurrences] = useState<Record<string, boolean>>(() => {
+    const init: Record<string, boolean> = {};
+    previewOccurrences.forEach((d) => {
+      init[d.toISOString()] = true; // default: select all
+    });
+    return init;
+  });
+
+  // statuses per occurrence: 'idle' | 'pending' | 'success' | 'error'
+  const [creationStatus, setCreationStatus] = useState<Record<string, 'idle' | 'pending' | 'success' | 'error'>>({});
+
+  // simple progress counters shown in the button/progress bar
+  const [totalToCreate, setTotalToCreate] = useState<number>(0);
+  const [createdCount, setCreatedCount] = useState<number>(0);
+
+  // reset selection/status when preview occurrences change
+  useEffect(() => {
+    const init: Record<string, boolean> = {};
+    previewOccurrences.forEach((d) => (init[d.toISOString()] = true));
+    setSelectedOccurrences(init);
+    setCreationStatus({});
+    setTotalToCreate(0);
+    setCreatedCount(0);
+  }, [previewOccurrences]);
+
+  // compute markedDates for CalendarList, reflecting:
+  // - occurrences selected for creation (highlight blue)
+  // - per-occurrence status (pending/orange, success/green, error/red)
+  // - already-created games (red)
   const markedDates = useMemo(() => {
     const obj: Record<string, any> = {};
+
+    // Mark preview occurrences first (so their selection/status drives styling)
     previewOccurrences.forEach((d) => {
-      const key = d.toISOString().slice(0, 10);
-      obj[key] = { marked: true, dotColor: '#2E86AB' };
+      const iso = d.toISOString();
+      const key = iso.slice(0, 10); // YYYY-MM-DD
+      const isSelected = !!selectedOccurrences[iso];
+      const status = creationStatus[iso] ?? 'idle';
+      const alreadyCreated = createdGames.some((g) => g.startISO === iso);
+
+      // defaults
+      let dotColor = '#2E86AB';
+      let selected = false;
+      let selectedColor: string | undefined = undefined;
+
+      if (alreadyCreated) {
+        // already-created: red highlight
+        dotColor = '#FF3B30';
+        selected = true;
+        selectedColor = '#fff1f0';
+      } else if (status === 'pending') {
+        dotColor = '#f0ad4e'; // orange
+        selected = true;
+        selectedColor = '#fff8e6';
+      } else if (status === 'success') {
+        dotColor = '#28a745'; // green
+        selected = true;
+        selectedColor = '#ecffef';
+      } else if (status === 'error') {
+        dotColor = '#b00020'; // dark red
+        selected = true;
+        selectedColor = '#fff1f0';
+      } else if (isSelected) {
+        // selected for future creation
+        dotColor = '#054f73';      // darker blue
+        selected = true;
+        selectedColor = '#d7eef6'; // slightly darker selected background
+      } else {
+        // non-selected preview
+        dotColor = '#2E86AB';
+        selected = false;
+      }
+
+      // accumulate: if multiple occurrences fall on same day, prefer red/success/pending ordering
+      const existing = obj[key];
+      if (!existing) {
+        obj[key] = { marked: true, dotColor, selected, selectedColor };
+      } else {
+        // if existing is already red (created) keep it; otherwise prefer more urgent color
+        const priority = (c: string) => {
+          if (c === '#FF3B30' || c === '#b00020') return 4;
+          if (c === '#f0ad4e') return 3;
+          if (c === '#28a745') return 2;
+          if (c === '#0a7ea4') return 1;
+          return 0;
+        };
+        const existingPriority = priority(existing.dotColor);
+        const newPriority = priority(dotColor);
+        if (newPriority >= existingPriority) {
+          obj[key] = { marked: true, dotColor, selected: existing.selected || selected, selectedColor: selectedColor ?? existing.selectedColor };
+        }
+      }
     });
+
+    // Also mark any createdGames that are on dates not in previewOccurrences
+    createdGames.forEach((g) => {
+      if (!g.startISO) return;
+      const key = new Date(g.startISO).toISOString().slice(0, 10);
+      const existing = obj[key];
+      if (!existing) {
+        obj[key] = { marked: true, dotColor: '#FF3B30', selected: true, selectedColor: '#fff1f0' };
+      } else {
+        // prefer red if a created game exists on the day
+        obj[key] = { ...existing, dotColor: '#FF3B30', selected: true, selectedColor: '#fff1f0' };
+      }
+    });
+
     return obj;
-  }, [previewOccurrences]);
+  }, [previewOccurrences, selectedOccurrences, creationStatus, createdGames]);
 
   // Optional calendar lib
   let CalendarList: any = null;
@@ -166,6 +267,17 @@ export default function GameSchedulerScreen() {
         Toast.show({ type: 'error', text1: 'Sign in required', text2: 'Please sign in to create games.' });
         return;
       }
+
+      // Build list of occurrences selected
+      const selectedIsos = previewOccurrences
+        .map((d) => d.toISOString())
+        .filter((iso) => selectedOccurrences[iso]);
+
+      if (selectedIsos.length === 0) {
+        Toast.show({ type: 'info', text1: 'No occurrences selected', text2: 'Please select at least one occurrence to create.' });
+        return;
+      }
+
       setCreating(true);
       await ensureFirestoreOnline();
 
@@ -174,12 +286,14 @@ export default function GameSchedulerScreen() {
       const userDoc = await getDocument(`users/${user.uid}`);
       if (!userDoc) {
         Toast.show({ type: 'error', text1: 'User record missing', text2: 'Cannot find user record.' });
+        setCreating(false);
         return;
       }
       const teamId = userDoc.teamId;
       const isCoordinator = !!userDoc.isCoordinator;
       if (!isCoordinator || !teamId) {
         Toast.show({ type: 'error', text1: 'Permission denied', text2: 'You must be a coordinator with a team to create games.' });
+        setCreating(false);
         return;
       }
 
@@ -201,80 +315,91 @@ export default function GameSchedulerScreen() {
         // ignore; best-effort enrichment
       }
 
-      let created = 0;
+      // Initialize statuses
+      const newStatus: Record<string, 'idle' | 'pending' | 'success' | 'error'> = {};
+      selectedIsos.forEach((iso) => {
+        newStatus[iso] = 'pending';
+      });
+      setCreationStatus((prev) => ({ ...prev, ...newStatus }));
+      setTotalToCreate(selectedIsos.length);
+      setCreatedCount(0);
+
       const defaultTitle = gameTitleText?.trim() ? gameTitleText.trim() : 'Available Game';
 
-      for (const occ of previewOccurrences) {
-        const payload: any = {
-          teamId,
-          title: defaultTitle,
-          type: 'open',
-          startISO: occ.toISOString(),
-          // Attach location object if we have team coords (so FindGames can use it)
-          location: teamLat != null && teamLng != null ? { lat: teamLat, lng: teamLng, label: teamLabel } : null,
-          placeId: teamPlaceId ?? null,
-          kitColor: null,
-          createdBy: user.uid,
-          createdAt: new Date().toISOString(),
-        };
+      // Iterate sequentially to provide clearer per-item statuses (you can parallelize later)
+      let successCount = 0;
+      for (const iso of selectedIsos) {
         try {
-          const ref: any = await addDocSafe('games', payload);
-          const createdId = ref?.id ?? (typeof ref?.path === 'string' ? String(ref.path).split('/').pop() : null);
-          console.log('[GameScheduler] added game', { createdId, payload });
-          if (createdId) {
-            created++;
-            // Try to immediately read back the created doc (helps verify permissions & visibility)
-            try {
-              const doc = await getDocument(`games/${createdId}`);
-              console.log('[GameScheduler] getDocument for created game returned', { createdId, doc });
-              if (doc) {
-                setCreatedGames((prev) => [
-                  {
-                    id: createdId,
-                    title: doc.title,
-                    startISO: doc.startISO,
-                    location: doc.location,
-                    kitColor: doc.kitColor ?? null,
-                    teamId: doc.teamId,
-                    teamName: teamName || (doc.teamName ?? ''),
-                    teamLocation: doc.teamLocation ?? '',
-                    elo: doc.elo,
-                    createdBy: doc.createdBy,
-                  },
-                  ...prev,
-                ]);
-              }
-            } catch (readErr) {
-              console.warn('[GameScheduler] getDocument for created game failed', createdId, readErr);
-            }
-          } else {
-            console.warn('[GameScheduler] addDoc returned no id for payload', payload, ref);
+          const occ = new Date(iso);
+          const payload: any = {
+            teamId,
+            title: defaultTitle,
+            type: 'open',
+            startISO: occ.toISOString(),
+            location: teamLat != null && teamLng != null ? { lat: teamLat, lng: teamLng, label: teamLabel } : null,
+            placeId: teamPlaceId ?? null,
+            kitColor: null,
+            createdBy: user.uid,
+            createdAt: new Date().toISOString(),
+          };
+
+          // mark pending
+          setCreationStatus((prev) => ({ ...prev, [iso]: 'pending' }));
+
+          // Attempt SDK-first addDoc
+          let ref: any = null;
+          try {
+            ref = await addDocSafe('games', payload);
+          } catch (sdkErr) {
+            // SDK write failed — mark this occurrence as error and continue.
+            // If you want a REST fallback, implement it here using your existing helpers in src/firestoreRest.ts.
+            console.warn('[GameScheduler] addDoc SDK failed, no fallback implemented here', sdkErr);
+            throw sdkErr; // this will be caught by the per-item catch below and set status='error'
           }
-        } catch (e) {
-          console.warn('[GameScheduler] createGames addDoc failed for', payload, e);
+
+          // If add succeeded and returned an id, we can fetch document or use payload to immediately reflect created item
+          const createdId = ref?.id ?? (typeof ref?.path === 'string' ? String(ref.path).split('/').pop() : null);
+
+          // optimistic UI: insert a record into createdGames (the list shown below) so user sees immediate result
+          const createdItem: Game = {
+            id: createdId ?? `local-${Math.random().toString(36).slice(2, 9)}`,
+            title: payload.title,
+            startISO: payload.startISO,
+            location: payload.location,
+            kitColor: payload.kitColor,
+            teamId: payload.teamId,
+            teamName: teamName,
+            teamLocation: teamLabel,
+            type: payload.type,
+            elo: undefined,
+            createdBy: payload.createdBy,
+          };
+
+          setCreatedGames((prev) => [createdItem, ...prev]);
+
+          // mark success
+          setCreationStatus((prev) => ({ ...prev, [iso]: 'success' }));
+          successCount++;
+          setCreatedCount((c) => c + 1);
+        } catch (itemErr: any) {
+          console.warn('[GameScheduler] failed to create occurrence', iso, itemErr);
+          setCreationStatus((prev) => ({ ...prev, [iso]: 'error' }));
         }
       }
 
-      if (created > 0) {
-        Toast.show({ type: 'success', text1: 'Games created', text2: `${created} game(s) created.` });
+      if (successCount > 0) {
+        Toast.show({ type: 'success', text1: 'Games created', text2: `${successCount} game(s) created.` });
       } else {
-        Toast.show({ type: 'info', text1: 'No games created', text2: 'None of the game documents could be created.' });
+        Toast.show({ type: 'error', text1: 'Create failed', text2: 'None of the selected occurrences could be created.' });
       }
 
-      // Refresh created games list
+      // Refresh created games list (best-effort)
       try {
         await debugAuthState('after createGames, before fetchCreatedGames');
       } catch {
         // ignore
       }
       await fetchCreatedGames();
-
-      // Notify dashboard and other listeners that games were created
-      try {
-        emitAppEvent('games:created', { teamId });
-      } catch (e) {
-        console.warn('[GameScheduler] failed to emit games:created', e);
-      }
     } catch (e: any) {
       console.error('[GameScheduler] createGames error', e);
       Toast.show({ type: 'error', text1: 'Create failed', text2: e?.message ?? String(e) });
@@ -439,6 +564,14 @@ export default function GameSchedulerScreen() {
               futureScrollRange={6}
               markedDates={markedDates}
               markingType="multi-dot"
+              // Theme: use the darker selection blue so calendar preview matches the row highlight
+              theme={{
+                selectedDayBackgroundColor: '#054f73',
+                selectedDayTextColor: '#ffffff',
+                dotColor: '#054f73',
+                selectedDotColor: '#ffffff',
+                todayTextColor: '#054f73',
+              }}
               style={{ borderRadius: 8, marginVertical: 8 }}
             />
           ) : (
@@ -447,24 +580,100 @@ export default function GameSchedulerScreen() {
             </View>
           )}
 
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
+            <Text style={{ fontSize: 13 }}>{previewOccurrences.length} occurrence(s)</Text>
+            <Pressable
+              onPress={() => { /* toggle logic */ }}
+            >
+              <Text style={{ color: '#054f73', fontWeight: '600' }}>{previewOccurrences.every((d) => selectedOccurrences[d.toISOString()]) ? 'Deselect all' : 'Select all'}</Text>
+            </Pressable>
+          </View>
+
           <View style={styles.previewWrap}>
-            {previewOccurrences.map((d) => (
-              <View key={d.toISOString()} style={styles.previewRow}>
-                <Text>{d.toLocaleString()}</Text>
-              </View>
-            ))}
+            {previewOccurrences.map((d) => {
+              const iso = d.toISOString();
+              const isSelected = !!selectedOccurrences[iso];
+              const status = creationStatus[iso] ?? 'idle';
+              const alreadyCreated = createdGames.some((g) => g.startISO === iso);
+
+              // compute background for row based on status / selection / alreadyCreated
+              let bg = '#f4f4f4';
+              if (alreadyCreated) bg = '#fff1f0'; // light red
+              else if (status === 'pending') bg = '#fff8e6'; // light orange
+              else if (status === 'success') bg = '#ecffef'; // light green
+              else if (status === 'error') bg = '#fff1f0'; // light red
+              else if (isSelected) bg = '#d7eef6'; // darker, more visible light blue
+
+              return (
+                <Pressable
+                  key={iso}
+                  onPress={() => setSelectedOccurrences((prev) => ({ ...prev, [iso]: !prev[iso] }))}
+                  style={[styles.previewRow, { flexDirection: 'row', alignItems: 'center', minWidth: 200, backgroundColor: bg }]}
+                >
+                  <View
+                    style={{
+                      width: 20,
+                      height: 20,
+                      borderRadius: 3,
+                      borderWidth: 1,
+                      borderColor: isSelected ? '#054f73' : '#ccc',
+                      backgroundColor: isSelected ? '#054f73' : '#fff',
+                      marginRight: 8,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    {isSelected ? <Text style={{ color: 'white', fontSize: 12 }}>✓</Text> : null}
+                  </View>
+
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontWeight: '600' }}>{d.toDateString()}</Text>
+                    <Text style={{ color: '#666', fontSize: 12 }}>{d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</Text>
+                  </View>
+
+                  <View style={{ marginLeft: 8 }}>
+                    {status === 'pending' ? (
+                      <ActivityIndicator size="small" />
+                    ) : status === 'success' ? (
+                      <Text style={{ color: 'green', fontWeight: '600' }}>Created</Text>
+                    ) : status === 'error' ? (
+                      <Text style={{ color: '#b00020', fontWeight: '600' }}>Failed</Text>
+                    ) : alreadyCreated ? (
+                      <Text style={{ color: '#b00020', fontWeight: '600' }}>Already created</Text>
+                    ) : null}
+                  </View>
+                </Pressable>
+              );
+            })}
           </View>
 
           {/* Confirm create availability button */}
           <View style={{ marginTop: 10, alignItems: 'center' }}>
             <Pressable
               onPress={createGames}
-              style={[styles.loadMore, { paddingHorizontal: 18, backgroundColor: '#0a7ea4' }]}
+              style={[
+                styles.loadMore,
+                { paddingHorizontal: 18, backgroundColor: creating ? '#999' : '#0a7ea4', flexDirection: 'row', alignItems: 'center' },
+              ]}
               disabled={creating}
             >
-              {creating ? <ActivityIndicator color="white" /> : <Text style={{ color: 'white' }}>Confirm & Create Availability</Text>}
+              {creating ? (
+                <>
+                  <ActivityIndicator color="white" style={{ marginRight: 8 }} />
+                  <Text style={{ color: 'white' }}>{`Creating ${createdCount}/${totalToCreate || previewOccurrences.length}`}</Text>
+                </>
+              ) : (
+                <Text style={{ color: 'white' }}>{`Create ${Object.values(selectedOccurrences).filter(Boolean).length || 0} occurrence(s)`}</Text>
+              )}
             </Pressable>
           </View>
+
+          {/* small progress indicator */}
+          {creating && totalToCreate > 0 ? (
+            <View style={{ marginTop: 8, height: 6, width: '100%', backgroundColor: '#eee', borderRadius: 4 }}>
+              <View style={{ width: `${Math.round((createdCount / totalToCreate) * 100)}%`, height: '100%', backgroundColor: '#2E86AB', borderRadius: 4 }} />
+            </View>
+          ) : null}
 
           {/* Find Games button: navigates to the read-only FindGames screen */}
           <View style={{ marginTop: 12, alignItems: 'center' }}>
@@ -541,7 +750,7 @@ const styles = StyleSheet.create({
   optionActive: { backgroundColor: '#e6f4fe', borderColor: '#2e86ab' },
   preview: { marginTop: 8 },
   previewWrap: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 },
-  previewRow: { padding: 6, borderRadius: 6, backgroundColor: '#f4f4f4', marginRight: 8, marginBottom: 8 },
+  previewRow: { padding: 6, borderRadius: 6, marginRight: 8, marginBottom: 8 },
   gameCard: {
     flex: 1,
     borderWidth: 1,

@@ -17,7 +17,7 @@ import {
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import { app, auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
-import { debugAuthState, getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
+import { debugAuthState, getDocument, listTopLevelCollection } from '../../src/firestoreRest';
 import { geocodeAddress, haversineDistanceKm } from '../../src/locations';
 
 // Team type includes rating (previously called ELO)
@@ -148,7 +148,7 @@ export default function FindATeam() {
             (d.team && (d.team.teamName ?? d.team.name)) ??
             null;
 
-          // location: try native or REST nested location fields
+          // location: try native or REST nested location fields (string)
           let location =
             d.location ??
             (d.fields?.location?.stringValue) ??
@@ -183,10 +183,91 @@ export default function FindATeam() {
         })
         .filter(Boolean) as Team[];
 
-      // Sort alphabetically to make directory predictable
-      normalized.sort((a, b) => (a.teamName ?? '').localeCompare(b.teamName ?? ''));
+      // If we have the user's coords, compute distance for each team (best-effort)
+      // and sort by proximity. Teams without coords will appear at the end alphabetically.
+      let directoryToSet: Team[] = normalized;
 
-      setDirectory(normalized);
+      const tryExtractLatLng = (doc: any) => {
+        if (!doc) return null;
+        // common direct fields
+        const candidatesLat = ['lat', 'latitude', 'locationLat', 'lat_dd'];
+        const candidatesLng = ['lng', 'longitude', 'locationLng', 'lng_dd'];
+
+        for (const k of candidatesLat) {
+          const v = doc[k];
+          if (typeof v === 'number') return { lat: v, lng: null as any };
+          if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return { lat: Number(v), lng: null as any };
+        }
+
+        // nested location object like { location: { lat, lng } }
+        if (doc.location && typeof doc.location === 'object') {
+          const lat = (doc.location.lat ?? doc.location.latitude ?? doc.location.latitudeDegrees ?? null);
+          const lng = (doc.location.lng ?? doc.location.longitude ?? doc.location.longitudeDegrees ?? null);
+          if ((lat != null && !Number.isNaN(Number(lat))) && (lng != null && !Number.isNaN(Number(lng)))) {
+            return { lat: Number(lat), lng: Number(lng) };
+          }
+        }
+
+        // REST mapValue shape: fields.location.mapValue.fields.lat.doubleValue etc
+        const locFields = doc.fields?.location?.mapValue?.fields;
+        if (locFields) {
+          const latField = locFields.lat ?? locFields.latitude ?? locFields.lat_dd;
+          const lngField = locFields.lng ?? locFields.longitude ?? locFields.lng_dd;
+          const latVal = latField?.doubleValue ?? latField?.integerValue ?? latField?.stringValue ?? null;
+          const lngVal = lngField?.doubleValue ?? lngField?.integerValue ?? lngField?.stringValue ?? null;
+          if (latVal != null && lngVal != null && !Number.isNaN(Number(latVal)) && !Number.isNaN(Number(lngVal))) {
+            return { lat: Number(latVal), lng: Number(lngVal) };
+          }
+        }
+
+        // Nested team object coordinates fallback
+        if (doc.team && typeof doc.team === 'object') {
+          const lat = doc.team.lat ?? doc.team.latitude ?? null;
+          const lng = doc.team.lng ?? doc.team.longitude ?? null;
+          if (lat != null && lng != null && !Number.isNaN(Number(lat)) && !Number.isNaN(Number(lng))) {
+            return { lat: Number(lat), lng: Number(lng) };
+          }
+        }
+
+        return null;
+      };
+
+      if (userCoords && userCoords.lat != null && userCoords.lng != null && Array.isArray(arr) && arr.length > 0) {
+        // Build a map from normalized id -> raw doc for coordinate lookups
+        const rawById = new Map<string, any>();
+        for (const raw of arr) {
+          const id = raw.id ?? raw._id ?? (typeof raw.name === 'string' ? raw.name.split('/').pop() : null);
+          if (id) rawById.set(String(id), raw);
+        }
+
+        const withDistances = normalized.map((t) => {
+          const raw = rawById.get(String(t.id));
+          const coords = tryExtractLatLng(raw);
+          if (coords && coords.lat != null && coords.lng != null) {
+            const dKm = haversineDistanceKm(userCoords.lat, userCoords.lng, Number(coords.lat), Number(coords.lng));
+            return { team: t, distanceMiles: dKm * KM_TO_MILES, hasCoords: true };
+          }
+          // no coords -> mark as missing
+          return { team: t, distanceMiles: Number.POSITIVE_INFINITY, hasCoords: false };
+        });
+
+        // Sort: teams with coords by distance, then teams without coords alphabetically
+        withDistances.sort((a, b) => {
+          if (a.hasCoords && b.hasCoords) return a.distanceMiles - b.distanceMiles;
+          if (a.hasCoords && !b.hasCoords) return -1;
+          if (!a.hasCoords && b.hasCoords) return 1;
+          // both missing coords -> alphabetical by teamName
+          return (a.team.teamName ?? '').localeCompare(b.team.teamName ?? '');
+        });
+
+        // strip metadata and produce directory
+        directoryToSet = withDistances.map((x) => x.team);
+      } else {
+        // No user coords: keep alphabetical sort for predictability
+        directoryToSet.sort((a, b) => (a.teamName ?? '').localeCompare(b.teamName ?? ''));
+      }
+
+      setDirectory(directoryToSet);
     } catch (e: any) {
       console.error('Failed to load directory', e);
       Toast.show({ type: 'error', text1: 'Failed to load teams', text2: e?.message ?? String(e) });
@@ -197,32 +278,36 @@ export default function FindATeam() {
   };
 
   const handleSearch = async (term?: string) => {
-    const qTerm = term ?? searchTerm;
-    if (!qTerm.trim()) return;
+    const qTerm = (term ?? searchTerm).trim();
+    if (!qTerm) return;
     setSearching(true);
     setResults([]);
     setSelectedTeam(null);
 
     try {
-      await ensureFirestoreOnline();
+      // Ensure we have directory loaded (fetchDirectory sorts by proximity if userCoords exist)
+      if (!Array.isArray(directory) || directory.length === 0) {
+        await fetchDirectory();
+      }
 
-      const docs = await runCollectionQuery({
-        collectionId: 'teams',
-        // helper expects arrays for where/orderBy
-        where: [{ fieldPath: 'teamName', op: 'GREATER_THAN_OR_EQUAL', value: qTerm }],
-        orderBy: [{ fieldPath: 'teamName', direction: 'ASCENDING' }],
-        limit: 50,
+      const low = qTerm.toLowerCase();
+
+      // Filter the client-side directory by teamName or location (case-insensitive)
+      const filtered = (directory ?? []).filter((t) => {
+        const name = (t.teamName ?? '').toLowerCase();
+        const loc = (t.location ?? '').toLowerCase();
+        return name.includes(low) || loc.includes(low);
       });
 
-      const teams = (docs as any[]).map((d: any) => normalizeDocToTeam(d)).filter(Boolean) as Team[];
-      setResults(teams);
+      // Preserve directory order (which was nearest-first when location available)
+      setResults(filtered);
 
-      if (teams.length === 0) {
-        Toast.show({ type: 'info', text1: 'No teams found', text2: 'Try another name.' });
+      if (filtered.length === 0) {
+        Toast.show({ type: 'info', text1: 'No teams found', text2: 'Try another name or use "Search Area".' });
       }
     } catch (e: any) {
-      console.error('❌ Error searching teams:', e);
-      Toast.show({ type: 'error', text1: 'Error', text2: e.message });
+      console.error('❌ Error searching teams (client filter):', e);
+      Toast.show({ type: 'error', text1: 'Error', text2: e.message ?? String(e) });
     } finally {
       setSearching(false);
     }
@@ -640,7 +725,7 @@ export default function FindATeam() {
       <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
         <TextInput
           style={styles.input}
-          placeholder="Search area (city, rink, suburb)..."
+          placeholder="Search area (city, rink)..."
           value={searchTerm}
           onChangeText={setSearchTerm}
         />

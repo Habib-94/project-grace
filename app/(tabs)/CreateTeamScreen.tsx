@@ -18,6 +18,7 @@ import ColorPicker from 'react-native-wheel-color-picker';
 
 import { emitAppEvent } from '../../src/appEvents';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
+import { getDocument } from '../../src/firestoreRest';
 import { geocodeAddress, getPlaceDetails } from '../../src/locations';
 
 // runtime-safe add/update helpers (same pattern as elsewhere)
@@ -30,17 +31,6 @@ async function addDocSafe(collectionPath: string, data: any) {
   // Web modular SDK
   const { collection, addDoc } = await import('firebase/firestore');
   return addDoc(collection(db as any, collectionPath), data);
-}
-
-async function updateUserSafe(uid: string, data: any) {
-  // Native RN Firebase style
-  if (db && typeof (db as any).collection === 'function') {
-    return (db as any).collection('users').doc(uid).update(data);
-  }
-
-  // Web modular SDK
-  const { doc, updateDoc } = await import('firebase/firestore');
-  return updateDoc(doc(db as any, 'users', uid), data);
 }
 
 // runtime-safe upsert/set with merge
@@ -141,8 +131,6 @@ export default function CreateTeamScreen() {
     acAbortRef.current = ac;
 
     try {
-      // Place Autocomplete endpoint (returns list of predictions)
-      // types=establishment to prefer places like arenas/centres; remove if you want broader results
       const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(
         input
       )}&types=establishment&language=en&key=${API_KEY}`;
@@ -152,7 +140,6 @@ export default function CreateTeamScreen() {
       if (json?.status === 'OK' && Array.isArray(json.predictions)) {
         setPredictions(json.predictions.slice(0, 6));
       } else {
-        // not OK (ZERO_RESULTS, etc.) -> keep empty list
         setPredictions([]);
       }
     } catch (e: any) {
@@ -174,18 +161,15 @@ export default function CreateTeamScreen() {
     try {
       const details = await getPlaceDetails(p.place_id);
       if (!details) {
-        // fallback: set the description as location text
         setLocationText(p.description);
         setPickedPlace(null);
         Toast.show({ type: 'info', text1: 'Selected place', text2: p.description });
       } else {
         setPickedPlace(details);
-        // prefer formattedAddress if available
         const display = details.formattedAddress ?? details.name ?? p.description;
         setLocationText(display);
         Toast.show({ type: 'success', text1: 'Location selected', text2: display });
       }
-      // clear suggestions
       setPredictions([]);
     } catch (e: any) {
       console.warn('[CreateTeam] select prediction failed', e);
@@ -196,7 +180,6 @@ export default function CreateTeamScreen() {
   };
 
   const handleLookupPlace = async () => {
-    // Keep the existing single-result "Find with Google" behavior as fallback
     if (!locationText || locationText.trim().length < 3) {
       Toast.show({ type: 'info', text1: 'Enter an address or rink name first' });
       return;
@@ -211,7 +194,6 @@ export default function CreateTeamScreen() {
         setPickedPlace(res);
         setLocationText(res.formattedAddress ?? res.name ?? locationText.trim());
         Toast.show({ type: 'success', text1: 'Location found', text2: res.formattedAddress ?? res.name });
-        // clear predictions
         setPredictions([]);
       }
     } catch (e: any) {
@@ -222,19 +204,70 @@ export default function CreateTeamScreen() {
     }
   };
 
+  // Rewritten handler with validation and clear error messages
   const handleCreateTeam = async () => {
     if (!user) {
-      Toast.show({ type: 'error', text1: 'Sign in required' });
+      Toast.show({ type: 'error', text1: 'Sign in required', text2: 'You must sign in to create a team.' });
       router.replace('/(auth)/LoginScreen');
       return;
     }
-    if (!teamName || !teamName.trim()) {
-      Toast.show({ type: 'info', text1: 'Please enter a team name' });
+
+    // Basic client-side validation for required details
+    if (!teamName || !teamName.trim() || (!pickedPlace && (!locationText || !locationText.trim()))) {
+      // More specific guidance depending on what's missing
+      if (!teamName || !teamName.trim()) {
+        Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please enter a team name.' });
+      } else {
+        Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please provide a location for the team (use "Find with Google" or enter an address).' });
+      }
       return;
     }
+
     setLoading(true);
     try {
       await ensureFirestoreOnline();
+
+      // Best-effort: read the user's Firestore profile to pick up their full name (signup flow writes `name`)
+      let creatorName: string | null = null;
+      let creatorEmail: string | null = null;
+      try {
+        const userDoc = await getDocument(`users/${user.uid}`);
+        if (userDoc) {
+          creatorName = (userDoc.name ?? userDoc.displayName ?? '') || null;
+          creatorEmail = (userDoc.email ?? '') || null;
+
+          // BLOCK: disallow creating another team if user is already a coordinator
+          if (userDoc.isCoordinator) {
+            Toast.show({
+              type: 'error',
+              text1: 'Cannot create team',
+              text2: 'You are already a coordinator for a team and cannot create another one.',
+            });
+            setLoading(false);
+            return;
+          }
+
+          // BLOCK: disallow creating a team if user is already a member of a team
+          if (userDoc.teamId) {
+            Toast.show({
+              type: 'error',
+              text1: 'Cannot create team',
+              text2: 'You are already a member of a team. Leave your current team before creating a new one.',
+            });
+            setLoading(false);
+            return;
+          }
+        }
+      } catch (e) {
+        // If reading the user doc fails, fall back to auth profile values but still proceed with caution.
+        console.warn('[CreateTeam] failed to read users/{uid} for coordinator check', e);
+        creatorName = user.displayName ?? null;
+        creatorEmail = user.email ?? null;
+        // Note: server-side rules will still enforce creation permissions; we surface helpful client messages when possible.
+      }
+
+      const coordEntry = { uid: user.uid, name: creatorName ?? (user.displayName ?? ''), email: creatorEmail ?? (user.email ?? '') };
+
       const payload: any = {
         teamName: teamName.trim(),
         location: pickedPlace?.formattedAddress ?? locationText ?? '',
@@ -245,6 +278,9 @@ export default function CreateTeamScreen() {
         createdAt: new Date().toISOString(),
         homeColor,
         awayColor,
+        // coordinator metadata (init with the creating user)
+        coordinators: [coordEntry],
+        coordinatorNames: [coordEntry.name ?? ''],
       };
 
       const ref: any = await addDocSafe('teams', payload);
@@ -254,7 +290,7 @@ export default function CreateTeamScreen() {
       if (createdId) {
         // update the user's profile to attach them to this team and make them a coordinator
         try {
-          await upsertUserDoc(user.uid, { teamId: createdId, isCoordinator: true, email: user.email ?? '', name: user.displayName ?? '' });
+          await upsertUserDoc(user.uid, { teamId: createdId, isCoordinator: true, email: user.email ?? '', name: creatorName ?? user.displayName ?? '' });
         } catch (uErr) {
           console.warn('[CreateTeam] failed to upsert users/{uid}', uErr);
         }
@@ -269,7 +305,9 @@ export default function CreateTeamScreen() {
       }
     } catch (e: any) {
       console.error('[CreateTeam] create failed', e);
-      Toast.show({ type: 'error', text1: 'Create failed', text2: e?.message || '' });
+      // Try to show server-provided error message when available
+      const msg = e?.message ?? String(e);
+      Toast.show({ type: 'error', text1: 'Create failed', text2: msg });
     } finally {
       setLoading(false);
     }
@@ -356,7 +394,7 @@ export default function CreateTeamScreen() {
       </View>
 
       {/* Color Picker Modal */}
-      <Modal visible={!!activePicker} animationType="slide">
+      <Modal visible={!!activePicker} animationType="slide" onRequestClose={() => setActivePicker(null)}>
         <View style={styles.modalContainer}>
           <Text style={styles.modalTitle}>
             Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
@@ -373,7 +411,9 @@ export default function CreateTeamScreen() {
             row={false}
             swatches
           />
-          <Button title="Done" onPress={() => setActivePicker(null)} />
+          <View style={{ marginTop: 12 }}>
+            <Button title="Done" onPress={() => setActivePicker(null)} />
+          </View>
         </View>
       </Modal>
 
@@ -403,39 +443,41 @@ export default function CreateTeamScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
+  container: {
+    flexGrow: 1,
+    justifyContent: 'flex-start',
+    alignItems: 'center',
+    padding: 20,
+    backgroundColor: '#fff',
+  },
   title: {
     fontSize: 26,
     fontWeight: 'bold',
     color: '#0a7ea4',
-    textAlign: 'center',
     marginBottom: 20,
   },
-  input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 6, borderRadius: 6, backgroundColor: '#fff' },
-  lookupRow: { marginBottom: 12 },
-  kitRow: { flexDirection: 'row', justifyContent: 'space-around', marginBottom: 20 },
-  jerseyCard: { alignItems: 'center' },
-  jerseyBox: { width: 110, height: 110, position: 'relative' },
-  jerseyImg: { position: 'absolute', width: '100%', height: '100%' },
-  jerseyLabel: { marginTop: 8, fontSize: 16, fontWeight: '600', color: '#000' },
-  modalContainer: { flex: 1, justifyContent: 'center', padding: 20, backgroundColor: '#fff' },
-  modalTitle: { fontSize: 20, fontWeight: '600', marginBottom: 20, textAlign: 'center' },
-
-  // suggestions UI
-  suggestions: {
+  input: {
     borderWidth: 1,
-    borderColor: '#eee',
+    borderColor: '#ccc',
+    borderRadius: 8,
+    width: '100%',
+    padding: 12,
+    marginBottom: 10,
     backgroundColor: '#fff',
-    borderRadius: 6,
-    paddingVertical: 6,
-    marginBottom: 8,
-    // small shadow
-    shadowColor: '#000',
-    shadowOpacity: 0.05,
-    shadowRadius: 6,
-    elevation: 1,
   },
-  suggestionItem: { paddingHorizontal: 12, paddingVertical: 8 },
-  suggestionMain: { fontWeight: '600', color: '#222' },
-  suggestionSecondary: { color: '#666', fontSize: 12, marginTop: 2 },
+  lookupRow: { width: '100%', marginTop: 8, marginBottom: 12 },
+  kitRow: { flexDirection: 'row', gap: 20, marginTop: 12, marginBottom: 12 },
+  jerseyCard: { alignItems: 'center', width: 140 },
+  jerseyBox: { width: 120, height: 120, alignItems: 'center', justifyContent: 'center' },
+  jerseyImg: { width: 120, height: 120, position: 'absolute' },
+  jerseyLabel: { marginTop: 6, fontSize: 14, fontWeight: '600', color: '#333' },
+
+  modalContainer: { flex: 1, padding: 20, justifyContent: 'center', backgroundColor: '#fff' },
+  modalTitle: { fontSize: 18, fontWeight: '700', marginBottom: 12, color: '#0a7ea4' },
+
+  suggestions: { width: '100%', backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#eee', marginTop: 6, padding: 8 },
+  suggestionItem: { paddingVertical: 8 },
+  suggestionMain: { fontWeight: '600' },
+  suggestionSecondary: { color: '#666', fontSize: 12 },
+
 });
