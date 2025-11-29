@@ -133,15 +133,57 @@ export default function FindGamesScreen() {
       Toast.show({ type: 'info', text1: 'Current location not available' });
       return;
     }
+
+    // Require an authenticated user because your Firestore rules require auth for reads.
+    const currentUser = auth?.currentUser ?? null;
+    if (!currentUser) {
+      Toast.show({ type: 'info', text1: 'Sign in required', text2: 'Please sign in to search games.' });
+      router.push('/(auth)/LoginScreen');
+      return;
+    }
+
     setSearching(true);
     try {
-      const [gamesSettled, teamsSettled] = await Promise.allSettled([
-        listTopLevelCollection('games', 1000),
-        listTopLevelCollection('teams', 1000),
-      ]);
+      let gamesRaw: any[] = [];
+      let teamsRaw: any[] = [];
 
-      const gamesRaw = gamesSettled.status === 'fulfilled' ? (gamesSettled.value as any[]) : [];
-      const teamsRaw = teamsSettled.status === 'fulfilled' ? (teamsSettled.value as any[]) : [];
+      // Prefer SDK reads when the native SDK (db) is available.
+      if (db && typeof (db as any).collection === 'function') {
+        try {
+          const gSnap = await (db as any).collection('games').get();
+          gamesRaw = (gSnap?.docs ?? []).map((d: any) => ({ id: d.id, ...(d.data?.() ?? d.data ?? {}) }));
+        } catch (sdkGErr) {
+          console.warn('[FindGames] SDK games collection read failed', sdkGErr);
+          gamesRaw = [];
+        }
+
+        try {
+          const tSnap = await (db as any).collection('teams').get();
+          teamsRaw = (tSnap?.docs ?? []).map((d: any) => ({ id: d.id, ...(d.data?.() ?? d.data ?? {}) }));
+        } catch (sdkTErr) {
+          console.warn('[FindGames] SDK teams collection read failed', sdkTErr);
+          teamsRaw = [];
+        }
+      } else {
+        // Fallback to REST helper. If REST fails with 403 it's likely missing auth token or rules block.
+        const [gamesSettled, teamsSettled] = await Promise.allSettled([
+          listTopLevelCollection('games', 1000),
+          listTopLevelCollection('teams', 1000),
+        ]);
+
+        if (gamesSettled.status === 'fulfilled') gamesRaw = gamesSettled.value as any[];
+        else {
+          console.warn('[FindGames] listTopLevelCollection(games) failed', gamesSettled.reason);
+          if (String(gamesSettled.reason).toLowerCase().includes('permission')) {
+            Toast.show({ type: 'error', text1: 'Permission denied', text2: 'Sign in or check Firestore rules.' });
+          }
+        }
+
+        if (teamsSettled.status === 'fulfilled') teamsRaw = teamsSettled.value as any[];
+        else {
+          console.warn('[FindGames] listTopLevelCollection(teams) failed', teamsSettled.reason);
+        }
+      }
 
       // persist teams for modal use
       if (Array.isArray(teamsRaw)) setTeams(teamsRaw);
@@ -151,8 +193,8 @@ export default function FindGamesScreen() {
         for (const t of teamsRaw) {
           const id = getDocId(t);
           if (id) teamsMap.set(id, t);
-          if (t.teamId) teamsMap.set(String(t.teamId), t);
-          if (t.id) teamsMap.set(String(t.id), t);
+          if ((t as any).teamId) teamsMap.set(String((t as any).teamId), t);
+          if ((t as any).id) teamsMap.set(String((t as any).id), t);
         }
       }
 
@@ -185,11 +227,7 @@ export default function FindGamesScreen() {
           const teamNameFromTeamDoc =
             teamDoc && (readStringField(teamDoc, 'teamName') ?? teamDoc.teamName ?? teamDoc.name ?? teamDoc.displayName);
           const teamName =
-            teamNameFromTeamDoc ??
-            readStringField(g, 'teamName') ??
-            g.teamName ??
-            g.team?.teamName ??
-            String(rawTeamId ?? 'Unknown Team');
+            teamNameFromTeamDoc ?? readStringField(g, 'teamName') ?? g.teamName ?? g.team?.teamName ?? String(rawTeamId ?? 'Unknown Team');
 
           const homeColor =
             (teamDoc && (readStringField(teamDoc, 'homeColor') ?? teamDoc.homeColor)) ??
@@ -220,7 +258,24 @@ export default function FindGamesScreen() {
         .filter((g: any) => g.distanceMiles <= radiusMiles)
         .sort((a: any, b: any) => a.distanceMiles - b.distanceMiles);
 
-      setResults(enriched);
+      // filter out expired/past games (use expiresAt if present, else startISO + 5min grace)
+      const nowMs = Date.now();
+      const enrichedFiltered = enriched.filter((g: any) => {
+        // prefer expiresAt if present (ISO string)
+        if (g.expiresAt) {
+          const t = new Date(g.expiresAt).getTime();
+          if (!isNaN(t)) return t > nowMs;
+          return true;
+        }
+        // fallback to startISO (expire at start time)
+        if (g.startISO) {
+          const t = new Date(g.startISO).getTime();
+          return !isNaN(t) ? t > nowMs : true;
+        }
+        return true; // keep TBA items
+      });
+
+      setResults(enrichedFiltered);
     } catch (e: any) {
       console.warn('[FindGames] search failed', e);
       Toast.show({ type: 'error', text1: 'Search failed', text2: e?.message ?? '' });

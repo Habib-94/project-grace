@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 
 import Toast from 'react-native-toast-message';
+import TutorialModal from '../../src/components/TutorialModal';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig'; // db/auth/ensure helper
 import { debugAuthState, getDocument, listTopLevelCollection, runCollectionQuery } from '../../src/firestoreRest';
 
@@ -50,6 +51,15 @@ export default function GameSchedulerScreen() {
   // created games (games this coordinator created via this screen)
   const [createdGames, setCreatedGames] = useState<Game[]>([]);
   const [fetchingCreatedGames, setFetchingCreatedGames] = useState(false);
+
+  // tutorial modal visible state and helper to close it
+  const [tutorialVisible, setTutorialVisible] = useState<boolean>(false);
+  const closeTutorial = () => setTutorialVisible(false);
+
+  // Optionally show the tutorial on first mount; remove or change logic if you want to control visibility differently
+  useEffect(() => {
+    setTutorialVisible(true);
+  }, []);
 
   // Optional title for created games
   const [gameTitleText, setGameTitleText] = useState<string>('');
@@ -341,6 +351,9 @@ export default function GameSchedulerScreen() {
             kitColor: null,
             createdBy: user.uid,
             createdAt: new Date().toISOString(),
+
+            // TTL: expire exactly at the scheduled start time
+            expiresAt: new Date(occ.getTime()),
           };
 
           // mark pending
@@ -688,12 +701,17 @@ export default function GameSchedulerScreen() {
 
   return (
     <View style={styles.container}>
-      <ScrollView
-        contentContainerStyle={{ padding: 16 }}
-        keyboardShouldPersistTaps="handled"
-        showsVerticalScrollIndicator={false}
-      >
+      <ScrollView contentContainerStyle={{ padding: 16 }} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
         {renderHeader()}
+
+        {/* tutorial modal — shown once per user for this page */}
+        <TutorialModal
+          visible={tutorialVisible}
+          onClose={closeTutorial}
+          title="Schedule games quickly"
+          body="Pick a date/time, optionally choose recurrence, select occurrences and tap Create. Already-created games are shown in red."
+          imageSource={require('../../assets/images/mascot.png')}
+        />
 
         <View style={{ padding: 16 }}>
           <Text style={{ fontWeight: '700', marginBottom: 8 }}>Your created games</Text>

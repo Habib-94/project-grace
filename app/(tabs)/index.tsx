@@ -1,9 +1,13 @@
+import TutorialModal from '@/components/TutorialModal';
 import { auth, db, ensureFirestoreOnline } from '@/firebaseConfig';
 import { debugAuthState, getDocument, listTopLevelCollection } from '@/firestoreRest';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useIsFocused } from '@react-navigation/native';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Button, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { onAppEvent } from '../../src/appEvents';
 
 export default function HomeScreen() {
   const [userData, setUserData] = useState<any>(null);
@@ -11,8 +15,22 @@ export default function HomeScreen() {
   const [gameRequests, setGameRequests] = useState<any[]>([]);
   const [loadingGameRequests, setLoadingGameRequests] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [homeTutorialVisible, setHomeTutorialVisible] = useState(false);
+  const [homeTutorialStep, setHomeTutorialStep] = useState(0);
+  const [newAccountTutorialVisible, setNewAccountTutorialVisible] = useState(false);
+  // track team-specific tutorial visibility / which team we're showing for
+  const [homeTutorialTeamId, setHomeTutorialTeamId] = useState<string | null>(null);
+
   const router = useRouter();
   const user = auth?.currentUser ?? null;
+  const isFocused = useIsFocused();
+
+  const homeTutorialKey = (uid?: string) => `tutorial_seen:${uid ?? 'anon'}:home`;
+  const teamHomeTutorialKey = (teamId?: string, uid?: string) =>
+    `tutorial_seen:${uid ?? 'anon'}:home:team:${teamId ?? 'none'}`;
+
+  // new helper: key for the one-shot "new account" tutorial shown right after signup
+  const newAccountTutorialKey = (uid?: string) => `tutorial_seen:${uid ?? 'anon'}:home:new_account`;
 
   // small helper: wait for auth.currentUser to appear (poll), returns currentUser or null
   async function waitForAuthUser(timeout = 5000) {
@@ -107,89 +125,251 @@ export default function HomeScreen() {
     }
   }
 
-  useEffect(() => {
-    // Only attempt to fetch pending game requests for team coordinators.
-    // Our security rules require the caller to be a coordinator for the team.
-    if (teamData?.id && userData?.isCoordinator) {
-      fetchGameRequests(teamData.id);
-    } else {
-      // Ensure we clear any stale preview for non-coordinators
-      setGameRequests([]);
-    }
-  }, [teamData?.id, userData?.isCoordinator]);
-
-  useEffect(() => {
+  // Extracted refresh function: re-fetch current user's profile and team document.
+  // Call this on mount and when app events arrive.
+  async function refreshUserAndTeam() {
     let mounted = true;
-
-    if (!user) {
+    if (!auth || !auth.currentUser) {
+      setUserData(null);
+      setTeamData(null);
       setLoading(false);
       return;
     }
 
-    (async () => {
-      try {
-        // Two runtime paths:
-        // - native @react-native-firebase: db.collection('users').doc(uid).get()
-        // - web SDK: use REST helper getDocument(...) to avoid streaming issues
-        if (db && typeof (db as any).collection === 'function') {
-          // Native firestore usage
-          const uSnap = await (db as any).collection('users').doc(user.uid).get();
-          if (!mounted) return;
-          if (!uSnap?.exists) {
-            setUserData(null);
-            setTeamData(null);
-            setLoading(false);
-            return;
-          }
-          const u = uSnap.data();
-          setUserData(u);
+    try {
+      setLoading(true);
+      // Same logic as the original one-time fetch: prefer native SDK if available, otherwise REST helper
+      if (db && typeof (db as any).collection === 'function') {
+        const uSnap = await (db as any).collection('users').doc(auth.currentUser.uid).get();
+        if (!mounted) return;
+        if (!uSnap?.exists) {
+          setUserData(null);
+          setTeamData(null);
+          return;
+        }
+        const u = uSnap.data();
+        setUserData(u);
 
-          if (u?.teamId) {
-            const tSnap = await (db as any).collection('teams').doc(u.teamId).get();
-            if (!mounted) return;
-            if (tSnap?.exists) {
-              setTeamData({ id: tSnap.id, ...(tSnap.data() ?? {}) });
-            } else {
-              setTeamData(null);
-            }
+        if (u?.teamId) {
+          const tSnap = await (db as any).collection('teams').doc(u.teamId).get();
+          if (!mounted) return;
+          if (tSnap?.exists) {
+            setTeamData({ id: tSnap.id, ...(tSnap.data() ?? {}) });
           } else {
             setTeamData(null);
           }
         } else {
-          // Web SDK / Expo Go: use REST helper to fetch documents (avoids Firestore web streaming)
-          const u = await getDocument(`users/${user.uid}`);
-          if (!mounted) return;
-          if (!u) {
-            setUserData(null);
-            setTeamData(null);
-            setLoading(false);
-            return;
-          }
-          setUserData(u);
-
-          if (u?.teamId) {
-            const t = await getDocument(`teams/${u.teamId}`);
-            if (!mounted) return;
-            if (t) {
-              setTeamData(t);
-            } else {
-              setTeamData(null);
-            }
-          } else {
-            setTeamData(null);
-          }
+          setTeamData(null);
         }
-      } catch (err) {
-        console.warn('one-time getDoc error', err);
-      } finally {
-        if (mounted) setLoading(false);
+      } else {
+        const u = await getDocument(`users/${auth.currentUser.uid}`);
+        if (!mounted) return;
+        if (!u) {
+          setUserData(null);
+          setTeamData(null);
+          return;
+        }
+        setUserData(u);
+        if (u?.teamId) {
+          const t = await getDocument(`teams/${u.teamId}`);
+          if (!mounted) return;
+          if (t) setTeamData(t);
+          else setTeamData(null);
+        } else {
+          setTeamData(null);
+        }
       }
-    })();
+    } catch (err) {
+      console.warn('refreshUserAndTeam error', err);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Wire refreshUserAndTeam to initial mount (replace the previous one-time useEffect body with this call)
+  useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    // initial load
+    refreshUserAndTeam();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid]);
+
+  // Subscribe to app-level events so HomeScreen updates immediately when teams change
+  useEffect(() => {
+    const unsubUpdated = onAppEvent('team:updated', async (payload?: any) => {
+      await refreshUserAndTeam();
+      // If we are a coordinator for this team, refresh requests too
+      if (teamData?.id && userData?.isCoordinator) fetchGameRequests(teamData.id);
+    });
+
+    const unsubLeft = onAppEvent('team:left', async (payload?: any) => {
+      await refreshUserAndTeam();
+      setGameRequests([]); // user left team so clear pending requests
+    });
+
+    const unsubDeleted = onAppEvent('team:deleted', async (payload?: any) => {
+      await refreshUserAndTeam();
+      setGameRequests([]);
+    });
 
     return () => {
-      mounted = false;
+      try { unsubUpdated?.(); } catch {}
+      try { unsubLeft?.(); } catch {}
+      try { unsubDeleted?.(); } catch {}
     };
-  }, [user?.uid]);
+    // include teamData/userData so refresh logic sees latest context if events fire rapidly
+  }, [teamData?.id, userData?.isCoordinator, user?.uid]);
+
+  // Refresh when screen becomes focused (covers navigating back)
+  useEffect(() => {
+    if (isFocused) {
+      refreshUserAndTeam();
+      if (teamData?.id && userData?.isCoordinator) {
+        fetchGameRequests(teamData.id);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isFocused]);
+
+  // define multi-step tutorial content
+  const homeTutorialSteps = [
+    {
+      title: 'Welcome to Home',
+      body: 'This screen shows your team at a glance. Tap the buttons to manage or create a team.',
+      size: 'small' as const,
+      primaryLabel: 'Next',
+    },
+    {
+      title: 'Kit & Role',
+      body: 'See your team kit colours and whether you are a Coordinator or Member. Coordinators can schedule games.',
+      size: 'small' as const,
+      primaryLabel: 'Next',
+    },
+    {
+      title: 'Requests & Actions',
+      body: 'Preview pending requests, manage them from the Manage Team screen, or use Find Games to discover matches.',
+      size: 'small' as const,
+      primaryLabel: 'Got it',
+    },
+  ];
+
+  async function closeHomeTutorial() {
+    try {
+      const uid = auth?.currentUser?.uid ?? null;
+      // if showing for a specific team, persist the team-specific key; otherwise persist the generic home key
+      if (homeTutorialTeamId) {
+        const key = teamHomeTutorialKey(homeTutorialTeamId, uid ?? undefined);
+        await AsyncStorage.setItem(key, '1');
+      } else {
+        const key = homeTutorialKey(uid ?? undefined);
+        await AsyncStorage.setItem(key, '1');
+      }
+    } catch (e) {
+      console.warn('failed to store home tutorial seen', e);
+    } finally {
+      setHomeTutorialVisible(false);
+      setHomeTutorialTeamId(null);
+    }
+  }
+
+  // primary handler: advance steps, persist only after final step
+  async function handleTutorialPrimary() {
+    if (homeTutorialStep < homeTutorialSteps.length - 1) {
+      setHomeTutorialStep((s) => s + 1);
+      return;
+    }
+    try {
+      const uid = auth?.currentUser?.uid ?? null;
+      if (homeTutorialTeamId) {
+        const key = teamHomeTutorialKey(homeTutorialTeamId, uid ?? undefined);
+        await AsyncStorage.setItem(key, '1');
+      } else {
+        const key = homeTutorialKey(uid ?? undefined);
+        await AsyncStorage.setItem(key, '1');
+      }
+    } catch (e) {
+      console.warn('failed to store home tutorial seen', e);
+    } finally {
+      setHomeTutorialVisible(false);
+      setHomeTutorialStep(0);
+      setHomeTutorialTeamId(null);
+    }
+  }
+
+  const buildHomeTutorialBody = () => {
+    // fallback (not used now). kept for compatibility.
+    return [
+      'This is the Home screen — quick tour:',
+      '',
+      '- Top: shows your team name and location when you are in a team.',
+      '- Kit: view your team\'s home and away colours to confirm your kit.',
+    ].join('\n');
+  };
+
+  // Short helper: is account just created (within minutes)
+  function accountCreatedRecently(minutes = 10) {
+    try {
+      const meta = (auth as any)?.currentUser?.metadata;
+      const creation = meta?.creationTime ?? null;
+      if (!creation) return false;
+      const createdAt = Date.parse(creation);
+      if (isNaN(createdAt)) return false;
+      return Date.now() - createdAt <= minutes * 60 * 1000;
+    } catch {
+      return false;
+    }
+  }
+
+  // Show new-account tutorial if user has no team and account was just created and not seen before
+  useEffect(() => {
+    let mounted = true;
+    async function maybeShow() {
+      try {
+        const uid = auth?.currentUser?.uid ?? null;
+        if (!uid) return;
+        // only for users with no team
+        if (userData?.teamId) return;
+        // don't show if already seen
+        const seen = await AsyncStorage.getItem(newAccountTutorialKey(uid));
+        if (seen) return;
+        // require account recently created
+        if (!accountCreatedRecently(10)) return;
+        if (!mounted) return;
+        setNewAccountTutorialVisible(true);
+      } catch (e) {
+        console.warn('new-account tutorial check failed', e);
+      }
+    }
+    maybeShow();
+    return () => { mounted = false; };
+  }, [userData?.teamId, auth?.currentUser?.uid]);
+
+  // Persist that user saw the new-account tutorial
+  async function closeNewAccountTutorial() {
+    try {
+      const uid = auth?.currentUser?.uid ?? null;
+      const key = newAccountTutorialKey(uid ?? undefined);
+      await AsyncStorage.setItem(key, '1');
+    } catch (e) {
+      console.warn('failed to store new-account tutorial seen', e);
+    } finally {
+      setNewAccountTutorialVisible(false);
+    }
+  }
+
+  const newAccountTutorialStep = {
+    title: 'Welcome — get started',
+    body:
+      'You can either create a new team now (Create Team) or search for an existing team to join (Find a Team).\n\n' +
+      '- Create Team: build your team, invite teammates, and schedule games.\n' +
+      '- Find a Team: search public teams, request to join, and contact coordinators.\n\n' +
+      'Tip: If you are going to run the team, choose Create Team. Otherwise try Find a Team first.',
+    size: 'small' as const,
+    primaryLabel: 'Got it',
+  };
 
   const handleLogout = async () => {
     try {
@@ -231,7 +411,17 @@ export default function HomeScreen() {
 
   const renderRoleButton = () => {
     if (!userData?.teamId) {
-      return <Button title="Create Team" onPress={() => router.push('/(tabs)/CreateTeamScreen')} />;
+      // show both Create Team and Find a Team when user has no team
+      return (
+        <View style={{ width: '100%', alignItems: 'center' }}>
+          <View style={{ width: '60%', marginBottom: 10 }}>
+            <Button title="Create Team" onPress={() => router.push('/(tabs)/CreateTeamScreen')} />
+          </View>
+          <View style={{ width: '60%' }}>
+            <Button title="Find a Team" onPress={() => router.push('/(tabs)/FindATeam')} />
+          </View>
+        </View>
+      );
     }
     if (userData?.isCoordinator) {
       return <Button title="Manage Team" onPress={() => router.push('/(tabs)/CoordinatorDashboardScreen')} />;
@@ -241,6 +431,39 @@ export default function HomeScreen() {
 
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.containerContent}>
+      {/* New-account tutorial modal (one-shot) */}
+      {newAccountTutorialVisible && (
+        <TutorialModal
+          visible={newAccountTutorialVisible}
+          onClose={closeNewAccountTutorial}
+          onPrimary={closeNewAccountTutorial}
+          primaryLabel={newAccountTutorialStep.primaryLabel}
+          size={newAccountTutorialStep.size}
+          title={newAccountTutorialStep.title}
+          body={newAccountTutorialStep.body}
+        />
+      )}
+
+      {/* existing home tutorial / other UI */}
+      {homeTutorialVisible && (
+        <TutorialModal
+          visible={homeTutorialVisible}
+          onClose={async () => {
+            try {
+              const uid = auth?.currentUser?.uid ?? null;
+              const key = homeTutorialKey(uid ?? undefined);
+              await AsyncStorage.setItem(key, '1');
+            } catch {}
+            setHomeTutorialVisible(false);
+            setHomeTutorialStep(0);
+          }}
+          onPrimary={handleTutorialPrimary}
+          primaryLabel={homeTutorialSteps[homeTutorialStep]?.primaryLabel ?? 'Got it'}
+          size={homeTutorialSteps[homeTutorialStep]?.size ?? 'small'}
+          title={homeTutorialSteps[homeTutorialStep]?.title}
+          body={homeTutorialSteps[homeTutorialStep]?.body}
+        />
+      )}
       {teamData ? (
         <>
           <Text style={styles.teamName}>{teamData.teamName}</Text>

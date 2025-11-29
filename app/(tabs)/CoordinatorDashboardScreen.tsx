@@ -16,7 +16,7 @@ import {
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
-import { onAppEvent } from '../../src/appEvents';
+import { emitAppEvent, onAppEvent } from '../../src/appEvents';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
 import { getDocument, listTopLevelCollection } from '../../src/firestoreRest';
 
@@ -189,7 +189,33 @@ export default function CoordinatorDashboardScreen() {
         await ensureFirestoreOnline();
 
         // Read user via REST helper (avoids web streaming)
-        const userDoc = await getDocument(`users/${currentUser.uid}`);
+        // Robust user read: try REST, retry once on failure, then fall back to SDK read if available.
+        let userDoc: any = null;
+        try {
+          userDoc = await getDocument(`users/${currentUser.uid}`);
+        } catch (e1) {
+          console.warn('[Coordinator] initial getDocument(users) failed, will retry once', e1);
+          // brief retry in case of auth token race / propagation
+          await new Promise((r) => setTimeout(r, 700));
+          try {
+            userDoc = await getDocument(`users/${currentUser.uid}`);
+          } catch (e2) {
+            console.warn('[Coordinator] retry getDocument(users) failed, falling back to SDK read if available', e2);
+            userDoc = null;
+          }
+        }
+
+        // Fallback: if REST still failed and native/web SDK `db` is available, try direct SDK read
+        if (!userDoc && db && typeof (db as any).collection === 'function') {
+          try {
+            const snap = await (db as any).collection('users').doc(currentUser.uid).get();
+            if (snap?.exists) userDoc = { id: snap.id, ...(snap.data() ?? {}) };
+          } catch (sdkErr) {
+            console.warn('[Coordinator] SDK fallback read users/{uid} failed', sdkErr);
+            userDoc = null;
+          }
+        }
+
         if (!userDoc) {
           if (isMounted) {
             Toast.show({ type: 'error', text1: 'User record not found' });
@@ -199,16 +225,59 @@ export default function CoordinatorDashboardScreen() {
         }
 
         const userData = userDoc as any;
+
+        // If the user is not yet marked as coordinator but they have a teamId,
+        // try to fetch the team doc (some writes may be visible earlier than flag propagation).
         if (!userData?.isCoordinator) {
-          if (isMounted) {
-            Toast.show({
-              type: 'error',
-              text1: 'Access Denied',
-              text2: 'You must be a coordinator to access this page.',
-            });
-            router.replace('/(tabs)');
+          if (userData?.teamId) {
+            try {
+              const maybeTeam = await getDocument(`teams/${userData.teamId}`);
+              if (maybeTeam) {
+                // allow viewing the team (team exists) — set teamData and continue.
+                const team: Team = { id: maybeTeam.id, ...(maybeTeam as any) };
+                if (isMounted) {
+                  setTeamData(team);
+                  if (team.latitude && team.longitude) {
+                    setLocationCoords({ latitude: team.latitude, longitude: team.longitude });
+                  }
+                }
+                // still fetch requests/games below (we'll short-circuit duplicate fetches)
+              } else {
+                // team not found — treat as access denied
+                if (isMounted) {
+                  Toast.show({
+                    type: 'error',
+                    text1: 'Access Denied',
+                    text2: 'You must be a coordinator to access this page.',
+                  });
+                  router.replace('/(tabs)');
+                }
+                return;
+              }
+            } catch (teamErr) {
+              console.warn('[Coordinator] failed reading team while user is not coordinator', teamErr);
+              if (isMounted) {
+                Toast.show({
+                  type: 'error',
+                  text1: 'Access Denied',
+                  text2: 'You must be a coordinator to access this page.',
+                });
+                router.replace('/(tabs)');
+              }
+              return;
+            }
+          } else {
+            // No teamId and not a coordinator — redirect away.
+            if (isMounted) {
+              Toast.show({
+                type: 'error',
+                text1: 'Access Denied',
+                text2: 'You must be a coordinator to access this page.',
+              });
+              router.replace('/(tabs)');
+            }
+            return;
           }
-          return;
         }
 
         // Read team via REST helper
@@ -461,6 +530,40 @@ export default function CoordinatorDashboardScreen() {
     if (!teamData?.id) return;
     setSaving(true);
     try {
+      await ensureFirestoreOnline();
+
+      // VERIFY: make sure current user is coordinator for this team before attempting write.
+      // This avoids triggering a permissions error from Firestore and gives a clearer UX message.
+      try {
+        const currentUser = user;
+        if (!currentUser?.uid) {
+          Toast.show({ type: 'error', text1: 'Not signed in', text2: 'Sign in to save team changes.' });
+          setSaving(false);
+          return;
+        }
+
+        const userDoc = await getDocument(`users/${currentUser.uid}`);
+        if (!userDoc || String(userDoc.teamId ?? '') !== String(teamData.id) || !userDoc.isCoordinator) {
+          Toast.show({
+            type: 'error',
+            text1: 'Permission denied',
+            text2: 'Only a coordinator for this team can save changes. Check your account or contact an admin.',
+          });
+          setSaving(false);
+          return;
+        }
+      } catch (checkErr) {
+        // If reading user doc fails, surface a helpful message and avoid attempting the update blindly.
+        console.warn('[CoordinatorDashboard] could not verify coordinator status before save', checkErr);
+        Toast.show({
+          type: 'error',
+          text1: 'Cannot verify permissions',
+          text2: 'Failed to confirm your coordinator status. Try again or contact support.',
+        });
+        setSaving(false);
+        return;
+      }
+
       // 1) update the team document
       await updateDocSafe(`teams/${teamData.id}`, {
         teamName: teamData.teamName,
@@ -485,9 +588,22 @@ export default function CoordinatorDashboardScreen() {
 
       Toast.show({ type: 'success', text1: 'Team updated' });
       setEditing(false);
+
+      // after updating team doc and any related caches:
+      try { emitAppEvent('team:updated', { teamId: teamData.id, teamName: teamData.teamName }); } catch (e) { /* ignore */ }
     } catch (err: any) {
       console.error('Failed to save team', err);
-      Toast.show({ type: 'error', text1: 'Save failed', text2: err?.message || '' });
+      const code = err?.code ?? '';
+      const msg = err?.message ?? String(err);
+      if (code === 'permission-denied' || /permission/i.test(msg)) {
+        Toast.show({
+          type: 'error',
+          text1: 'Save failed — permission denied',
+          text2: 'Your account is not allowed to update this team. Confirm you are a coordinator for this team.',
+        });
+      } else {
+        Toast.show({ type: 'error', text1: 'Save failed', text2: msg });
+      }
     } finally {
       setSaving(false);
     }
@@ -636,6 +752,8 @@ export default function CoordinatorDashboardScreen() {
 
               Toast.show({ type: 'success', text1: 'Team deleted' });
               router.replace('/(tabs)/HomeScreen');
+
+              try { emitAppEvent('team:deleted', { teamId: teamData.id }); } catch (e) {}
             } catch (e: any) {
               console.error('Delete team failed', e);
               Toast.show({ type: 'error', text1: 'Delete failed', text2: e?.message || '' });
@@ -822,20 +940,24 @@ export default function CoordinatorDashboardScreen() {
 
             {editing ? (
               // Location: editable only when editing
-              PlacesComp ? (
-                // Wrap in boundary so if the third-party component throws we don't crash the whole screen
+              // Only mount GooglePlacesAutocomplete when we have both the component and an API key.
+              // Otherwise fall back to a plain TextInput. Wrap the third-party comp in an error boundary.
+              (PlacesComp && GOOGLE_MAPS_API_KEY) ? (
                 <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
                   <PlacesComp
                     ref={autocompleteRef}
                     placeholder="Search ice rink..."
-                    fetchDetails
+                    fetchDetails={true}
+                    debounce={400}
+                    predefinedPlaces={[]}
+                    nearbyPlacesAPI="GooglePlacesSearch"
                     onPress={(data: any, details: any = null) => {
                       const lat = details?.geometry?.location?.lat ?? 0;
                       const lng = details?.geometry?.location?.lng ?? 0;
                       setTeamData({ ...teamData, location: data.description, latitude: lat, longitude: lng });
                     }}
                     query={{
-                      ...(GOOGLE_MAPS_API_KEY ? { key: GOOGLE_MAPS_API_KEY } : {}),
+                      key: GOOGLE_MAPS_API_KEY,
                       language: 'en',
                       types: 'establishment',
                     }}
@@ -850,9 +972,9 @@ export default function CoordinatorDashboardScreen() {
                   onChangeText={(t) => setTeamData({ ...teamData, location: t })}
                 />
               )
-            ) : (
-              <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
-            )}
+             ) : (
+               <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
+             )}
 
             <View style={styles.kitRow}>
               <Jersey
