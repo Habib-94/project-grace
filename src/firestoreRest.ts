@@ -75,21 +75,24 @@ function buildHeaders(withJson = true) {
 }
 
 async function fetchWithAuth(url: string, opts: RequestInit = {}) {
-  const token = await getAuthToken();
-  const headers = { ...(opts.headers ?? {}), ...(buildHeaders(opts.body != null)) } as Record<string, string>;
-  if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
-  }
-  const urlWithKey = API_KEY ? (url.includes('?') ? `${url}&key=${API_KEY}` : `${url}?key=${API_KEY}`) : url;
-
+  // Attach ID token if available, else fall back to API_KEY if present
+  const headers: Record<string, string> = { ...(opts.headers as Record<string, string> || {}), 'Content-Type': 'application/json' };
   try {
-    const res = await fetch(urlWithKey, { ...opts, headers });
-    return res;
-  } catch (err: any) {
-    // Surface a clearer error for networking failures (e.g. no fetch, DNS, offline)
-    const message = err?.message ?? String(err);
-    throw new Error(`Network error when calling Firestore REST: ${message}`);
+    if (auth && auth.currentUser && typeof auth.currentUser.getIdToken === 'function') {
+      const token = await auth.currentUser.getIdToken(/* forceRefresh */ false);
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+    }
+  } catch (e) {
+    // ignore token errors
   }
+
+  // If no auth header and API_KEY is available, append ?key= fallback
+  let fetchUrl = url;
+  if (!headers['Authorization'] && typeof API_KEY !== 'undefined' && API_KEY) {
+    fetchUrl = url.includes('?') ? `${url}&key=${encodeURIComponent(API_KEY)}` : `${url}?key=${encodeURIComponent(API_KEY)}`;
+  }
+
+  return fetch(fetchUrl, { ...opts, headers });
 }
 
 /**
@@ -132,13 +135,30 @@ export async function getDocument(path: string) {
 }
 
 function parseDocumentJson(docJson: any) {
-  if (!docJson) return null;
+  const id = docJson.name?.split('/').pop();
   const fields = docJson.fields ?? {};
-  const out: Record<string, any> = { id: docJson.name?.split('/').pop() ?? undefined };
-  for (const [k, v] of Object.entries(fields)) {
-    out[k] = parseValue(v as any);
+  const parsed: any = { id };
+  for (const key of Object.keys(fields)) {
+    const v = fields[key];
+    if (v.stringValue != null) parsed[key] = v.stringValue;
+    else if (v.integerValue != null) parsed[key] = Number(v.integerValue);
+    else if (v.doubleValue != null) parsed[key] = Number(v.doubleValue);
+    else if (v.booleanValue != null) parsed[key] = v.booleanValue;
+    else if (v.timestampValue != null) {
+      // normalize to ISO string for easy client comparisons
+      parsed[key] = new Date(v.timestampValue).toISOString();
+    } else if (v.mapValue != null) {
+      const obj: any = {};
+      for (const k of Object.keys(v.mapValue.fields ?? {})) {
+        const inner = v.mapValue.fields[k];
+        obj[k] = inner?.stringValue ?? inner?.integerValue ?? inner?.doubleValue ?? inner?.booleanValue ?? inner?.timestampValue ?? null;
+      }
+      parsed[key] = obj;
+    } else {
+      parsed[key] = null;
+    }
   }
-  return out;
+  return parsed;
 }
 
 function parseValue(v: any): any {
@@ -380,27 +400,22 @@ export async function listDocumentsInSubcollection(parentPath: string, collectio
 }
 
 /**
- * List documents in a top-level collection, e.g. GET /projects/.../documents/{collectionId}
- * Returns parsed documents array.
+ * List top-level documents for a collection using Firestore REST API.
+ * Attaches an ID token when available so rules that require auth succeed.
  */
-export async function listTopLevelCollection(collectionId: string, pageSize?: number) {
+export async function listTopLevelCollection(collectionId: string, pageSize = 1000) {
   if (!PROJECT_ID) throw new Error('Missing PROJECT_ID for Firestore REST');
-  const base = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents`;
-  const url = `${base}/${collectionId}${pageSize ? `?pageSize=${pageSize}` : ''}`;
+  const base = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(PROJECT_ID)}/databases/(default)/documents/${encodeURIComponent(collectionId)}`;
+  const url = `${base}?pageSize=${Number(pageSize)}`;
   const res = await fetchWithAuth(url, { method: 'GET' });
+  const bodyText = await res.text().catch(() => '<no body>');
   if (!res.ok) {
-    const text = await res.text().catch(() => '<no body>');
-    console.warn('[firestoreRest] listTopLevelCollection non-ok response', { status: res.status, body: text });
-    throw new Error(`REST list top-level collection failed ${res.status}: ${text}`);
+    console.warn('[firestoreRest] listTopLevelCollection non-ok response', { status: res.status, body: bodyText });
+    throw new Error(`REST list top-level collection failed ${res.status}: ${bodyText}`);
   }
-  const json = await res.json().catch(() => null);
-  const docs: any[] = [];
-  if (json && Array.isArray(json.documents)) {
-    for (const docJson of json.documents) {
-      docs.push(parseDocumentJson(docJson));
-    }
-  }
-  return docs;
+  const json = (() => { try { return JSON.parse(bodyText); } catch { return null; } })();
+  if (!json || !Array.isArray(json.documents)) return [];
+  return json.documents.map((d: any) => parseDocumentJson(d));
 }
 
 // Export default (add new helper if you export default at bottom)
