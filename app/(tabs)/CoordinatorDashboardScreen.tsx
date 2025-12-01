@@ -476,9 +476,14 @@ export default function CoordinatorDashboardScreen() {
         type: req.type ?? 'home',
         startISO: req.startISO ?? new Date().toISOString(),
         location: teamData.location ?? '',
-        createdBy: req.requestedBy ?? user?.uid,
+        createdBy: req.requestedBy ?? user?.uid, // uid
+        createdByName: req.requestedByName ?? (user?.displayName ?? ''),
+        createdByEmail: (req as any).requestedByEmail ?? (user?.email ?? ''),
+        // prefer rating from the request (if present); otherwise leave null
+        createdByRating: (req as any).requestedByRating ?? null,
         createdAt: new Date().toISOString(),
       };
+
       if (req.kitColor) payload.kitColor = req.kitColor;
 
       // create the game (safe helper)

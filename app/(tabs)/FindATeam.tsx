@@ -1,3 +1,5 @@
+import TutorialModal from '@/components/TutorialModal';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
@@ -49,6 +51,10 @@ export default function FindATeam() {
   // Directory list (defaults shown when search empty)
   const [directory, setDirectory] = useState<Team[]>([]);
   const [dirLoading, setDirLoading] = useState(false);
+
+  // Tutorial: one-shot per-user for Find a Team
+  const [findTeamTutorialVisible, setFindTeamTutorialVisible] = useState(false);
+  const [findTeamTutorialStep, setFindTeamTutorialStep] = useState(0);
 
   const user = auth.currentUser;
   const router = useRouter();
@@ -713,6 +719,45 @@ export default function FindATeam() {
     await searchTeamsNearby(userCoords, true);
   };
 
+  const findTeamTutorialKey = (uid?: string) => `tutorial_seen:${uid ?? 'anon'}:find_team`;
+
+  const findTeamTutorialSteps = [
+    {
+      title: 'Find a Team',
+      body:
+        'Search for teams by city, rink or team name. Use "Search Area" to geolocate an area. ' +
+        'The directory shows nearby or popular clubs. Tap a team to view details and request to join.',
+      size: 'small' as const,
+      primaryLabel: 'Next',
+    },
+    {
+      title: 'Request to Join',
+      body:
+        'When you find a team you like, tap it and choose "Request to Join". The team coordinator will review your request.',
+      size: 'small' as const,
+      primaryLabel: 'Got it',
+    },
+  ];
+
+  useEffect(() => {
+    let mounted = true;
+    async function maybeShowFindTutorial() {
+      try {
+        const uid = auth?.currentUser?.uid ?? null;
+        if (!uid) return; // only show for signed-in users
+        const seen = await AsyncStorage.getItem(findTeamTutorialKey(uid));
+        if (seen) return;
+        if (!mounted) return;
+        setFindTeamTutorialVisible(true);
+      } catch (e) {
+        console.warn('find-team tutorial check failed', e);
+      }
+    }
+    maybeShowFindTutorial();
+    return () => { mounted = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>Find a Team</Text>
@@ -733,7 +778,7 @@ export default function FindATeam() {
         <Button title="Search Area" onPress={handleSearchArea} disabled={searching || loadingTeams} />
       </View>
 
-      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
         <TextInput
           style={[styles.input, { width: 100 }]}
           value={String(radiusMiles)}
@@ -745,10 +790,20 @@ export default function FindATeam() {
           }}
         />
         <Text style={{ marginLeft: 8 }}>miles radius</Text>
-        <View style={{ width: 12 }} />
-        <Button title="Nearest to me" onPress={handleNearestToMe} disabled={loadingLocation || loadingTeams} />
+      </View>
+
+      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
+        <View style={{ flex: 1 }}>
+          <Button title="Nearest to me" onPress={handleNearestToMe} disabled={loadingLocation || loadingTeams} />
+        </View>
         <View style={{ width: 8 }} />
-        <Button title="Refresh Teams" onPress={() => loadTeams().then(() => searchTeamsNearby(userCoords ?? undefined, true))} disabled={loadingTeams} />
+        <View style={{ flex: 1 }}>
+          <Button
+            title="Refresh Teams"
+            onPress={() => loadTeams().then(() => searchTeamsNearby(userCoords ?? undefined, true))}
+            disabled={loadingTeams}
+          />
+        </View>
       </View>
 
       {/* Preview results when searching */}
@@ -806,6 +861,42 @@ export default function FindATeam() {
             <Button title="Cancel" onPress={() => setSelectedTeam(null)} color="#FF3B30" />
           </View>
         </View>
+      )}
+
+      {findTeamTutorialVisible && (
+        <TutorialModal
+          visible={findTeamTutorialVisible}
+          onClose={async () => {
+            try {
+              const uid = auth?.currentUser?.uid ?? null;
+              if (uid) await AsyncStorage.setItem(findTeamTutorialKey(uid), '1');
+            } catch (e) {
+              console.warn('failed to store find-team tutorial seen', e);
+            } finally {
+              setFindTeamTutorialVisible(false);
+              setFindTeamTutorialStep(0);
+            }
+          }}
+          onPrimary={async () => {
+            if (findTeamTutorialStep < findTeamTutorialSteps.length - 1) {
+              setFindTeamTutorialStep((s) => s + 1);
+              return;
+            }
+            try {
+              const uid = auth?.currentUser?.uid ?? null;
+              if (uid) await AsyncStorage.setItem(findTeamTutorialKey(uid), '1');
+            } catch (e) {
+              console.warn('failed to store find-team tutorial seen', e);
+            } finally {
+              setFindTeamTutorialVisible(false);
+              setFindTeamTutorialStep(0);
+            }
+          }}
+          primaryLabel={findTeamTutorialSteps[findTeamTutorialStep]?.primaryLabel ?? 'Got it'}
+          size={findTeamTutorialSteps[findTeamTutorialStep]?.size ?? 'small'}
+          title={findTeamTutorialSteps[findTeamTutorialStep]?.title}
+          body={findTeamTutorialSteps[findTeamTutorialStep]?.body}
+        />
       )}
     </ScrollView>
   );

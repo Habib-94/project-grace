@@ -244,6 +244,16 @@ export default function FindGamesScreen() {
 
           const locationFirst = firstLineOf(teamLocationRaw);
 
+          // NEW: prefer denormalized rating on game, then game's elo, then team doc's rating/elo
+          const teamRating = (typeof g.teamRating !== 'undefined' && g.teamRating !== null)
+            ? g.teamRating
+            : (typeof g.elo !== 'undefined' && g.elo !== null)
+            ? g.elo
+            : (teamDoc?.elo ?? teamDoc?.rating ?? null);
+
+          // NEW: prefer denormalized creator name fields
+          const createdByName = g.createdByName ?? g.coordinatorName ?? g.createdByDisplayName ?? null;
+
           return {
             ...g,
             id: g.id ?? getDocId(g) ?? g._id ?? `${teamName}-${lat}-${lng}`,
@@ -252,6 +262,9 @@ export default function FindGamesScreen() {
             teamHomeColor: homeColor,
             teamLocationFirstLine: locationFirst,
             teamId: rawTeamId ?? undefined,
+            // denormalized extras we just computed:
+            teamRating,
+            createdByName,
           };
         })
         .filter(Boolean)
@@ -294,35 +307,48 @@ export default function FindGamesScreen() {
     setModalCreatorDoc(null);
     setModalVisible(true);
 
-    // try to find team doc from cached teams first
+    // try to find team doc from cached teams first (unchanged)
     const teamId = game.teamId ?? game.teamIdString ?? null;
     if (teamId) {
-      const cached = teams.find((t) => getDocId(t) === String(teamId) || String(t.id) === String(teamId) || String(t.teamId) === String(teamId));
+      const cached = teams.find((t) =>
+        getDocId(t) === String(teamId) ||
+        String(t.id) === String(teamId) ||
+        String(t.teamId) === String(teamId)
+      );
       if (cached) {
         setModalTeamDoc(cached);
       } else {
-        // otherwise load via REST getDocument (best effort)
         try {
           await ensureFirestoreOnline();
           const t = await getDocument(`teams/${String(teamId)}`);
           if (t) setModalTeamDoc(t);
         } catch (err) {
-          console.warn('[FindGames] failed to load team doc for modal', err);
+          // best-effort: ignore failures, keep denormalized fallback from the game doc
+          console.warn('[FindGames] failed to load team doc for modal (best-effort)', err);
         }
       }
     }
 
-    // Best-effort: load the user document for the game's creator (createdBy)
-    const creatorUid = game.createdBy ?? game.createdByUid ?? null;
-    if (creatorUid) {
-      try {
-        await ensureFirestoreOnline();
-        const u = await getDocument(`users/${String(creatorUid)}`);
-        if (u) setModalCreatorDoc(u);
-      } catch (err) {
-        console.warn('[FindGames] failed to load creator user doc for modal', err);
-      }
-    }
+    // IMPORTANT: do NOT attempt to read users/{creatorUid} here.
+    // That read will be denied by rules for other users and produces the permission warning.
+    // Instead, prefer denormalized creator fields that should be written into the game document on create.
+    // Use the game doc's denormalized fields if present; otherwise fall back to a minimal placeholder.
+
+    const creatorFallback = {
+      displayName: game.createdByName ?? game.createdByDisplayName ?? game.coordinatorName ?? 'Private user',
+      email: game.createdByEmail ?? null,
+      rating: typeof game.createdByRating !== 'undefined' ? game.createdByRating : (typeof game.createdByRating === 'undefined' ? null : game.createdByRating),
+    };
+
+    setModalCreatorDoc({
+      displayName: creatorFallback.displayName,
+      email: creatorFallback.email,
+      rating: creatorFallback.rating,
+    });
+
+    // NOTE: we intentionally do NOT call getDocument(`users/${creatorUid}`) anymore.
+    // If you still want an optional enrichment for cases where the viewer is the creator or
+    // you have a publicProfiles collection, we can fetch only when allowed (or when the current user === creator).
   };
 
   // small helper to convert JS value -> Firestore REST field value object
@@ -383,6 +409,8 @@ export default function FindGamesScreen() {
       const homeTeamId = selectedGame.teamId ?? selectedGame.teamIdString ?? null;
 
       const payload: any = {
+        // Make the request document target the home team so their coordinator receives it
+        teamId: homeTeamId,                // <-- CRITICAL: coordinator dashboard expects 'teamId'
         requestingTeamId,
         requestingTeamName,
         homeTeamId,
@@ -396,6 +424,11 @@ export default function FindGamesScreen() {
         // include UID fields so rules that check ownership can pass
         requestedBy: user.uid,
         createdBy: user.uid,
+
+        // include denormalized requester coordinator info so home coordinator sees team + coordinator + rating
+        requestingCoordinatorName: me.displayName ?? me.fullName ?? me.name ?? '',
+        requestingCoordinatorEmail: me.email ?? null,
+        requestingCoordinatorRating: typeof me.rating !== 'undefined' ? me.rating : null,
       };
 
       // ====== diagnostic: print token/payload so we can see why rules denied ======
@@ -440,6 +473,10 @@ export default function FindGamesScreen() {
         put('createdAt', payload.createdAt);
         put('requestedBy', payload.requestedBy);
         put('createdBy', payload.createdBy);
+        put('teamId', payload.teamId);
+        put('requestingCoordinatorName', payload.requestingCoordinatorName);
+        put('requestingCoordinatorEmail', payload.requestingCoordinatorEmail);
+        put('requestingCoordinatorRating', payload.requestingCoordinatorRating);
 
         // Get fresh ID token if available
         let token: string | null = null;
@@ -552,10 +589,14 @@ export default function FindGamesScreen() {
       <Modal visible={modalVisible} animationType="slide" transparent={true} onRequestClose={() => setModalVisible(false)}>
         <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', padding: 16 }}>
           <View style={{ backgroundColor: '#fff', borderRadius: 8, padding: 16, maxHeight: '90%' }}>
-            <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>{selectedGame?.title ?? selectedGame?.teamName ?? 'Game details'}</Text>
+            <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>
+              {selectedGame?.title ?? selectedGame?.teamName ?? 'Game details'}
+            </Text>
+
             <Text style={{ color: '#333', marginBottom: 4 }}>
               When: {selectedGame?.startISO ? new Date(selectedGame.startISO).toLocaleString() : 'TBA'}
             </Text>
+
             <Text style={{ color: '#333', marginBottom: 4 }}>
               Where: {selectedGame?.teamLocationFirstLine ?? (modalTeamDoc ? firstLineOf(readStringField(modalTeamDoc, 'location') ?? '') : 'Unknown')}
             </Text>
@@ -565,36 +606,49 @@ export default function FindGamesScreen() {
               Team: {modalTeamDoc?.teamName ?? selectedGame?.teamName ?? 'Unknown'}
             </Text>
 
-             {/* Kit colors */}
-             <View style={{ flexDirection: 'row', marginTop: 8, alignItems: 'center' }}>
-               <View style={{ width: 16, height: 16, backgroundColor: modalTeamDoc?.homeColor ?? selectedGame?.teamHomeColor ?? '#fff', borderWidth: 1, borderColor: '#ddd', marginRight: 8 }} />
-               <Text style={{ color: '#333' }}>Home kit</Text>
-               <View style={{ width: 12 }} />
-               <View style={{ width: 16, height: 16, backgroundColor: modalTeamDoc?.awayColor ?? selectedGame?.awayColor ?? '#fff', borderWidth: 1, borderColor: '#ddd', marginRight: 8 }} />
-               <Text style={{ color: '#333' }}>Away kit</Text>
-             </View>
+            {/* Kit colors */}
+            <View style={{ flexDirection: 'row', marginTop: 8, alignItems: 'center' }}>
+              <View
+                style={{
+                  width: 16,
+                  height: 16,
+                  backgroundColor: modalTeamDoc?.homeColor ?? selectedGame?.teamHomeColor ?? selectedGame?.homeColor ?? '#fff',
+                  borderWidth: 1,
+                  borderColor: '#ddd',
+                  marginRight: 8,
+                }}
+              />
+              <Text style={{ color: '#333' }}>Home kit</Text>
+              <View style={{ width: 12 }} />
+              <View
+                style={{
+                  width: 16,
+                  height: 16,
+                  backgroundColor: modalTeamDoc?.awayColor ?? selectedGame?.awayColor ?? '#fff',
+                  borderWidth: 1,
+                  borderColor: '#ddd',
+                  marginRight: 8,
+                }}
+              />
+              <Text style={{ color: '#333' }}>Away kit</Text>
+            </View>
 
-             {/* ELO / rating */}
-             <Text style={{ color: '#333', marginTop: 8 }}>
-               Team Rating: {modalTeamDoc?.elo ?? modalTeamDoc?.rating ?? '—'}
-             </Text>
-
-            {/* Coordinator (creator full name) */}
-            <Text style={{ color: '#333', marginTop: 8, marginBottom: 12 }}>
-              Coordinator: {modalCreatorDoc?.name ?? modalCreatorDoc?.displayName ?? modalTeamDoc?.coordinatorName ?? (Array.isArray(modalTeamDoc?.coordinatorNames) ? modalTeamDoc.coordinatorNames.join(', ') : (modalTeamDoc?.coordinators?.join?.(', ') ?? 'Unknown'))}
+            {/* Team Rating: prefer denormalized fields on the game, then team doc */}
+            <Text style={{ color: '#333', marginTop: 8 }}>
+              Team Rating: { (selectedGame?.teamRating ?? selectedGame?.elo ?? modalTeamDoc?.elo ?? modalTeamDoc?.rating) ?? '—' }
             </Text>
 
-            {/* Creator info */}
-            {modalCreatorDoc ? (
-              <View style={{ marginTop: 12 }}>
-                <Text style={{ color: '#333', marginBottom: 4 }}>Requested by:</Text>
-                <Text style={{ color: '#007aff', fontWeight: '500' }}>{modalCreatorDoc.fullName ?? modalCreatorDoc.displayName ?? 'Unknown User'}</Text>
-                <Text style={{ color: '#333' }}>{modalCreatorDoc.email ?? 'No email provided'}</Text>
-              </View>
-            ) : null}
+            {/* Coordinator (creator) name: prefer denormalized fields on the game first */}
+            <Text style={{ color: '#333', marginTop: 8, marginBottom: 12 }}>
+              Coordinator: {(selectedGame?.createdByName ?? selectedGame?.coordinatorName ?? modalCreatorDoc?.displayName ?? modalTeamDoc?.coordinatorName ?? 'Unknown')}
+            </Text>
 
+            {/* Action buttons */}
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 12 }}>
-              <Pressable onPress={() => { setModalVisible(false); setSelectedGame(null); }} style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#eee' }}>
+              <Pressable
+                onPress={() => { setModalVisible(false); setSelectedGame(null); }}
+                style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#eee' }}
+              >
                 <Text style={{ color: '#333' }}>Close</Text>
               </Pressable>
 

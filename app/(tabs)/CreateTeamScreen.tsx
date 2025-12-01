@@ -1,4 +1,4 @@
-import Constants from 'expo-constants';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
@@ -16,10 +16,14 @@ import {
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
+import TutorialModal from '@/components/TutorialModal';
+import Constants from 'expo-constants';
 import { emitAppEvent } from '../../src/appEvents';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
 import { getDocument } from '../../src/firestoreRest';
 import { geocodeAddress, getPlaceDetails } from '../../src/locations';
+
+// NEW imports for the tutorial
 
 // runtime-safe add/update helpers (same pattern as elsewhere)
 async function addDocSafe(collectionPath: string, data: any) {
@@ -75,7 +79,56 @@ export default function CreateTeamScreen() {
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // Autocomplete state
+  // Block screen for existing coordinators
+  const [createTeamBlocked, setCreateTeamBlocked] = useState(false);
+  const [blockedTeamId, setBlockedTeamId] = useState<string | null>(null);
+  // human-friendly team name to show instead of raw id when available
+  const [blockedTeamName, setBlockedTeamName] = useState<string | null>(null);
+
+  // Tutorial state (one-shot per user for Create Team)
+  const [createTeamTutorialVisible, setCreateTeamTutorialVisible] = useState(false);
+  const [createTeamTutorialStep, setCreateTeamTutorialStep] = useState(0);
+
+  const newTeamTutorialKey = (uid?: string) => `tutorial_seen:${uid ?? 'anon'}:create_team`;
+
+  const createTeamTutorialSteps = [
+    {
+      title: 'Create a team',
+      body:
+        'Give your team a name and pick a location (rink or arena). Use "Find with Google" to quickly select a place. ' +
+        'Choose your Home and Away kit colours and then tap Create Team.',
+      size: 'small' as const,
+      primaryLabel: 'Next',
+    },
+    {
+      title: 'After creating',
+      body:
+        'You will become the Coordinator for the team. Coordinators can invite members, manage requests, and schedule games from the Manage Team screen.',
+      size: 'small' as const,
+      primaryLabel: 'Got it',
+    },
+  ];
+
+  useEffect(() => {
+    let mounted = true;
+    async function maybeShow() {
+      try {
+        const uid = auth?.currentUser?.uid ?? null;
+        if (!uid) return;
+        const seen = await AsyncStorage.getItem(newTeamTutorialKey(uid));
+        if (seen) return;
+        if (!mounted) return;
+        setCreateTeamTutorialVisible(true);
+      } catch (e) {
+        console.warn('create-team tutorial check failed', e);
+      }
+    }
+    maybeShow();
+    return () => { mounted = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Autocomplete state (required by fetchPredictions / suggestions UI)
   const [predictions, setPredictions] = useState<Prediction[]>([]);
   const [loadingPredictions, setLoadingPredictions] = useState(false);
   const acAbortRef = useRef<AbortController | null>(null);
@@ -333,9 +386,143 @@ export default function CreateTeamScreen() {
     </TouchableOpacity>
   );
 
+  useEffect(() => {
+    let mounted = true;
+    async function checkCoordinator() {
+      try {
+        if (!user?.uid) return;
+        await ensureFirestoreOnline();
+
+        // Try REST helper first (preferred), fall back to SDK if present
+        let udoc: any = null;
+        try {
+          udoc = await getDocument(`users/${user.uid}`);
+        } catch (e) {
+          console.warn('[CreateTeam] getDocument(users) failed during coordinator check', e);
+        }
+        if (!udoc && db && typeof (db as any).collection === 'function') {
+          try {
+            const snap = await (db as any).collection('users').doc(user.uid).get();
+            if (snap?.exists) udoc = { id: snap.id, ...(snap.data() ?? {}) };
+          } catch (sdkErr) {
+            console.warn('[CreateTeam] SDK fallback users/{uid} read failed', sdkErr);
+          }
+        }
+
+        if (!mounted) return;
+
+        if (udoc?.isCoordinator) {
+          setCreateTeamBlocked(true);
+          const tid = udoc.teamId ?? null;
+          setBlockedTeamId(tid);
+
+          // Try to load the friendly team name for display
+          if (tid) {
+            let tdoc: any = null;
+            try {
+              try {
+                tdoc = await getDocument(`teams/${tid}`);
+              } catch (restErr) {
+                // REST failed, try SDK fallback
+                console.warn('[CreateTeam] getDocument(teams) REST failed, trying SDK fallback', restErr);
+              }
+              if (!tdoc && db && typeof (db as any).collection === 'function') {
+                try {
+                  const snap = await (db as any).collection('teams').doc(tid).get();
+                  if (snap?.exists) tdoc = { id: snap.id, ...(snap.data() ?? {}) };
+                } catch (sdkErr) {
+                  console.warn('[CreateTeam] SDK fallback teams/{id} read failed', sdkErr);
+                }
+              }
+            } catch (anyErr) {
+              console.warn('[CreateTeam] loading team doc failed', anyErr);
+            } finally {
+              if (mounted) setBlockedTeamName(tdoc?.teamName ?? null);
+            }
+          } else {
+            setBlockedTeamName(null);
+          }
+        } else {
+          setCreateTeamBlocked(false);
+          setBlockedTeamId(null);
+          setBlockedTeamName(null);
+        }
+      } catch (err) {
+        console.warn('[CreateTeam] coordinator check failed', err);
+      }
+    }
+    checkCoordinator();
+    return () => { mounted = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.uid]);
+
+  // If user is blocked (already a coordinator), show a short message and navigation options.
+  if (createTeamBlocked) {
+    return (
+      <View style={styles.center}>
+        <Text style={{ fontSize: 18, fontWeight: '700', color: '#0a7ea4', marginBottom: 8 }}>
+          You are already a team Coordinator
+        </Text>
+        <Text style={{ color: '#666', textAlign: 'center', marginBottom: 18 }}>
+          Leave your current team from the Manage Team screen before creating a new one.
+          {blockedTeamName
+            ? ` (${blockedTeamName})`
+            : blockedTeamId
+              ? ` (Team ID: ${blockedTeamId})`
+              : ''}
+        </Text>
+
+        <View style={{ width: '70%', marginBottom: 10 }}>
+          <Button title="Manage Team" onPress={() => router.push('/(tabs)/CoordinatorDashboardScreen')} />
+        </View>
+        <View style={{ width: '70%' }}>
+          <Button title="Back to Home" onPress={() => router.push('/(tabs)')} color="#666" />
+        </View>
+      </View>
+    );
+  }
+
+  // otherwise continue to render the normal create team UI...
   return (
     <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
       <Text style={styles.title}>Create a New Team</Text>
+
+      {/* Create Team tutorial (one-shot per user) */}
+      {createTeamTutorialVisible && (
+        <TutorialModal
+          visible={createTeamTutorialVisible}
+          onClose={async () => {
+            try {
+              const uid = auth?.currentUser?.uid ?? null;
+              if (uid) await AsyncStorage.setItem(newTeamTutorialKey(uid), '1');
+            } catch (e) {
+              console.warn('failed to store create-team tutorial seen', e);
+            } finally {
+              setCreateTeamTutorialVisible(false);
+              setCreateTeamTutorialStep(0);
+            }
+          }}
+          onPrimary={async () => {
+            if (createTeamTutorialStep < createTeamTutorialSteps.length - 1) {
+              setCreateTeamTutorialStep((s) => s + 1);
+              return;
+            }
+            try {
+              const uid = auth?.currentUser?.uid ?? null;
+              if (uid) await AsyncStorage.setItem(newTeamTutorialKey(uid), '1');
+            } catch (e) {
+              console.warn('failed to store create-team tutorial seen', e);
+            } finally {
+              setCreateTeamTutorialVisible(false);
+              setCreateTeamTutorialStep(0);
+            }
+          }}
+          primaryLabel={createTeamTutorialSteps[createTeamTutorialStep]?.primaryLabel ?? 'Got it'}
+          size={createTeamTutorialSteps[createTeamTutorialStep]?.size ?? 'small'}
+          title={createTeamTutorialSteps[createTeamTutorialStep]?.title}
+          body={createTeamTutorialSteps[createTeamTutorialStep]?.body}
+        />
+      )}
 
       <TextInput
         style={styles.input}
@@ -480,4 +667,41 @@ const styles = StyleSheet.create({
   suggestionMain: { fontWeight: '600' },
   suggestionSecondary: { color: '#666', fontSize: 12 },
 
+  tutorialOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.7)',
+    zIndex: 1000,
+  },
+  tutorialCard: {
+    width: '80%',
+    maxWidth: 400,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 20,
+    elevation: 4,
+  },
+  tutorialTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    marginBottom: 12,
+    color: '#0a7ea4',
+  },
+  tutorialBody: {
+    fontSize: 14,
+    color: '#333',
+    marginBottom: 16,
+  },
+  tutorialButtons: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 10,
+  },
+
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
 });

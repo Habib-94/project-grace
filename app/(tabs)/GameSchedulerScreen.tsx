@@ -4,6 +4,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -30,6 +31,13 @@ type Game = {
   type?: string;
   elo?: number;
   createdBy?: string;
+  // optional denormalized fields that may exist on some docs:
+  teamRating?: number | null;
+  teamHomeColor?: string | null;
+  awayColor?: string | null;
+  createdByName?: string | null;
+  createdByEmail?: string | null;
+  createdByRating?: number | null;
 };
 
 export default function GameSchedulerScreen() {
@@ -313,9 +321,10 @@ export default function GameSchedulerScreen() {
       let teamLng: number | null = null;
       let teamLabel = '';
       let teamPlaceId = '';
+      let teamDoc: any = null; // <<--- declare in outer scope so later code can reference it
 
       try {
-        const teamDoc = await getDocument(`teams/${teamId}`);
+        teamDoc = await getDocument(`teams/${teamId}`);
         teamName = (teamDoc?.teamName as string) ?? '';
         teamLat = teamDoc?.latitude ?? teamDoc?.lat ?? null;
         teamLng = teamDoc?.longitude ?? teamDoc?.lng ?? null;
@@ -341,8 +350,19 @@ export default function GameSchedulerScreen() {
       for (const iso of selectedIsos) {
         try {
           const occ = new Date(iso);
+
+          // derive denormalized creator fields (use userDoc if available, else fallback)
+          const creatorName = (userDoc?.displayName ?? userDoc?.name ?? auth?.currentUser?.displayName ?? '') as string;
+          const creatorEmail = (userDoc?.email ?? auth?.currentUser?.email ?? '') as string;
+          const creatorRating = typeof userDoc?.rating !== 'undefined' ? userDoc.rating : null;
+
+          // derive team rating if available
+          const teamRating = typeof teamDoc?.elo !== 'undefined' ? teamDoc.elo : (typeof teamDoc?.rating !== 'undefined' ? teamDoc.rating : null);
+
           const payload: any = {
             teamId,
+            teamName: teamName ?? '',
+            teamRating: teamRating ?? null,      // denormalized team rating/elo
             title: defaultTitle,
             type: 'open',
             startISO: occ.toISOString(),
@@ -351,6 +371,17 @@ export default function GameSchedulerScreen() {
             kitColor: null,
             createdBy: user.uid,
             createdAt: new Date().toISOString(),
+
+            // Denormalized creator info (coordinator who created this availability)
+            createdByName: creatorName,
+            createdByEmail: creatorEmail,
+            createdByRating: creatorRating,
+
+            // also optionally mark coordinatorName for clarity (same as createdByName)
+            coordinatorName: creatorName,
+
+            // Denormalized team home color so viewers can show kit colors without fetching teams/{teamId}
+            teamHomeColor: teamDoc?.homeColor ?? teamDoc?.kitColor ?? null,
 
             // TTL: expire exactly at the scheduled start time
             expiresAt: new Date(occ.getTime()),
@@ -386,6 +417,10 @@ export default function GameSchedulerScreen() {
             type: payload.type,
             elo: undefined,
             createdBy: payload.createdBy,
+            // also include denormalized creator/team fields where available for immediate UI
+            createdByName: payload.createdByName,
+            teamRating: payload.teamRating,
+            teamHomeColor: teamDoc?.homeColor ?? null,
           };
 
           setCreatedGames((prev) => [createdItem, ...prev]);
@@ -466,7 +501,8 @@ export default function GameSchedulerScreen() {
       const teamIds = Array.from(new Set(myDocs.map((d) => d?.teamId).filter(Boolean)));
 
       // Fetch team docs in parallel to get the team's name + location (if available)
-      const teamInfoMap: Record<string, { name: string; location: string }> = {};
+      // also grab homeColor and rating so we can show kit colors & rating even if the game doc didn't denormalize them
+      const teamInfoMap: Record<string, { name: string; location: string; homeColor?: string | null; rating?: number | null }> = {};
       if (teamIds.length) {
         await Promise.all(
           teamIds.map(async (tid) => {
@@ -475,30 +511,55 @@ export default function GameSchedulerScreen() {
               teamInfoMap[tid] = {
                 name: (teamDoc?.teamName as string) ?? '',
                 location: (teamDoc?.location as string) ?? '',
+                homeColor: (teamDoc?.homeColor as string) ?? (teamDoc?.kitColor as string) ?? null,
+                rating:
+                  typeof teamDoc?.elo !== 'undefined'
+                    ? teamDoc.elo
+                    : typeof teamDoc?.rating !== 'undefined'
+                    ? teamDoc.rating
+                    : null,
               };
             } catch (e) {
               console.warn('[GameScheduler] failed to read team doc for', tid, e);
-              teamInfoMap[tid] = { name: '', location: '' };
+              teamInfoMap[tid] = { name: '', location: '', homeColor: null, rating: null };
             }
           })
         );
       }
 
       // Map into typed items and attach teamLocation (falls back to game's own location.label)
+      // Also preserve kit colors & team rating by preferring denormalized fields on the game doc,
+      // then falling back to the team doc we just fetched.
       const items: Game[] = myDocs
-        .map((d) => ({
-          id: d.id,
-          title: d.title,
-          startISO: d.startISO,
-          location: d.location,
-          kitColor: d.kitColor ?? null,
-          teamId: d.teamId,
-          teamName: d.teamId ? teamInfoMap[d.teamId]?.name ?? '' : '',
-          teamLocation: d.teamId ? teamInfoMap[d.teamId]?.location ?? '' : (d.location?.label ?? ''),
-          type: d.type ?? 'open',
-          elo: d.elo,
-          createdBy: d.createdBy,
-        }))
+        .map((d) => {
+          const tid = d.teamId;
+          const teamInfo = tid ? teamInfoMap[tid] : undefined;
+
+          return {
+            id: d.id,
+            title: d.title,
+            startISO: d.startISO,
+            location: d.location,
+            kitColor: d.kitColor ?? null,
+            teamId: d.teamId,
+            teamName: tid ? teamInfo?.name ?? (d.teamName ?? '') : (d.teamName ?? ''),
+            teamLocation: tid ? teamInfo?.location ?? (d.teamLocation ?? '') : (d.teamLocation ?? d.location?.label ?? ''),
+            type: d.type ?? 'open',
+            elo: d.elo,
+            createdBy: d.createdBy,
+            // include denormalized fields if present so modal can show them
+            createdByName: d.createdByName ?? d.coordinatorName ?? null,
+            // team rating: prefer game's denormalized teamRating, then game's elo, then team doc rating
+            teamRating: (typeof d.teamRating !== 'undefined' && d.teamRating !== null)
+              ? d.teamRating
+              : (typeof d.elo !== 'undefined' && d.elo !== null)
+              ? d.elo
+              : teamInfo?.rating ?? null,
+            // teamHomeColor: prefer game's denormalized teamHomeColor, then legacy homeColor on game doc, then team doc homeColor
+            teamHomeColor: (d.teamHomeColor ?? d.homeColor ?? teamInfo?.homeColor ?? null),
+            awayColor: (d.awayColor ?? null),
+          } as Game;
+        })
         // Client-side sort by startISO (docs without startISO go to the end)
         .sort((a, b) => {
           if (!a.startISO && !b.startISO) return 0;
@@ -699,6 +760,56 @@ export default function GameSchedulerScreen() {
     );
   }
 
+  // modal state for game details
+  const [modalVisible, setModalVisible] = useState(false);
+  const [selectedGame, setSelectedGame] = useState<Game | null>(null);
+  const [requesting, setRequesting] = useState(false);
+
+  // open details modal for a game
+  function openGameDetails(game: Game) {
+    setSelectedGame(game);
+    setModalVisible(true);
+  }
+
+  // close details modal
+  function closeGameDetails() {
+    setSelectedGame(null);
+    setModalVisible(false);
+  }
+
+  // request a game (join as player)
+  async function requestGame() {
+    if (!selectedGame?.id) return;
+
+    // Prevent requesting your own game
+    const myUid = auth?.currentUser?.uid;
+    if (myUid && selectedGame.createdBy === myUid) {
+      Toast.show({
+        type: 'info',
+        text1: "Can't request your own game",
+        text2: 'You are the creator of this game.',
+      });
+      // close modal (optional) — keep behavior consistent with earlier UX
+      closeGameDetails();
+      return;
+    }
+
+    try {
+      setRequesting(true);
+      await ensureFirestoreOnline();
+
+      // TODO: implement game request logic (e.g. create a "requests" subcollection under the game)
+
+      Toast.show({ type: 'success', text1: 'Request sent', text2: 'Your request to join the game has been sent.' });
+      closeGameDetails();
+    } catch (e: any) {
+      console.error('[GameScheduler] requestGame error', e);
+      Toast.show({ type: 'error', text1: 'Request failed', text2: e?.message ?? String(e) });
+    } finally {
+      setRequesting(false);
+    }
+  }
+
   return (
     <View style={styles.container}>
       <ScrollView contentContainerStyle={{ padding: 16 }} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
@@ -742,17 +853,95 @@ export default function GameSchedulerScreen() {
                   {/* main meta: date and type */}
                   <Text style={styles.gameMeta}>{dt ? dt.toLocaleString() : 'TBA'} • {typeLabel}</Text>
 
-                  {/* Team and Team Location (prefer attached teamLocation, else fall back to game's own location.label or teamId) */}
+                  {/* Team and Team Location (prefer attached teamLocation, else fall back to game's own location.label) */}
                   <Text style={styles.gameMeta}>Team: {item.teamName ?? item.teamId ?? '—'}</Text>
                   <Text style={styles.gameMeta}>
                     Location: {item.teamLocation ? item.teamLocation : (item.location?.label ?? '—')}
                   </Text>
+
+                  {/* Open details button */}
+                  <View style={{ marginTop: 8, alignSelf: 'stretch' }}>
+                    <Pressable onPress={() => openGameDetails(item)} style={{ paddingVertical: 10, borderRadius: 6, backgroundColor: '#0a7ea4', alignItems: 'center' }}>
+                      <Text style={{ color: 'white', fontWeight: '600' }}>View Details</Text>
+                    </Pressable>
+                  </View>
                 </View>
               );
             })
           )}
         </View>
       </ScrollView>
+
+      {/* Game details modal */}
+      <Modal visible={modalVisible} animationType="slide" transparent={true} onRequestClose={() => setModalVisible(false)}>
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.4)', justifyContent: 'center', padding: 16 }}>
+          <View style={{ backgroundColor: '#fff', borderRadius: 8, padding: 16, maxHeight: '90%' }}>
+            {/* Header: title */}
+            <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>
+              {selectedGame?.title ?? selectedGame?.teamName ?? 'Game details'}
+            </Text>
+
+            {/* When */}
+            <Text style={{ color: '#333', marginBottom: 4 }}>
+              When: {selectedGame?.startISO ? new Date(selectedGame.startISO).toLocaleString() : 'TBA'}
+            </Text>
+
+            {/* Where */}
+            <Text style={{ color: '#333', marginBottom: 4 }}>
+              Where: {selectedGame?.teamLocation ?? selectedGame?.location?.label ?? 'Unknown'}
+            </Text>
+
+            {/* Team name */}
+            <Text style={{ color: '#333', marginTop: 4 }}>
+              Team: {selectedGame?.teamName ?? 'Unknown'}
+            </Text>
+
+            {/* Kit colours row - shows home + away (home emphasised) */}
+            <View style={{ flexDirection: 'row', marginTop: 8, alignItems: 'center' }}>
+              <View style={{ width: 16, height: 16, backgroundColor: (selectedGame?.teamHomeColor ?? selectedGame?.kitColor ?? '#fff'), borderWidth: 1, borderColor: '#ddd', marginRight: 8 }} />
+              <Text style={{ color: '#333' }}>Home kit</Text>
+              <View style={{ width: 12 }} />
+              <View style={{ width: 16, height: 16, backgroundColor: (selectedGame?.awayColor ?? '#fff'), borderWidth: 1, borderColor: '#ddd', marginRight: 8 }} />
+              <Text style={{ color: '#333' }}>Away kit</Text>
+            </View>
+
+            {/* Team Rating */}
+            <Text style={{ color: '#333', marginTop: 8 }}>
+              Team Rating: { (selectedGame?.teamRating ?? selectedGame?.elo) ?? '—' }
+            </Text>
+
+            {/* Coordinator (creator) name */}
+            <Text style={{ color: '#333', marginTop: 8, marginBottom: 12 }}>
+              Coordinator: { (selectedGame?.createdByName ?? auth?.currentUser?.displayName ?? 'You') }
+            </Text>
+
+            {/* Action buttons */}
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 12 }}>
+              <Pressable
+                onPress={() => { setModalVisible(false); setSelectedGame(null); }}
+                style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#eee' }}
+              >
+                <Text style={{ color: '#333' }}>Close</Text>
+              </Pressable>
+
+              {/* disable request button when the current user created this game */}
+              <Pressable
+                onPress={requestGame}
+                style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#0a7ea4' }}
+                disabled={requesting || (!!selectedGame?.createdBy && selectedGame.createdBy === auth?.currentUser?.uid)}
+              >
+                <Text style={{ color: '#fff' }}>
+                  {requesting
+                    ? 'Sending...'
+                    : (!!selectedGame?.createdBy && selectedGame.createdBy === auth?.currentUser?.uid)
+                      ? 'You created this'
+                      : 'Request Game'}
+                </Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
