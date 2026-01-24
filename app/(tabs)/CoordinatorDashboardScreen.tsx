@@ -88,6 +88,7 @@ async function runBatchSafe(ops: Array<{ op: 'update' | 'delete'; path: string; 
     const batch = writeBatch(db as any);
     for (const o of ops) {
       const [col, id] = o.path.split('/');
+      if (!col || !id) continue; // Skip invalid paths
       if (o.op === 'update') batch.update(doc(db as any, col, id), o.data ?? {});
       else if (o.op === 'delete') batch.delete(doc(db as any, col, id));
     }
@@ -142,11 +143,11 @@ export default function CoordinatorDashboardScreen() {
     static getDerivedStateFromError() {
       return { hasError: true };
     }
-    componentDidCatch(error: any, info: any) {
+    override componentDidCatch(error: any, info: any) {
       console.warn('[PlacesErrorBoundary] caught error rendering PlacesComp', error, info);
       try { this.props.onError?.(); } catch (e) { /* ignore */ }
     }
-    render() {
+    override render() {
       if (this.state.hasError) {
         return null; // fall back to text input in parent
       }
@@ -946,7 +947,7 @@ export default function CoordinatorDashboardScreen() {
             {editing ? (
               // Location: editable only when editing
               // Only mount GooglePlacesAutocomplete when we have both the component and an API key.
-              // Otherwise fall back to a plain TextInput. Wrap the third-party comp in an error boundary.
+              // Otherwise fall back to a plain TextInput. Wrap the third-party comp in an error boundary.np
               (PlacesComp && GOOGLE_MAPS_API_KEY) ? (
                 <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
                   <PlacesComp

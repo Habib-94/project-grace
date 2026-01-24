@@ -14,27 +14,16 @@ import {
 import Toast from 'react-native-toast-message';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
 import { getDocument } from '../../src/firestoreRest';
+import { setDocumentSafe } from '../../src/utils/firebase-helpers';
+import { redactSensitiveData, sanitizeEmail } from '../../src/utils/security';
 
 /**
  * Runtime-safe upsert/set with merge.
  * Uses native RN Firebase API when available, otherwise web modular setDoc with { merge: true }.
  */
-async function upsertUserDoc(uid: string, data: any) {
-  // Native RN Firebase style
-  try {
-    if (db && typeof (db as any).collection === 'function') {
-      // native firestore supports .doc(uid).set(data, { merge: true })
-      // Some native SDK versions accept a second "options" parameter with { merge: true }
-      return await (db as any).collection('users').doc(uid).set(data, { merge: true });
-    }
-  } catch (e) {
-    // fallthrough to web
-    console.warn('[upsertUserDoc] native set failed, falling back to web SDK', e);
-  }
-
-  // Web modular SDK
-  const { doc, setDoc } = await import('firebase/firestore');
-  return setDoc(doc(db as any, 'users', uid), data, { merge: true });
+async function upsertUserDoc(uid: string, data: Record<string, any>) {
+  if (!db) throw new Error('Database not initialized');
+  await setDocumentSafe(db, 'users', uid, data, { merge: true });
 }
 
 export default function LoginScreen() {
@@ -56,9 +45,13 @@ export default function LoginScreen() {
     try {
       setLoading(true);
 
+      // Sanitize email input
+      const sanitizedEmail = sanitizeEmail(email);
+
       // Sign in the user (web/native compatible; signInWithEmailAndPassword is used for web SDK path,
       // and auth should be the native instance if native SDK is present)
-      await signInWithEmailAndPassword(auth as any, email, password);
+      if (!auth) throw new Error('Auth not initialized');
+      await signInWithEmailAndPassword(auth, sanitizedEmail, password);
 
       // Make sure Firestore network is enabled before any REST/list checks or writes
       try {
@@ -70,7 +63,7 @@ export default function LoginScreen() {
       // Ensure a users/{uid} document exists (some flows may have missed creating it).
       // Use REST getDocument (which attaches the ID token) to check for existence.
       try {
-        const user = (auth as any)?.currentUser;
+        const user = auth.currentUser;
         const uid = user?.uid;
         if (uid) {
           let existing: any = null;
@@ -78,7 +71,7 @@ export default function LoginScreen() {
             existing = await getDocument(`users/${uid}`);
           } catch (e) {
             // getDocument may throw 404 or permission errors; log and continue to attempt upsert
-            console.warn('[Login] getDocument(users/{uid}) check failed', e);
+            console.warn('[Login] getDocument(users/{uid}) check failed', redactSensitiveData({ error: e }));
           }
 
           if (!existing) {
@@ -86,7 +79,7 @@ export default function LoginScreen() {
               await upsertUserDoc(uid, {
                 uid,
                 name: user?.displayName ?? '',
-                email: user?.email ?? '',
+                email: sanitizedEmail,
                 role: 'standard',
                 teamId: null,
                 isCoordinator: false,
@@ -95,12 +88,12 @@ export default function LoginScreen() {
               console.log('[Login] created missing users/{uid} doc');
             } catch (uErr) {
               // Non-fatal — we log and continue; rules may prevent this write.
-              console.warn('[Login] upsertUserDoc failed', uErr);
+              console.warn('[Login] upsertUserDoc failed', redactSensitiveData({ error: uErr }));
             }
           }
         }
       } catch (e) {
-        console.warn('[Login] ensure user doc step failed', e);
+        console.warn('[Login] ensure user doc step failed', redactSensitiveData({ error: e }));
       }
 
       Toast.show({
@@ -115,6 +108,7 @@ export default function LoginScreen() {
         text1: 'Login failed',
         text2: message,
       });
+      console.error('[Login] Login failed', redactSensitiveData({ email, error: e }));
     } finally {
       setLoading(false);
     }

@@ -13,6 +13,8 @@ import {
   View,
 } from 'react-native';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
+import { setDocumentSafe } from '../../src/utils/firebase-helpers';
+import { redactSensitiveData, sanitizeEmail, sanitizeText, validatePassword } from '../../src/utils/security';
 
 /**
  * Runtime-safe helpers:
@@ -20,54 +22,29 @@ import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
  * - setUserDocSafe: writes users/{uid} using native firestore if present, otherwise web SDK.
  */
 
-async function createUserSafe(email: string, password: string) {
-  // Native RN Firebase auth instance typically exposes createUserWithEmailAndPassword on the instance
-  try {
-    const a = auth as any;
-    if (a && typeof a.createUserWithEmailAndPassword === 'function') {
-      // native SDK returns a user credential-like object
-      return await a.createUserWithEmailAndPassword(email, password);
-    }
-  } catch {
-    // fallthrough to web path
+async function createUserSafe(email: string, password: string) {  
+  if (!auth) throw new Error('Auth not initialized');
+  
+  // Try native SDK first
+  const authInstance = auth as any;
+  if (authInstance && typeof authInstance.createUserWithEmailAndPassword === 'function') {
+    return await authInstance.createUserWithEmailAndPassword(email, password);
   }
 
   // Web modular fallback
   const { createUserWithEmailAndPassword } = await import('firebase/auth');
-  return await createUserWithEmailAndPassword(auth as any, email, password);
+  return await createUserWithEmailAndPassword(auth, email, password);
 }
 
 async function updateProfileSafe(user: any, profile: { displayName?: string }) {
-  try {
-    // native: user.updateProfile may exist
-    if (user && typeof user.updateProfile === 'function') {
-      await user.updateProfile(profile);
-      return;
-    }
-  } catch {
-    // fallthrough
+  if (user && typeof user.updateProfile === 'function') {
+    await user.updateProfile(profile);
+    return;
   }
 
   // web fallback
   const { updateProfile } = await import('firebase/auth');
   await updateProfile(user, profile);
-}
-
-async function setUserDocSafe(uid: string, data: any) {
-  // native Firestore: db.collection(...).doc(uid).set(...)
-  try {
-    const f = db as any;
-    if (f && typeof f.collection === 'function') {
-      // native API compatibility
-      return await f.collection('users').doc(uid).set(data);
-    }
-  } catch {
-    // fallthrough to web
-  }
-
-  // web modular fallback
-  const { doc, setDoc } = await import('firebase/firestore');
-  return await setDoc(doc(db as any, 'users', uid), data);
 }
 
 export default function SignupScreen() {
@@ -86,11 +63,23 @@ export default function SignupScreen() {
     try {
       setLoading(true);
 
+      // Validate and sanitize inputs
+      const sanitizedName = sanitizeText(name, 100);
+      const sanitizedEmail = sanitizeEmail(email);
+      
+      // Validate password strength
+      const passwordValidation = validatePassword(password);
+      if (!passwordValidation.valid) {
+        Alert.alert('Weak Password', passwordValidation.error || 'Please choose a stronger password.');
+        setLoading(false);
+        return;
+      }
+
       // Ensure Firestore network is enabled (works for both runtimes)
       await ensureFirestoreOnline();
 
       // Create auth user in a runtime-safe way
-      const cred = await createUserSafe(email.trim().toLowerCase(), password);
+      const cred = await createUserSafe(sanitizedEmail, password);
       const user = cred?.user ?? cred; // native may return different shape
       const uid = user?.uid;
       if (!uid) {
@@ -99,17 +88,18 @@ export default function SignupScreen() {
 
       // Update auth display name (runtime-safe)
       try {
-        await updateProfileSafe(user, { displayName: name });
+        await updateProfileSafe(user, { displayName: sanitizedName });
       } catch (profileErr) {
-        console.warn('[Signup] updateProfile failed', profileErr);
+        console.warn('[Signup] updateProfile failed', redactSensitiveData({ error: profileErr }));
       }
 
       // Create the Firestore user document in a runtime-safe manner
       try {
-        await setUserDocSafe(uid, {
+        if (!db) throw new Error('Database not initialized');
+        await setDocumentSafe(db, 'users', uid, {
           uid,
-          name,
-          email: email.trim().toLowerCase(),
+          name: sanitizedName,
+          email: sanitizedEmail,
           role: 'standard',
           teamId: null,
           isCoordinator: false,
@@ -119,7 +109,7 @@ export default function SignupScreen() {
       } catch (setErr) {
         // If writing the user doc fails, surface a warning but don't block login flow.
         // Dashboard/getDocument will otherwise 404; better to ensure we created the doc.
-        console.warn('[Signup] failed to create users/{uid} doc', setErr);
+        console.warn('[Signup] failed to create users/{uid} doc', redactSensitiveData({ error: setErr }));
         // Re-throw only if you want to block the flow:
         // throw setErr;
       }
@@ -127,7 +117,7 @@ export default function SignupScreen() {
       Alert.alert('Account Created', 'You can now create or join a team.');
       router.replace('/(tabs)');
     } catch (e: any) {
-      console.error('❌ Signup failed:', e);
+      console.error('❌ Signup failed:', redactSensitiveData({ email, error: e }));
       Alert.alert('Signup Failed', e?.message ?? 'Unknown error occurred.');
     } finally {
       setLoading(false);

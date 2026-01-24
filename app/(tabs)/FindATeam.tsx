@@ -6,16 +6,16 @@ import { useRouter } from 'expo-router';
 import { addDoc, collection } from 'firebase/firestore';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  Button,
-  FlatList,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Alert,
+    Button,
+    FlatList,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import { app, auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
@@ -541,6 +541,7 @@ export default function FindATeam() {
     const byLine = String(text).split('\n').map(s => s.trim()).filter(Boolean);
     if (byLine.length === 0) return '';
     const first = byLine[0];
+    if (!first) return '';
     const beforeComma = first.split(',').map(s => s.trim()).filter(Boolean)[0] ?? first;
     return beforeComma;
   };

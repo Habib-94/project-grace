@@ -3,15 +3,15 @@ import { useRouter } from 'expo-router';
 import { addDoc, collection } from 'firebase/firestore';
 import React, { useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
-  Button,
-  FlatList,
-  Modal,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
+    ActivityIndicator,
+    Button,
+    FlatList,
+    Modal,
+    Pressable,
+    StyleSheet,
+    Text,
+    TextInput,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import { app, auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
@@ -124,6 +124,7 @@ export default function FindGamesScreen() {
     const byLine = String(text).split('\n').map(s => s.trim()).filter(Boolean);
     if (byLine.length === 0) return '';
     const first = byLine[0];
+    if (!first) return '';
     const beforeComma = first.split(',').map(s => s.trim()).filter(Boolean)[0] ?? first;
     return beforeComma;
   };
