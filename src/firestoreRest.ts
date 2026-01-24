@@ -335,7 +335,7 @@ function decodeJwtPayload(token: string | null) {
   if (!token) return null;
   try {
     const parts = token.split('.');
-    if (parts.length < 2) return null;
+    if (parts.length < 3 || !parts[1]) return null;
     const payloadStr = base64UrlDecodeToString(parts[1]);
     if (!payloadStr) return null;
     try {

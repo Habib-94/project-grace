@@ -1,13 +1,14 @@
 // Safe dual-mode firebase config: prefer native @react-native-firebase when available,
 // fall back to the web modular SDK otherwise. Exports: app, auth, db, ensureFirestoreOnline.
 
-import { FirebaseApp, getApp, getApps, initializeApp } from 'firebase/app';
+import type { FirebaseApp } from 'firebase/app';
+import { getApp, getApps, initializeApp } from 'firebase/app';
 import { getAuth as getWebAuth } from 'firebase/auth';
+import type { Firestore as WebFirestore } from 'firebase/firestore';
 import {
   getFirestore as getWebFirestore,
   initializeFirestore,
   enableNetwork as webEnableNetwork,
-  Firestore as WebFirestore,
 } from 'firebase/firestore';
 
 const firebaseConfig = {

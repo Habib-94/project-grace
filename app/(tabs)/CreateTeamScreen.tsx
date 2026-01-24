@@ -22,37 +22,16 @@ import { emitAppEvent } from '../../src/appEvents';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
 import { getDocument } from '../../src/firestoreRest';
 import { geocodeAddress, getPlaceDetails } from '../../src/locations';
+import { addDocumentSafe, setDocumentSafe } from '../../src/utils/firebase-helpers';
+import {
+  rateLimiter,
+  redactSensitiveData,
+  sanitizeColor,
+  sanitizeLocation,
+  sanitizeText,
+  validateTeamName
+} from '../../src/utils/security';
 
-// NEW imports for the tutorial
-
-// runtime-safe add/update helpers (same pattern as elsewhere)
-async function addDocSafe(collectionPath: string, data: any) {
-  // Native RN Firebase style
-  if (db && typeof (db as any).collection === 'function') {
-    return (db as any).collection(collectionPath).add(data);
-  }
-
-  // Web modular SDK
-  const { collection, addDoc } = await import('firebase/firestore');
-  return addDoc(collection(db as any, collectionPath), data);
-}
-
-// runtime-safe upsert/set with merge
-async function upsertUserDoc(uid: string, data: any) {
-  // Native RN Firebase style
-  try {
-    if (db && typeof (db as any).collection === 'function') {
-      // native firestore supports .doc(uid).set(data, { merge: true })
-      return await (db as any).collection('users').doc(uid).set(data, { merge: true });
-    }
-  } catch (e) {
-    // fallthrough to web
-  }
-
-  // Web modular SDK
-  const { doc, setDoc } = await import('firebase/firestore');
-  return setDoc(doc(db as any, 'users', uid), data, { merge: true });
-}
 
 type Prediction = {
   place_id: string;
@@ -265,16 +244,45 @@ export default function CreateTeamScreen() {
       return;
     }
 
+    // Rate limiting: allow max 3 team creation attempts per hour
+    const rateLimitKey = `createTeam:${user.uid}`;
+    if (!rateLimiter.isAllowed(rateLimitKey, 3, 60 * 60 * 1000)) {
+      const resetMs = rateLimiter.getResetTime(rateLimitKey, 60 * 60 * 1000);
+      const resetMinutes = Math.ceil(resetMs / (60 * 1000));
+      Toast.show({ 
+        type: 'error', 
+        text1: 'Too many attempts', 
+        text2: `Please wait ${resetMinutes} minutes before creating another team.` 
+      });
+      return;
+    }
+
+    // Validate and sanitize team name
+    const sanitizedTeamName = sanitizeText(teamName, 50);
+    const teamNameValidation = validateTeamName(sanitizedTeamName);
+    if (!teamNameValidation.valid) {
+      Toast.show({ 
+        type: 'error', 
+        text1: 'Invalid team name', 
+        text2: teamNameValidation.error 
+      });
+      return;
+    }
+
     // Basic client-side validation for required details
-    if (!teamName || !teamName.trim() || (!pickedPlace && (!locationText || !locationText.trim()))) {
-      // More specific guidance depending on what's missing
-      if (!teamName || !teamName.trim()) {
+    if (!sanitizedTeamName || (!pickedPlace && (!locationText || !locationText.trim()))) {
+      if (!sanitizedTeamName) {
         Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please enter a team name.' });
       } else {
         Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please provide a location for the team (use "Find with Google" or enter an address).' });
       }
       return;
     }
+
+    // Sanitize location and colors
+    const sanitizedLocation = sanitizeLocation(pickedPlace?.formattedAddress ?? locationText ?? '');
+    const sanitizedHomeColor = sanitizeColor(homeColor);
+    const sanitizedAwayColor = sanitizeColor(awayColor);
 
     setLoading(true);
     try {
@@ -313,39 +321,55 @@ export default function CreateTeamScreen() {
         }
       } catch (e) {
         // If reading the user doc fails, fall back to auth profile values but still proceed with caution.
-        console.warn('[CreateTeam] failed to read users/{uid} for coordinator check', e);
+        console.warn('[CreateTeam] failed to read users/{uid} for coordinator check', redactSensitiveData({ error: e }));
         creatorName = user.displayName ?? null;
         creatorEmail = user.email ?? null;
         // Note: server-side rules will still enforce creation permissions; we surface helpful client messages when possible.
       }
 
-      const coordEntry = { uid: user.uid, name: creatorName ?? (user.displayName ?? ''), email: creatorEmail ?? (user.email ?? '') };
+      const coordEntry = { 
+        uid: user.uid, 
+        name: sanitizeText(creatorName ?? (user.displayName ?? ''), 100), 
+        email: creatorEmail ?? (user.email ?? '') 
+      };
 
-      const payload: any = {
-        teamName: teamName.trim(),
-        location: pickedPlace?.formattedAddress ?? locationText ?? '',
+      const payload: Record<string, any> = {
+        teamName: sanitizedTeamName,
+        location: sanitizedLocation,
         latitude: pickedPlace?.lat ?? null,
         longitude: pickedPlace?.lng ?? null,
-        placeId: pickedPlace?.placeId ?? '',
+        placeId: sanitizeText(pickedPlace?.placeId ?? '', 200),
         createdBy: user.uid,
         createdAt: new Date().toISOString(),
-        homeColor,
-        awayColor,
+        homeColor: sanitizedHomeColor,
+        awayColor: sanitizedAwayColor,
         // coordinator metadata (init with the creating user)
         coordinators: [coordEntry],
         coordinatorNames: [coordEntry.name ?? ''],
       };
 
-      const ref: any = await addDocSafe('teams', payload);
+      if (!db) throw new Error('Database not initialized');
+      const ref: any = await addDocumentSafe(db, 'teams', payload);
       const createdId = ref?.id ?? (typeof ref?.path === 'string' ? String(ref.path).split('/').pop() : null);
       Toast.show({ type: 'success', text1: 'Team created' });
 
       if (createdId) {
         // update the user's profile to attach them to this team and make them a coordinator
         try {
-          await upsertUserDoc(user.uid, { teamId: createdId, isCoordinator: true, email: user.email ?? '', name: creatorName ?? user.displayName ?? '' });
+          await setDocumentSafe(
+            db, 
+            'users', 
+            user.uid, 
+            { 
+              teamId: createdId, 
+              isCoordinator: true, 
+              email: user.email ?? '', 
+              name: creatorName ?? user.displayName ?? '' 
+            }, 
+            { merge: true }
+          );
         } catch (uErr) {
-          console.warn('[CreateTeam] failed to upsert users/{uid}', uErr);
+          console.warn('[CreateTeam] failed to upsert users/{uid}', redactSensitiveData({ error: uErr }));
         }
 
         // Emit an event so other screens can react (e.g., refresh lists)
@@ -357,7 +381,7 @@ export default function CreateTeamScreen() {
         router.replace('/(tabs)');
       }
     } catch (e: any) {
-      console.error('[CreateTeam] create failed', e);
+      console.error('[CreateTeam] create failed', redactSensitiveData({ teamName: sanitizedTeamName, error: e }));
       // Try to show server-provided error message when available
       const msg = e?.message ?? String(e);
       Toast.show({ type: 'error', text1: 'Create failed', text2: msg });
