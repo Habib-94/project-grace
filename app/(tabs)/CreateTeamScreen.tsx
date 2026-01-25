@@ -1,17 +1,19 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Picker } from '@react-native-picker/picker';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Button,
-  Modal,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Button,
+    Modal,
+    Platform,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
@@ -24,12 +26,12 @@ import { getDocument } from '../../src/firestoreRest';
 import { geocodeAddress, getPlaceDetails } from '../../src/locations';
 import { addDocumentSafe, setDocumentSafe } from '../../src/utils/firebase-helpers';
 import {
-  rateLimiter,
-  redactSensitiveData,
-  sanitizeColor,
-  sanitizeLocation,
-  sanitizeText,
-  validateTeamName
+    rateLimiter,
+    redactSensitiveData,
+    sanitizeColor,
+    sanitizeLocation,
+    sanitizeText,
+    validateTeamName
 } from '../../src/utils/security';
 
 
@@ -56,6 +58,7 @@ export default function CreateTeamScreen() {
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
+  const [skillLevel, setSkillLevel] = useState<'learn' | 'development' | 'experienced'>('development');
   const [loading, setLoading] = useState(false);
 
   // Block screen for existing coordinators
@@ -119,6 +122,21 @@ export default function CreateTeamScreen() {
     (process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string) ??
     (process.env.GOOGLE_MAPS_API_KEY as string) ??
     '';
+
+  // Helper: Convert skill level to rating
+  const getSkillRating = (level: 'learn' | 'development' | 'experienced'): number => {
+    // Rating range: 800 - 3000, middle = 1900
+    switch (level) {
+      case 'learn':
+        return 800; // Lowest possible
+      case 'development':
+        return 1400; // 500 below middle (1900 - 500)
+      case 'experienced':
+        return 2400; // 500 above middle (1900 + 500)
+      default:
+        return 1400;
+    }
+  };
 
   // Debounced autocomplete: fetch predictions when typing
   useEffect(() => {
@@ -343,6 +361,7 @@ export default function CreateTeamScreen() {
         createdAt: new Date().toISOString(),
         homeColor: sanitizedHomeColor,
         awayColor: sanitizedAwayColor,
+        elo: getSkillRating(skillLevel), // Set rating based on skill level
         // coordinator metadata (init with the creating user)
         coordinators: [coordEntry],
         coordinatorNames: [coordEntry.name ?? ''],
@@ -599,6 +618,27 @@ export default function CreateTeamScreen() {
         <Button title="Find with Google" onPress={handleLookupPlace} disabled={loading} />
       </View>
 
+      {/* Skill Level Selector */}
+      <View style={styles.skillLevelContainer}>
+        <Text style={styles.skillLevelLabel}>Skill Level:</Text>
+        <View style={styles.pickerContainer}>
+          <Picker
+            selectedValue={skillLevel}
+            onValueChange={(itemValue) => setSkillLevel(itemValue)}
+            style={styles.picker}
+          >
+            <Picker.Item label="Learn to Play" value="learn" />
+            <Picker.Item label="Development" value="development" />
+            <Picker.Item label="Experienced" value="experienced" />
+          </Picker>
+        </View>
+        <Text style={styles.skillLevelHint}>
+          {skillLevel === 'learn' && 'Starting rating: 800 (Beginner level)'}
+          {skillLevel === 'development' && 'Starting rating: 1,400 (Intermediate level)'}
+          {skillLevel === 'experienced' && 'Starting rating: 2,400 (Advanced level)'}
+        </Text>
+      </View>
+
       <View style={styles.kitRow}>
         <Jersey color={homeColor} label="Home" />
         <Jersey color={awayColor} label="Away" />
@@ -677,6 +717,34 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
   lookupRow: { width: '100%', marginTop: 8, marginBottom: 12 },
+  skillLevelContainer: {
+    width: '100%',
+    marginTop: 8,
+    marginBottom: 16,
+  },
+  skillLevelLabel: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 8,
+  },
+  pickerContainer: {
+    borderWidth: 1,
+    borderColor: '#ccc',
+    borderRadius: 8,
+    backgroundColor: '#fff',
+    overflow: 'hidden',
+  },
+  picker: {
+    width: '100%',
+    height: Platform.OS === 'ios' ? 120 : 50,
+  },
+  skillLevelHint: {
+    fontSize: 13,
+    color: '#666',
+    marginTop: 6,
+    fontStyle: 'italic',
+  },
   kitRow: { flexDirection: 'row', gap: 20, marginTop: 12, marginBottom: 12 },
   jerseyCard: { alignItems: 'center', width: 140 },
   jerseyBox: { width: 120, height: 120, alignItems: 'center', justifyContent: 'center' },

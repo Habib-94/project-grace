@@ -14,7 +14,7 @@ import {
 } from 'react-native';
 import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
 import { setDocumentSafe } from '../../src/utils/firebase-helpers';
-import { redactSensitiveData, sanitizeEmail, sanitizeText, validatePassword } from '../../src/utils/security';
+import { checkPasswordRequirements, redactSensitiveData, sanitizeEmail, sanitizeText, validatePassword } from '../../src/utils/security';
 
 /**
  * Runtime-safe helpers:
@@ -45,6 +45,19 @@ async function updateProfileSafe(user: any, profile: { displayName?: string }) {
   // web fallback
   const { updateProfile } = await import('firebase/auth');
   await updateProfile(user, profile);
+}
+
+function PasswordRequirement({ met, text }: { met: boolean; text: string }) {
+  return (
+    <View style={styles.requirementRow}>
+      <Text style={met ? styles.checkmark : styles.cross}>
+        {met ? '✓' : '✗'}
+      </Text>
+      <Text style={[styles.requirementText, met && styles.requirementMet]}>
+        {text}
+      </Text>
+    </View>
+  );
 }
 
 export default function SignupScreen() {
@@ -156,6 +169,24 @@ export default function SignupScreen() {
           onChangeText={setPassword}
         />
 
+        {password.length > 0 && (
+          <View style={styles.passwordRequirements}>
+            <Text style={styles.requirementsTitle}>Password Requirements:</Text>
+            <PasswordRequirement
+              met={checkPasswordRequirements(password).minLength}
+              text="At least 8 characters"
+            />
+            <PasswordRequirement
+              met={checkPasswordRequirements(password).hasUppercase}
+              text="Contains an uppercase letter"
+            />
+            <PasswordRequirement
+              met={checkPasswordRequirements(password).hasSpecialChar}
+              text="Contains a special character (!@#$%^&*)"
+            />
+          </View>
+        )}
+
         <View style={{ width: '100%', marginTop: 10 }}>
           <Button
             title={loading ? 'Creating Account…' : 'Sign Up'}
@@ -197,5 +228,42 @@ const styles = StyleSheet.create({
     width: '100%',
     padding: 12,
     marginBottom: 10,
+  },
+  passwordRequirements: {
+    width: '100%',
+    backgroundColor: '#f5f5f5',
+    borderRadius: 8,
+    padding: 12,
+    marginBottom: 10,
+  },
+  requirementsTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#333',
+    marginBottom: 8,
+  },
+  requirementRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  checkmark: {
+    color: '#4CAF50',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginRight: 8,
+  },
+  cross: {
+    color: '#F44336',
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginRight: 8,
+  },
+  requirementText: {
+    fontSize: 13,
+    color: '#666',
+  },
+  requirementMet: {
+    color: '#4CAF50',
   },
 });

@@ -3,15 +3,15 @@ import { useRouter } from 'expo-router';
 import { addDoc, collection } from 'firebase/firestore';
 import React, { useEffect, useState } from 'react';
 import {
-    ActivityIndicator,
-    Button,
-    FlatList,
-    Modal,
-    Pressable,
-    StyleSheet,
-    Text,
-    TextInput,
-    View,
+  ActivityIndicator,
+  Button,
+  FlatList,
+  Modal,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import { app, auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
@@ -653,9 +653,16 @@ export default function FindGamesScreen() {
                 <Text style={{ color: '#333' }}>Close</Text>
               </Pressable>
 
-              <Pressable onPress={requestGame} style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#0a7ea4' }} disabled={requesting}>
-                <Text style={{ color: '#fff' }}>{requesting ? 'Sending...' : 'Request Game'}</Text>
-              </Pressable>
+              {/* Show "Your Game" if current user created this game, otherwise show "Request Game" */}
+              {auth?.currentUser?.uid === selectedGame?.createdBy ? (
+                <View style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#4CAF50' }}>
+                  <Text style={{ color: '#fff', fontWeight: '600' }}>Your Game</Text>
+                </View>
+              ) : (
+                <Pressable onPress={requestGame} style={{ paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6, backgroundColor: '#0a7ea4' }} disabled={requesting}>
+                  <Text style={{ color: '#fff' }}>{requesting ? 'Sending...' : 'Request Game'}</Text>
+                </Pressable>
+              )}
             </View>
           </View>
         </View>

@@ -6,9 +6,10 @@ import { getApp, getApps, initializeApp } from 'firebase/app';
 import { getAuth as getWebAuth } from 'firebase/auth';
 import type { Firestore as WebFirestore } from 'firebase/firestore';
 import {
-  getFirestore as getWebFirestore,
-  initializeFirestore,
-  enableNetwork as webEnableNetwork,
+    CACHE_SIZE_UNLIMITED,
+    getFirestore as getWebFirestore,
+    initializeFirestore,
+    enableNetwork as webEnableNetwork,
 } from 'firebase/firestore';
 
 const firebaseConfig = {
@@ -64,7 +65,10 @@ try {
     // Try to initialize Firestore with long-polling to avoid streaming/webchannel issues on RN.
     try {
       // initializeFirestore may throw if already initialized (HMR), so guard with try/catch
-      db = initializeFirestore(app, { experimentalForceLongPolling: true } as any);
+      db = initializeFirestore(app, {
+        experimentalForceLongPolling: true,
+        cacheSizeBytes: CACHE_SIZE_UNLIMITED,
+      } as any);
     } catch (initErr) {
       db = getWebFirestore(app);
     }

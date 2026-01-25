@@ -3,16 +3,16 @@ import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  Button,
-  Modal,
-  SectionList,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View
+    ActivityIndicator,
+    Alert,
+    Button,
+    Modal,
+    SectionList,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
@@ -471,8 +471,12 @@ export default function CoordinatorDashboardScreen() {
     try {
       await ensureFirestoreOnline();
 
+      // Get requesting team data
+      const requestingTeam = req.requestingTeamId ? await getDocument(`teams/${req.requestingTeamId}`) : null;
+
       const payload: any = {
         teamId: teamData.id,
+        teamName: teamData.teamName,
         title: req.title ?? 'Game Request',
         type: req.type ?? 'home',
         startISO: req.startISO ?? new Date().toISOString(),
@@ -483,6 +487,12 @@ export default function CoordinatorDashboardScreen() {
         // prefer rating from the request (if present); otherwise leave null
         createdByRating: (req as any).requestedByRating ?? null,
         createdAt: new Date().toISOString(),
+        // Link opponent team (the team that requested the game)
+        opponentTeamId: req.requestingTeamId ?? null,
+        opponentTeamName: req.requestingTeamName ?? null,
+        homeTeamRating: teamData.elo ?? 1500,
+        awayTeamRating: requestingTeam?.elo ?? 1500,
+        completed: false,
       };
 
       if (req.kitColor) payload.kitColor = req.kitColor;
@@ -722,9 +732,30 @@ export default function CoordinatorDashboardScreen() {
   // Delete team: destructive — removes team doc + games + requests, and clears teamId for users
   const handleDeleteTeam = async () => {
     if (!user?.uid || !teamData?.id) return;
+
+    // Check for outstanding game availabilities (future games)
+    const nowMs = Date.now();
+    const outstandingGames = games.filter((g) => {
+      // Check if game has expired based on expiresAt or startISO
+      if (g.expiresAt) {
+        const t = new Date(g.expiresAt).getTime();
+        if (!isNaN(t) && t > nowMs) return true;
+      }
+      if (g.startISO) {
+        const t = new Date(g.startISO).getTime();
+        if (!isNaN(t) && t > nowMs) return true;
+      }
+      return false;
+    });
+
+    // Build warning message based on outstanding games
+    const gameWarning = outstandingGames.length > 0
+      ? `\n\nThis includes ${outstandingGames.length} outstanding game ${outstandingGames.length === 1 ? 'availability' : 'availabilities'} that will also be deleted.`
+      : '';
+
     Alert.alert(
       'Delete Team',
-      'This will permanently delete the team, its games and requests, and remove the team from member profiles. This action cannot be undone. Continue?',
+      `This will permanently delete the team, all its games${gameWarning ? ' (including active game availabilities)' : ''}, all requests, and remove the team from member profiles. This action cannot be undone.${gameWarning}\n\nContinue?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -734,29 +765,31 @@ export default function CoordinatorDashboardScreen() {
             try {
               await ensureFirestoreOnline();
 
-              // gather docs (use arrays for where)
-              // list top-level collections and filter client-side
-              const allGames = await listTopLevelCollection('games', 1000);
-              const gamesDocs = (allGames as any[]).filter((g) => g.teamId === teamData.id);
-
-              const allReqs = await listTopLevelCollection('requests', 1000);
-              const reqDocs = (allReqs as any[]).filter((r) => r.teamId === teamData.id);
-
-              const allUsers = await listTopLevelCollection('users', 1000);
-              const usersDocs = (allUsers as any[]).filter((u) => u.teamId === teamData.id);
-
               const ops: Array<{ op: 'update' | 'delete'; path: string; data?: any }> = [];
 
-              gamesDocs.forEach((g: any) => ops.push({ op: 'delete', path: `games/${g.id}` }));
-              reqDocs.forEach((r: any) => ops.push({ op: 'delete', path: `requests/${r.id}` }));
-              usersDocs.forEach((u: any) => ops.push({ op: 'update', path: `users/${u.id}`, data: { teamId: '', isCoordinator: false } }));
+              // Delete all games using the already-loaded games state
+              games.forEach((g: any) => {
+                if (g.id) ops.push({ op: 'delete', path: `games/${g.id}` });
+              });
 
-              // finally delete the team doc
+              // Delete all join requests using the already-loaded requests state
+              requests.forEach((r: any) => {
+                if (r.id) ops.push({ op: 'delete', path: `requests/${r.id}` });
+              });
+
+              // Clear current user's team association
+              ops.push({ 
+                op: 'update', 
+                path: `users/${user.uid}`, 
+                data: { teamId: '', isCoordinator: false } 
+              });
+
+              // Delete the team doc
               ops.push({ op: 'delete', path: `teams/${teamData.id}` });
 
               await runBatchSafe(ops);
 
-              Toast.show({ type: 'success', text1: 'Team deleted' });
+              Toast.show({ type: 'success', text1: 'Team deleted', text2: 'All games and requests have been removed.' });
               router.replace('/(tabs)/HomeScreen');
 
               try { emitAppEvent('team:deleted', { teamId: teamData.id }); } catch (e) {}
@@ -923,6 +956,7 @@ export default function CoordinatorDashboardScreen() {
             </View>
 
             <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginBottom: 16 }}>
+              <Button title="Game Results" onPress={() => router.push('/(tabs)/GameResultsScreen')} color="#4CAF50" />
               <Button title="Leave Team" onPress={handleLeaveTeam} color="#FF9500" />
               <Button title="Delete Team" onPress={handleDeleteTeam} color="#FF3B30" />
             </View>
