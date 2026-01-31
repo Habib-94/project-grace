@@ -464,6 +464,23 @@ export default function HomeScreen() {
           body={homeTutorialSteps[homeTutorialStep]?.body}
         />
       )}
+
+      {/* User Info Section */}
+      {user && (
+        <View style={styles.userInfoBox}>
+          <Text style={styles.userInfoTitle}>Signed in as</Text>
+          <Text style={styles.userName}>{userData?.name || user.displayName || 'User'}</Text>
+          <Text style={styles.userEmail}>{user.email}</Text>
+          {userData?.teamId && (
+            <View style={styles.userStatusBadge}>
+              <Text style={styles.userStatusText}>
+                {userData?.isCoordinator ? '👔 Coordinator' : '👤 Team Member'}
+              </Text>
+            </View>
+          )}
+        </View>
+      )}
+
       {teamData ? (
         <>
           <Text style={styles.teamName}>{teamData.teamName}</Text>
@@ -594,5 +611,47 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '500',
     textAlign: 'center',
+  },
+
+  /* User Info styles */
+  userInfoBox: {
+    width: '100%',
+    padding: 16,
+    borderRadius: 12,
+    backgroundColor: '#f0f9ff',
+    borderColor: '#0a7ea4',
+    borderWidth: 2,
+    marginBottom: 20,
+    alignItems: 'center',
+  },
+  userInfoTitle: {
+    fontSize: 12,
+    color: '#666',
+    textTransform: 'uppercase',
+    letterSpacing: 1,
+    marginBottom: 8,
+  },
+  userName: {
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#0a7ea4',
+    marginBottom: 4,
+  },
+  userEmail: {
+    fontSize: 14,
+    color: '#555',
+    marginBottom: 8,
+  },
+  userStatusBadge: {
+    backgroundColor: '#0a7ea4',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginTop: 8,
+  },
+  userStatusText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
   },
 });

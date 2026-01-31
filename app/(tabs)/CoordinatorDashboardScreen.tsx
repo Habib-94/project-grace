@@ -3,17 +3,19 @@ import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    Button,
-    Modal,
-    SectionList,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View
+  ActivityIndicator,
+  Alert,
+  Button,
+  Dimensions,
+  Modal,
+  SectionList,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
 } from 'react-native';
+import { LineChart } from 'react-native-chart-kit';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 import { emitAppEvent, onAppEvent } from '../../src/appEvents';
@@ -131,6 +133,7 @@ export default function CoordinatorDashboardScreen() {
   const autocompleteRef = useRef<any>(null);
   const [games, setGames] = useState<any[]>([]);
   const [saving, setSaving] = useState(false);
+  const [ratingHistory, setRatingHistory] = useState<Array<{ x: number; y: number; date: string }>>([]);
 
   const originalTeamRef = useRef<any>(null);
 
@@ -390,6 +393,65 @@ export default function CoordinatorDashboardScreen() {
   useEffect(() => {
     if (teamData?.id) fetchGames(teamData.id);
   }, [teamData?.id]);
+
+  // Process rating history from completed games
+  useEffect(() => {
+    if (!games || games.length === 0 || !teamData?.id) {
+      setRatingHistory([]);
+      return;
+    }
+
+    // Filter only completed games with results and rating data
+    const completedGames = games
+      .filter((g) => 
+        g.status === 'completed' && 
+        g.homeScore != null && 
+        g.awayScore != null &&
+        (g.homeNewRating != null || g.awayNewRating != null) &&
+        g.startISO
+      )
+      .sort((a, b) => {
+        const dateA = new Date(a.startISO).getTime();
+        const dateB = new Date(b.startISO).getTime();
+        return dateA - dateB;
+      });
+
+    if (completedGames.length === 0) {
+      setRatingHistory([]);
+      return;
+    }
+
+    const history: Array<{ x: number; y: number; date: string }> = [];
+    
+    // Add starting rating as first point if we have an initial ELO
+    if (teamData.elo != null) {
+      const firstGameDate = new Date(completedGames[0].startISO);
+      // Add a point for the initial rating slightly before the first game
+      history.push({
+        x: 0,
+        y: teamData.elo,
+        date: 'Initial',
+      });
+    }
+
+    // Build history from completed games
+    completedGames.forEach((game, index) => {
+      // Determine if this team was home or away
+      const isHomeTeam = game.homeTeamId === teamData.id || game.teamId === teamData.id;
+      const rating = isHomeTeam ? game.homeNewRating : game.awayNewRating;
+      
+      if (rating != null) {
+        const gameDate = new Date(game.startISO);
+        history.push({
+          x: index + 1,
+          y: rating,
+          date: gameDate.toLocaleDateString(),
+        });
+      }
+    });
+
+    setRatingHistory(history);
+  }, [games, teamData?.id, teamData?.elo]);
 
   // --- Game request types + state ---
   interface GameRequest {
@@ -936,6 +998,47 @@ export default function CoordinatorDashboardScreen() {
           <>
             <Text style={styles.title}>Coordinator Dashboard</Text>
 
+            {/* Rating History Chart */}
+            {ratingHistory.length > 0 && (
+              <View style={styles.chartContainer}>
+                <Text style={styles.chartTitle}>Rating History</Text>
+                <LineChart
+                  data={{
+                    labels: ratingHistory.map((_, i) => i === 0 ? 'Start' : i.toString()),
+                    datasets: [{
+                      data: ratingHistory.map(d => d.y),
+                    }],
+                  }}
+                  width={Dimensions.get('window').width - 40}
+                  height={220}
+                  chartConfig={{
+                    backgroundColor: '#ffffff',
+                    backgroundGradientFrom: '#f9f9f9',
+                    backgroundGradientTo: '#f9f9f9',
+                    decimalPlaces: 0,
+                    color: (opacity = 1) => `rgba(10, 126, 164, ${opacity})`,
+                    labelColor: (opacity = 1) => `rgba(0, 0, 0, ${opacity})`,
+                    style: {
+                      borderRadius: 16,
+                    },
+                    propsForDots: {
+                      r: '4',
+                      strokeWidth: '2',
+                      stroke: '#0a7ea4',
+                    },
+                  }}
+                  bezier
+                  style={{
+                    marginVertical: 8,
+                    borderRadius: 16,
+                  }}
+                />
+                <Text style={styles.chartSubtext}>
+                  Current: {Math.round(teamData?.elo ?? 1500)} | Games: {ratingHistory.length - 1}
+                </Text>
+              </View>
+            )}
+
             <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 10, marginBottom: 12 }}>
               {!editing ? (
                 <Button
@@ -1199,6 +1302,28 @@ const styles = StyleSheet.create({
   listPanel: {
     maxHeight: 220,
     marginBottom: 12,
+  },
+  chartContainer: {
+    marginBottom: 20,
+    paddingVertical: 16,
+    paddingHorizontal: 8,
+    backgroundColor: '#f9f9f9',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+  },
+  chartTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#0a7ea4',
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  chartSubtext: {
+    fontSize: 12,
+    color: '#666',
+    textAlign: 'center',
+    marginTop: 8,
   },
 });
 

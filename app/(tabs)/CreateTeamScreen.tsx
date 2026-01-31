@@ -4,16 +4,16 @@ import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-    ActivityIndicator,
-    Button,
-    Modal,
-    Platform,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Button,
+  Modal,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
@@ -26,12 +26,12 @@ import { getDocument } from '../../src/firestoreRest';
 import { geocodeAddress, getPlaceDetails } from '../../src/locations';
 import { addDocumentSafe, setDocumentSafe } from '../../src/utils/firebase-helpers';
 import {
-    rateLimiter,
-    redactSensitiveData,
-    sanitizeColor,
-    sanitizeLocation,
-    sanitizeText,
-    validateTeamName
+  rateLimiter,
+  redactSensitiveData,
+  sanitizeColor,
+  sanitizeLocation,
+  sanitizeText,
+  validateTeamName
 } from '../../src/utils/security';
 
 
@@ -55,6 +55,7 @@ export default function CreateTeamScreen() {
     lat?: number;
     lng?: number;
   } | null>(null);
+  const [showMapPreview, setShowMapPreview] = useState(false);
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
@@ -245,6 +246,8 @@ export default function CreateTeamScreen() {
         setLocationText(res.formattedAddress ?? res.name ?? locationText.trim());
         Toast.show({ type: 'success', text1: 'Location found', text2: res.formattedAddress ?? res.name });
         setPredictions([]);
+        // Show map preview
+        setShowMapPreview(true);
       }
     } catch (e: any) {
       console.warn('[CreateTeam] geocodeAddress failed', e);
@@ -527,9 +530,8 @@ export default function CreateTeamScreen() {
 
   // otherwise continue to render the normal create team UI...
   return (
-    <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
-      <Text style={styles.title}>Create a New Team</Text>
-
+    <>
+      {/* Modals outside ScrollView for proper overlay behavior */}
       {/* Create Team tutorial (one-shot per user) */}
       {createTeamTutorialVisible && (
         <TutorialModal
@@ -567,26 +569,94 @@ export default function CreateTeamScreen() {
         />
       )}
 
-      <TextInput
-        style={styles.input}
-        placeholder="Team Name"
-        value={teamName}
-        onChangeText={setTeamName}
-      />
+      {/* Color Picker Modal */}
+      <Modal visible={!!activePicker} animationType="slide" onRequestClose={() => setActivePicker(null)}>
+        <View style={styles.modalContainer}>
+          <Text style={styles.modalTitle}>
+            Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
+          </Text>
+          <ColorPicker
+            color={activePicker === 'home' ? homeColor : awayColor}
+            onColorChangeComplete={(color: string) => {
+              if (activePicker === 'home') setHomeColor(color);
+              else setAwayColor(color);
+            }}
+            thumbSize={30}
+            sliderSize={30}
+            noSnap
+            row={false}
+            swatches
+          />
+          <View style={{ marginTop: 12 }}>
+            <Button title="Done" onPress={() => setActivePicker(null)} />
+          </View>
+        </View>
+      </Modal>
 
-      <View style={{ width: '100%' }}>
+      {/* Google Maps Preview Modal */}
+      <Modal visible={showMapPreview} animationType="slide" onRequestClose={() => setShowMapPreview(false)}>
+        <View style={styles.mapModalContainer}>
+          <View style={styles.mapModalHeader}>
+            <Text style={styles.mapModalTitle}>Location Preview</Text>
+            <TouchableOpacity onPress={() => setShowMapPreview(false)} style={styles.closeButton}>
+              <Text style={styles.closeButtonText}>✕</Text>
+            </TouchableOpacity>
+          </View>
+          
+          {pickedPlace?.lat && pickedPlace?.lng ? (
+            <>
+              <View style={styles.mapContainer}>
+                <ExpoImage
+                  source={{
+                    uri: `https://maps.googleapis.com/maps/api/staticmap?center=${pickedPlace.lat},${pickedPlace.lng}&zoom=15&size=600x400&markers=color:red%7C${pickedPlace.lat},${pickedPlace.lng}&key=${API_KEY}`,
+                  }}
+                  style={styles.mapImage}
+                  contentFit="cover"
+                />
+              </View>
+              <View style={styles.mapInfoContainer}>
+                <Text style={styles.mapInfoText}>{pickedPlace.formattedAddress ?? pickedPlace.name}</Text>
+              </View>
+              <View style={styles.mapModalButtons}>
+                <TouchableOpacity 
+                  style={[styles.mapButton, styles.confirmButton]} 
+                  onPress={() => setShowMapPreview(false)}
+                >
+                  <Text style={styles.confirmButtonText}>Confirm Location</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          ) : (
+            <View style={styles.center}>
+              <Text>No location data available</Text>
+            </View>
+          )}
+        </View>
+      </Modal>
+
+      <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+        <Text style={styles.title}>Create a New Team</Text>
+
         <TextInput
           style={styles.input}
-          placeholder="Location (rink or arena)"
-          value={locationText}
-          onChangeText={(text) => {
-            setLocationText(text);
-            // If typing after a pickedPlace, clear the picked place so user can choose a different location
-            if (pickedPlace && (pickedPlace.formattedAddress !== text && pickedPlace.name !== text)) {
-              setPickedPlace(null);
-            }
-          }}
+          placeholder="Team Name"
+          value={teamName}
+          onChangeText={setTeamName}
         />
+
+        <View style={{ width: '100%' }}>
+          <TextInput
+            style={styles.input}
+            placeholder="Location (rink or arena)"
+            value={locationText}
+            onChangeText={(text) => {
+              setLocationText(text);
+              // If typing after a pickedPlace, clear the picked place so user can choose a different location
+              if (pickedPlace && (pickedPlace.formattedAddress !== text && pickedPlace.name !== text)) {
+                setPickedPlace(null);
+              }
+            }}
+          />
 
         {/* Inline suggestions */}
         {loadingPredictions ? (
@@ -644,30 +714,6 @@ export default function CreateTeamScreen() {
         <Jersey color={awayColor} label="Away" />
       </View>
 
-      {/* Color Picker Modal */}
-      <Modal visible={!!activePicker} animationType="slide" onRequestClose={() => setActivePicker(null)}>
-        <View style={styles.modalContainer}>
-          <Text style={styles.modalTitle}>
-            Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
-          </Text>
-          <ColorPicker
-            color={activePicker === 'home' ? homeColor : awayColor}
-            onColorChangeComplete={(color: string) => {
-              if (activePicker === 'home') setHomeColor(color);
-              else setAwayColor(color);
-            }}
-            thumbSize={30}
-            sliderSize={30}
-            noSnap
-            row={false}
-            swatches
-          />
-          <View style={{ marginTop: 12 }}>
-            <Button title="Done" onPress={() => setActivePicker(null)} />
-          </View>
-        </View>
-      </Modal>
-
       <View style={{ marginTop: 20 }}>
         <Button
           title={loading ? 'Creating...' : 'Create Team'}
@@ -678,18 +724,8 @@ export default function CreateTeamScreen() {
       </View>
 
       {loading ? <ActivityIndicator style={{ marginTop: 10 }} /> : null}
-
-      {pickedPlace ? (
-        <View style={{ marginTop: 12 }}>
-          <Text style={{ fontWeight: '600' }}>Selected</Text>
-          <Text>{pickedPlace.name ?? pickedPlace.formattedAddress}</Text>
-          <Text style={{ color: '#666' }}>{pickedPlace.formattedAddress}</Text>
-          <Text style={{ color: '#666' }}>
-            {pickedPlace.lat ?? 'n/a'}, {pickedPlace.lng ?? 'n/a'}
-          </Text>
-        </View>
-      ) : null}
     </ScrollView>
+    </>
   );
 }
 
@@ -796,4 +832,68 @@ const styles = StyleSheet.create({
   },
 
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+  
+  mapModalContainer: {
+    flex: 1,
+    backgroundColor: '#fff',
+  },
+  mapModalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#eee',
+  },
+  mapModalTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: '#0a7ea4',
+  },
+  closeButton: {
+    padding: 8,
+  },
+  closeButtonText: {
+    fontSize: 24,
+    color: '#666',
+    fontWeight: '300',
+  },
+  mapContainer: {
+    flex: 1,
+    margin: 16,
+    borderRadius: 12,
+    overflow: 'hidden',
+    borderWidth: 1,
+    borderColor: '#ddd',
+  },
+  mapImage: {
+    width: '100%',
+    height: '100%',
+  },
+  mapInfoContainer: {
+    padding: 16,
+    backgroundColor: '#f9f9f9',
+  },
+  mapInfoText: {
+    fontSize: 14,
+    color: '#333',
+    textAlign: 'center',
+  },
+  mapModalButtons: {
+    padding: 16,
+    paddingBottom: 32,
+  },
+  mapButton: {
+    padding: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  confirmButton: {
+    backgroundColor: '#0a7ea4',
+  },
+  confirmButtonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+  },
 });
