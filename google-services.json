@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "646265469239",
+    "project_id": "project-grace-475412",
+    "storage_bucket": "project-grace-475412.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:646265469239:android:b0fa646716cd912deb02b2",
+        "android_client_info": {
+          "package_name": "com.projectgrace.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC0ZosmSPU1_KTd-eSAlZdCN2S_oSYQ3-Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
