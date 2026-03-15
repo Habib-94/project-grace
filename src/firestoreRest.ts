@@ -27,53 +27,6 @@ if (!PROJECT_ID) {
 // Temporary diagnostic: log key values so we can verify env at runtime
 console.log('[firestoreRest] PROJECT_ID=', PROJECT_ID, 'API_KEY present=', !!API_KEY, 'firebaseApp.options=', (firebaseApp as any)?.options ?? null);
 
-async function getAuthToken(): Promise<string | null> {
-  try {
-    const a = auth as any;
-
-    // If there is a currentUser, try to get a fresh id token first.
-    const user = a?.currentUser ?? null;
-    if (user) {
-      // try forced refresh when available (helps if token expired or missing)
-      if (typeof user.getIdToken === 'function') {
-        try {
-          const token = await user.getIdToken(true); // force refresh
-          if (typeof token === 'string' && token.length) return token;
-        } catch (e) {
-          // fallback to non-forced getIdToken
-          try {
-            const token = await user.getIdToken();
-            if (typeof token === 'string' && token.length) return token;
-          } catch {
-            // continue to other fallbacks
-          }
-        }
-      }
-
-      // Some native SDKs expose different helpers, try common alternatives
-      if (typeof a.getIdToken === 'function') {
-        try {
-          const token = await a.getIdToken();
-          if (typeof token === 'string' && token.length) return token;
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    // No user or couldn't fetch token
-  } catch (e) {
-    // ignore and return null below
-  }
-  return null;
-}
-
-function buildHeaders(withJson = true) {
-  const headers: Record<string, string> = {};
-  if (withJson) headers['Content-Type'] = 'application/json';
-  return headers;
-}
-
 async function fetchWithAuth(url: string, opts: RequestInit = {}) {
   // Attach ID token if available, else fall back to API_KEY if present
   const headers: Record<string, string> = { ...(opts.headers as Record<string, string> || {}), 'Content-Type': 'application/json' };
@@ -159,30 +112,6 @@ function parseDocumentJson(docJson: any) {
     }
   }
   return parsed;
-}
-
-function parseValue(v: any): any {
-  if (v === null || v === undefined) return null;
-  if (v.stringValue !== undefined) return v.stringValue;
-  if (v.integerValue !== undefined) return Number(v.integerValue);
-  if (v.doubleValue !== undefined) return Number(v.doubleValue);
-  if (v.booleanValue !== undefined) return v.booleanValue;
-  if (v.nullValue !== undefined) return null;
-  if (v.mapValue) {
-    const obj: Record<string, any> = {};
-    const mapFields = v.mapValue.fields ?? {};
-    for (const [k, vv] of Object.entries(mapFields)) obj[k] = parseValue(vv as any);
-    return obj;
-  }
-  if (v.arrayValue) {
-    const a = v.arrayValue.values ?? [];
-    return a.map((item: any) => parseValue(item));
-  }
-  // timestampValue, geoPointValue, referenceValue etc. Return raw for now
-  if (v.timestampValue) return v.timestampValue;
-  if (v.geoPointValue) return { lat: Number(v.geoPointValue.latitude), lng: Number(v.geoPointValue.longitude) };
-  if (v.referenceValue) return v.referenceValue;
-  return v;
 }
 
 /**
