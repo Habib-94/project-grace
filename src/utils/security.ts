@@ -86,7 +86,22 @@ export function validatePassword(password: string): { valid: boolean; error?: st
     return { valid: false, error: 'Password must contain at least one number' };
   }
   
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
+    return { valid: false, error: 'Password must contain at least one special character' };
+  }
+  
   return { valid: true };
+}
+
+/**
+ * Check individual password requirements for UI feedback
+ */
+export function checkPasswordRequirements(password: string) {
+  return {
+    minLength: password.length >= 8,
+    hasUppercase: /[A-Z]/.test(password),
+    hasSpecialChar: /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password),
+  };
 }
 
 /**

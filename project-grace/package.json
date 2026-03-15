@@ -1,0 +1,14 @@
+{
+  "name": "project-grace",
+  "version": "1.0.0",
+  "scripts": {
+    "test": "jest"
+  },
+  "dependencies": {
+    "firebase": "^9.0.0"
+  },
+  "devDependencies": {
+    "@firebase/testing": "^0.20.0",
+    "jest": "^27.0.0"
+  }
+}

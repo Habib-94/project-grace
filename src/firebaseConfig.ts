@@ -4,11 +4,10 @@
 import type { FirebaseApp } from 'firebase/app';
 import { getApp, getApps, initializeApp } from 'firebase/app';
 import { getAuth as getWebAuth } from 'firebase/auth';
-import type { Firestore as WebFirestore } from 'firebase/firestore';
 import {
-  getFirestore as getWebFirestore,
-  initializeFirestore,
-  enableNetwork as webEnableNetwork,
+    CACHE_SIZE_UNLIMITED,
+    getFirestore as getWebFirestore,
+    initializeFirestore
 } from 'firebase/firestore';
 
 const firebaseConfig = {
@@ -61,12 +60,18 @@ try {
   try {
     auth = getWebAuth(app);
 
-    // Try to initialize Firestore with long-polling to avoid streaming/webchannel issues on RN.
+    // Use experimentalForceLongPolling for React Native compatibility
+    // BUT we will NOT call enableNetwork on it to avoid state errors
     try {
-      // initializeFirestore may throw if already initialized (HMR), so guard with try/catch
-      db = initializeFirestore(app, { experimentalForceLongPolling: true } as any);
+      db = initializeFirestore(app, {
+        experimentalForceLongPolling: true,
+        cacheSizeBytes: CACHE_SIZE_UNLIMITED,
+      } as any);
+      console.log('[firebaseConfig] Using web firebase SDK (auth + firestore) with long-polling');
     } catch (initErr) {
+      // Already initialized (HMR), get existing instance
       db = getWebFirestore(app);
+      console.log('[firebaseConfig] Using existing web firestore instance');
     }
 
     console.log('[firebaseConfig] Using web firebase SDK (auth + firestore)');
@@ -83,12 +88,27 @@ try {
 
 /**
  * ensureFirestoreOnline - works for both native and web Firestore objects.
- * - For web SDK: calls firebase.firestore.enableNetwork(db)
+ * - For web SDK: NO-OP (already online with long-polling)
  * - For native @react-native-firebase: calls db().enableNetwork() if available
  */
+let isEnsuringOnline = false;
+let lastEnsureTime = 0;
+const ENSURE_COOLDOWN = 1000; // 1 second cooldown between calls
+let isWebSDK = false; // track which SDK we're using
+
 export async function ensureFirestoreOnline(): Promise<void> {
   try {
     if (!db) return;
+
+    // Prevent concurrent calls and rate limit
+    const now = Date.now();
+    if (isEnsuringOnline || (now - lastEnsureTime) < ENSURE_COOLDOWN) {
+      console.log('[firebaseConfig] ensureFirestoreOnline: skipping (already in progress or on cooldown)');
+      return;
+    }
+
+    isEnsuringOnline = true;
+    lastEnsureTime = now;
 
     // Native @react-native-firebase/firestore: instance is a function-like object where methods live on it
     if (typeof (db as any).enableNetwork === 'function') {
@@ -100,17 +120,14 @@ export async function ensureFirestoreOnline(): Promise<void> {
       return;
     }
 
-    // Web SDK: use enableNetwork exported helper
-    if (typeof webEnableNetwork === 'function') {
-      await webEnableNetwork(db as WebFirestore);
-      await new Promise((r) => setTimeout(r, 50));
-      console.log('[firebaseConfig] Firestore (web) network enabled');
-      return;
-    }
-
-    console.warn('[firebaseConfig] ensureFirestoreOnline: unknown Firestore instance shape; no-op');
+    // Web SDK: skip enableNetwork call to avoid internal state errors
+    // The web SDK with experimentalForceLongPolling is already online by default
+    console.log('[firebaseConfig] Firestore (web) - skipping enableNetwork (already online with long-polling)');
+    return;
   } catch (err) {
     console.warn('[firebaseConfig] ensureFirestoreOnline error', err);
+  } finally {
+    isEnsuringOnline = false;
   }
 }
 

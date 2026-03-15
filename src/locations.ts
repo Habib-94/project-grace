@@ -1,12 +1,12 @@
 // Small helper for Google Places / Geocoding + distance calculation.
-// Relies on process/env or Expo Constants for GOOGLE_MAPS_API_KEY.
+// Relies on process/env or Expo Constants for EXPO_PUBLIC_GOOGLE_MAPS_API_KEY.
 
 import Constants from 'expo-constants';
 
-const API_KEY = (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? (process.env.GOOGLE_MAPS_API_KEY as string) ?? '';
+const API_KEY = (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? (process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string) ?? '';
 
 if (!API_KEY) {
-  console.warn('[location] No GOOGLE_MAPS_API_KEY found in expo config or env. Place/Geocode requests will fail.');
+  console.warn('[location] No EXPO_PUBLIC_GOOGLE_MAPS_API_KEY found in expo config or env. Place/Geocode requests will fail.');
 }
 
 type PlaceDetails = {
