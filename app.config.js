@@ -52,8 +52,9 @@ module.exports = ({ config }) => withGoogleMapsKey({
   },
   android: {
     adaptiveIcon: {
-      foregroundImage: './assets/images/adaptive-icon.png',
-      backgroundColor: '#ffffff',
+      foregroundImage: './assets/images/android-icon-foreground.png',
+      backgroundImage: './assets/images/android-icon-background.png',
+      monochromeImage: './assets/images/android-icon-monochrome.png',
     },
     package: 'com.projectgrace.app',
     googleServicesFile: process.env.GOOGLE_SERVICES_JSON ?? './google-services.json',
