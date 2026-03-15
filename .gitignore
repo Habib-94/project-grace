@@ -23,7 +23,6 @@ ios/
 # Firebase / Google Services
 # google-services.json is committed — it's client-side config that's included in the APK anyway.
 # The actual security is enforced by Firebase security rules, not this file.
-GoogleService-Info.plist
 service-account.json
 firebase-adminsdk-*.json
 
@@ -59,7 +58,6 @@ InternalBytecode.js
 .env
 .env.local
 .env.production
-GoogleService-Info.plist
 service-account.json
 *.keystore
 *.jks
