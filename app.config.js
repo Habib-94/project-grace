@@ -48,7 +48,7 @@ module.exports = ({ config }) => withGoogleMapsKey({
   ios: {
     supportsTablet: true,
     bundleIdentifier: 'com.projectgrace.app',
-    googleServicesFile: process.env.GOOGLE_SERVICES_PLIST ?? './GoogleService-Info.plist',
+    googleServicesFile: './GoogleService-Info.plist',
   },
   android: {
     adaptiveIcon: {
