@@ -1,11 +1,11 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import firestore from '@react-native-firebase/firestore';
 import { Picker } from '@react-native-picker/picker';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Button,
   Modal,
   Platform,
   ScrollView,
@@ -18,22 +18,20 @@ import {
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
-import TutorialModal from '@/components/TutorialModal';
-import Constants from 'expo-constants';
-import { emitAppEvent } from '../../src/appEvents';
-import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
-import { getDocument } from '../../src/firestoreRest';
-import { geocodeAddress, getPlaceDetails } from '../../src/locations';
-import { addDocumentSafe, setDocumentSafe } from '../../src/utils/firebase-helpers';
+import { useAuth } from '@/context/AuthContext';
+import { emitAppEvent } from '@/src/appEvents';
+import TutorialModal from '@/src/components/TutorialModal';
+import { geocodeAddress, getPlaceDetails } from '@/src/locations';
 import {
   rateLimiter,
-  redactSensitiveData,
   sanitizeColor,
   sanitizeLocation,
   sanitizeText,
-  validateTeamName
-} from '../../src/utils/security';
+  validateTeamName,
+} from '@/src/utils/security';
+import Constants from 'expo-constants';
 
+const API_KEY = (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? '';
 
 type Prediction = {
   place_id: string;
@@ -41,11 +39,35 @@ type Prediction = {
   structured_formatting?: { main_text?: string; secondary_text?: string };
 };
 
+type SkillLevel = 'learn' | 'development' | 'experienced';
+
+function getSkillRating(level: SkillLevel): number {
+  switch (level) {
+    case 'learn': return 800;
+    case 'development': return 1400;
+    case 'experienced': return 2400;
+  }
+}
+
+const TUTORIAL_STEPS = [
+  {
+    title: 'Create a team',
+    body: 'Give your team a name and pick a location (rink or arena). Use "Find with Google" to quickly select a place. Choose your Home and Away kit colours and then tap Create Team.',
+    size: 'small' as const,
+    primaryLabel: 'Next',
+  },
+  {
+    title: 'After creating',
+    body: 'You will become the Coordinator for the team. Coordinators can invite members, manage requests, and schedule games from the Manage Team screen.',
+    size: 'small' as const,
+    primaryLabel: 'Got it',
+  },
+];
+
 export default function CreateTeamScreen() {
   const router = useRouter();
-  const user = auth?.currentUser ?? null;
+  const { user } = useAuth();
 
-  // Stable initial states (avoid undefined issues)
   const [teamName, setTeamName] = useState('');
   const [locationText, setLocationText] = useState('');
   const [pickedPlace, setPickedPlace] = useState<{
@@ -59,133 +81,82 @@ export default function CreateTeamScreen() {
   const [homeColor, setHomeColor] = useState('#0a7ea4');
   const [awayColor, setAwayColor] = useState('#ffffff');
   const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
-  const [skillLevel, setSkillLevel] = useState<'learn' | 'development' | 'experienced'>('development');
+  const [skillLevel, setSkillLevel] = useState<SkillLevel>('development');
   const [loading, setLoading] = useState(false);
-
-  // Block screen for existing coordinators
   const [createTeamBlocked, setCreateTeamBlocked] = useState(false);
-  const [blockedTeamId, setBlockedTeamId] = useState<string | null>(null);
-  // human-friendly team name to show instead of raw id when available
   const [blockedTeamName, setBlockedTeamName] = useState<string | null>(null);
-
-  // Tutorial state (one-shot per user for Create Team)
-  const [createTeamTutorialVisible, setCreateTeamTutorialVisible] = useState(false);
-  const [createTeamTutorialStep, setCreateTeamTutorialStep] = useState(0);
-
-  const newTeamTutorialKey = (uid?: string) => `tutorial_seen:${uid ?? 'anon'}:create_team`;
-
-  const createTeamTutorialSteps = [
-    {
-      title: 'Create a team',
-      body:
-        'Give your team a name and pick a location (rink or arena). Use "Find with Google" to quickly select a place. ' +
-        'Choose your Home and Away kit colours and then tap Create Team.',
-      size: 'small' as const,
-      primaryLabel: 'Next',
-    },
-    {
-      title: 'After creating',
-      body:
-        'You will become the Coordinator for the team. Coordinators can invite members, manage requests, and schedule games from the Manage Team screen.',
-      size: 'small' as const,
-      primaryLabel: 'Got it',
-    },
-  ];
-
-  useEffect(() => {
-    let mounted = true;
-    async function maybeShow() {
-      try {
-        const uid = auth?.currentUser?.uid ?? null;
-        if (!uid) return;
-        const seen = await AsyncStorage.getItem(newTeamTutorialKey(uid));
-        if (seen) return;
-        if (!mounted) return;
-        setCreateTeamTutorialVisible(true);
-      } catch (e) {
-        console.warn('create-team tutorial check failed', e);
-      }
-    }
-    maybeShow();
-    return () => { mounted = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Autocomplete state (required by fetchPredictions / suggestions UI)
+  const [tutorialVisible, setTutorialVisible] = useState(false);
+  const [tutorialStep, setTutorialStep] = useState(0);
   const [predictions, setPredictions] = useState<Prediction[]>([]);
   const [loadingPredictions, setLoadingPredictions] = useState(false);
+
   const acAbortRef = useRef<AbortController | null>(null);
-  const debounceRef = useRef<any>(null);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // derive API key (same source as src/locations.ts)
-  const API_KEY =
-    (Constants.expoConfig?.extra?.googleMapsApiKey as string) ??
-    (process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY as string) ??
-    (process.env.GOOGLE_MAPS_API_KEY as string) ??
-    '';
+  const tutorialKey = user?.uid ? `tutorial_seen:${user.uid}:create_team` : null;
 
-  // Helper: Convert skill level to rating
-  const getSkillRating = (level: 'learn' | 'development' | 'experienced'): number => {
-    // Rating range: 800 - 3000, middle = 1900
-    switch (level) {
-      case 'learn':
-        return 800; // Lowest possible
-      case 'development':
-        return 1400; // 500 below middle (1900 - 500)
-      case 'experienced':
-        return 2400; // 500 above middle (1900 + 500)
-      default:
-        return 1400;
-    }
+  // ── Tutorial one-shot ──────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!tutorialKey) return;
+    AsyncStorage.getItem(tutorialKey)
+      .then((seen) => { if (!seen) setTutorialVisible(true); })
+      .catch(console.warn);
+  }, [tutorialKey]);
+
+  const dismissTutorial = async () => {
+    try { if (tutorialKey) await AsyncStorage.setItem(tutorialKey, '1'); } catch {}
+    setTutorialVisible(false);
+    setTutorialStep(0);
   };
 
-  // Debounced autocomplete: fetch predictions when typing
+  // ── Coordinator check ──────────────────────────────────────────────────────
+
   useEffect(() => {
-    // If user already picked a place that matches the text, don't show predictions
+    if (!user?.uid) return;
+    let mounted = true;
+
+    firestore().collection('users').doc(user.uid).get().then(async (snap) => {
+      if (!mounted || !snap.exists) return;
+      const data = snap.data()!;
+      if (data.isCoordinator) {
+        setCreateTeamBlocked(true);
+        if (data.teamId) {
+          try {
+            const teamSnap = await firestore().collection('teams').doc(data.teamId as string).get();
+            if (mounted) setBlockedTeamName((teamSnap.data()?.teamName as string) ?? null);
+          } catch {}
+        }
+      }
+    }).catch(console.warn);
+
+    return () => { mounted = false; };
+  }, [user?.uid]);
+
+  // ── Autocomplete ───────────────────────────────────────────────────────────
+
+  useEffect(() => {
     if (!locationText || pickedPlace?.formattedAddress === locationText || pickedPlace?.name === locationText) {
       setPredictions([]);
-      setLoadingPredictions(false);
       return;
     }
-
-    // clear previous debounce
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    // small debounce so we don't hit quota while user types
-    debounceRef.current = setTimeout(() => {
-      fetchPredictions(locationText);
-    }, 300);
-
+    debounceRef.current = setTimeout(() => fetchPredictions(locationText), 300);
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
-      if (acAbortRef.current) {
-        try { acAbortRef.current.abort(); } catch {}
-        acAbortRef.current = null;
-      }
+      acAbortRef.current?.abort();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [locationText]);
 
   async function fetchPredictions(input: string) {
+    if (!API_KEY || input.trim().length < 2) return;
     setLoadingPredictions(true);
-    setPredictions([]);
-    if (!API_KEY || !input || input.trim().length < 2) {
-      setLoadingPredictions(false);
-      return;
-    }
-
-    // Abort previous request if any
-    if (acAbortRef.current) {
-      try { acAbortRef.current.abort(); } catch {}
-      acAbortRef.current = null;
-    }
+    acAbortRef.current?.abort();
     const ac = new AbortController();
     acAbortRef.current = ac;
-
     try {
-      const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(
-        input
-      )}&types=establishment&language=en&key=${API_KEY}`;
-
+      const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=establishment&language=en&key=${API_KEY}`;
       const res = await fetch(url, { signal: ac.signal });
       const json = await res.json();
       if (json?.status === 'OK' && Array.isArray(json.predictions)) {
@@ -193,45 +164,34 @@ export default function CreateTeamScreen() {
       } else {
         setPredictions([]);
       }
-    } catch (e: any) {
-      if (e?.name === 'AbortError') {
-        // ignore
-      } else {
-        console.warn('[CreateTeam] autocomplete fetch failed', e);
-      }
+    } catch (e: unknown) {
+      if ((e as { name?: string })?.name !== 'AbortError') console.warn('[CreateTeam] autocomplete failed', e);
       setPredictions([]);
     } finally {
       setLoadingPredictions(false);
-      acAbortRef.current = null;
     }
   }
 
-  // When user picks a prediction, fetch details and set pickedPlace
   const handleSelectPrediction = async (p: Prediction) => {
     setLoading(true);
     try {
       const details = await getPlaceDetails(p.place_id);
-      if (!details) {
-        setLocationText(p.description);
-        setPickedPlace(null);
-        Toast.show({ type: 'info', text1: 'Selected place', text2: p.description });
-      } else {
+      if (details) {
         setPickedPlace(details);
-        const display = details.formattedAddress ?? details.name ?? p.description;
-        setLocationText(display);
-        Toast.show({ type: 'success', text1: 'Location selected', text2: display });
+        setLocationText(details.formattedAddress ?? details.name ?? p.description);
+      } else {
+        setLocationText(p.description);
       }
       setPredictions([]);
-    } catch (e: any) {
-      console.warn('[CreateTeam] select prediction failed', e);
-      Toast.show({ type: 'error', text1: 'Lookup failed', text2: e?.message ?? String(e) });
+    } catch (e: unknown) {
+      Toast.show({ type: 'error', text1: 'Lookup failed' });
     } finally {
       setLoading(false);
     }
   };
 
   const handleLookupPlace = async () => {
-    if (!locationText || locationText.trim().length < 3) {
+    if (locationText.trim().length < 3) {
       Toast.show({ type: 'info', text1: 'Enter an address or rink name first' });
       return;
     }
@@ -240,341 +200,158 @@ export default function CreateTeamScreen() {
       const res = await geocodeAddress(locationText.trim());
       if (!res) {
         Toast.show({ type: 'error', text1: 'No results', text2: 'Google did not return a match.' });
-        setPickedPlace(null);
       } else {
         setPickedPlace(res);
         setLocationText(res.formattedAddress ?? res.name ?? locationText.trim());
-        Toast.show({ type: 'success', text1: 'Location found', text2: res.formattedAddress ?? res.name });
         setPredictions([]);
-        // Show map preview
         setShowMapPreview(true);
       }
-    } catch (e: any) {
-      console.warn('[CreateTeam] geocodeAddress failed', e);
-      Toast.show({ type: 'error', text1: 'Lookup failed', text2: e?.message ?? String(e) });
+    } catch (e: unknown) {
+      Toast.show({ type: 'error', text1: 'Lookup failed' });
     } finally {
       setLoading(false);
     }
   };
 
-  // Rewritten handler with validation and clear error messages
+  // ── Create team ────────────────────────────────────────────────────────────
+
   const handleCreateTeam = async () => {
     if (!user) {
-      Toast.show({ type: 'error', text1: 'Sign in required', text2: 'You must sign in to create a team.' });
+      Toast.show({ type: 'error', text1: 'Sign in required' });
       router.replace('/(auth)/LoginScreen');
       return;
     }
 
-    // Rate limiting: allow max 3 team creation attempts per hour
-    const rateLimitKey = `createTeam:${user.uid}`;
-    if (!rateLimiter.isAllowed(rateLimitKey, 3, 60 * 60 * 1000)) {
-      const resetMs = rateLimiter.getResetTime(rateLimitKey, 60 * 60 * 1000);
-      const resetMinutes = Math.ceil(resetMs / (60 * 1000));
-      Toast.show({ 
-        type: 'error', 
-        text1: 'Too many attempts', 
-        text2: `Please wait ${resetMinutes} minutes before creating another team.` 
-      });
+    if (!rateLimiter.isAllowed(`createTeam:${user.uid}`, 3, 60 * 60 * 1000)) {
+      const resetMs = rateLimiter.getResetTime(`createTeam:${user.uid}`, 60 * 60 * 1000);
+      Toast.show({ type: 'error', text1: 'Too many attempts', text2: `Wait ${Math.ceil(resetMs / 60000)} minutes.` });
       return;
     }
 
-    // Validate and sanitize team name
-    const sanitizedTeamName = sanitizeText(teamName, 50);
-    const teamNameValidation = validateTeamName(sanitizedTeamName);
-    if (!teamNameValidation.valid) {
-      Toast.show({ 
-        type: 'error', 
-        text1: 'Invalid team name', 
-        text2: teamNameValidation.error 
-      });
+    const sanitizedName = sanitizeText(teamName, 50);
+    const nameValidation = validateTeamName(sanitizedName);
+    if (!nameValidation.valid) {
+      Toast.show({ type: 'error', text1: 'Invalid team name', ...(nameValidation.error ? { text2: nameValidation.error } : {}) });
       return;
     }
 
-    // Basic client-side validation for required details
-    if (!sanitizedTeamName || (!pickedPlace && (!locationText || !locationText.trim()))) {
-      if (!sanitizedTeamName) {
-        Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please enter a team name.' });
-      } else {
-        Toast.show({ type: 'error', text1: 'Team details incomplete', text2: 'Please provide a location for the team (use "Find with Google" or enter an address).' });
-      }
+    if (!sanitizedName || (!pickedPlace && !locationText.trim())) {
+      Toast.show({ type: 'error', text1: 'Missing details', text2: !sanitizedName ? 'Enter a team name.' : 'Enter a location.' });
       return;
     }
-
-    // Sanitize location and colors
-    const sanitizedLocation = sanitizeLocation(pickedPlace?.formattedAddress ?? locationText ?? '');
-    const sanitizedHomeColor = sanitizeColor(homeColor);
-    const sanitizedAwayColor = sanitizeColor(awayColor);
 
     setLoading(true);
     try {
-      await ensureFirestoreOnline();
+      // Check coordinator/team membership via native Firestore
+      const userSnap = await firestore().collection('users').doc(user.uid).get();
+      const userData = userSnap.data() ?? {};
 
-      // Best-effort: read the user's Firestore profile to pick up their full name (signup flow writes `name`)
-      let creatorName: string | null = null;
-      let creatorEmail: string | null = null;
-      try {
-        const userDoc = await getDocument(`users/${user.uid}`);
-        if (userDoc) {
-          creatorName = (userDoc.name ?? userDoc.displayName ?? '') || null;
-          creatorEmail = (userDoc.email ?? '') || null;
-
-          // BLOCK: disallow creating another team if user is already a coordinator
-          if (userDoc.isCoordinator) {
-            Toast.show({
-              type: 'error',
-              text1: 'Cannot create team',
-              text2: 'You are already a coordinator for a team and cannot create another one.',
-            });
-            setLoading(false);
-            return;
-          }
-
-          // BLOCK: disallow creating a team if user is already a member of a team
-          if (userDoc.teamId) {
-            Toast.show({
-              type: 'error',
-              text1: 'Cannot create team',
-              text2: 'You are already a member of a team. Leave your current team before creating a new one.',
-            });
-            setLoading(false);
-            return;
-          }
-        }
-      } catch (e) {
-        // If reading the user doc fails, fall back to auth profile values but still proceed with caution.
-        console.warn('[CreateTeam] failed to read users/{uid} for coordinator check', redactSensitiveData({ error: e }));
-        creatorName = user.displayName ?? null;
-        creatorEmail = user.email ?? null;
-        // Note: server-side rules will still enforce creation permissions; we surface helpful client messages when possible.
+      if (userData.isCoordinator) {
+        Toast.show({ type: 'error', text1: 'Cannot create team', text2: 'You are already a coordinator.' });
+        return;
+      }
+      if (userData.teamId) {
+        Toast.show({ type: 'error', text1: 'Cannot create team', text2: 'Leave your current team first.' });
+        return;
       }
 
-      const coordEntry = { 
-        uid: user.uid, 
-        name: sanitizeText(creatorName ?? (user.displayName ?? ''), 100), 
-        email: creatorEmail ?? (user.email ?? '') 
+      const sanitizedLocation = sanitizeLocation(pickedPlace?.formattedAddress ?? locationText);
+      const coordEntry = {
+        uid: user.uid,
+        name: sanitizeText((userData.name as string) ?? user.displayName ?? '', 100),
+        email: (userData.email as string) ?? user.email ?? '',
       };
 
-      const payload: Record<string, any> = {
-        teamName: sanitizedTeamName,
+      const ref = await firestore().collection('teams').add({
+        teamName: sanitizedName,
         location: sanitizedLocation,
         latitude: pickedPlace?.lat ?? null,
         longitude: pickedPlace?.lng ?? null,
         placeId: sanitizeText(pickedPlace?.placeId ?? '', 200),
         createdBy: user.uid,
-        createdAt: new Date().toISOString(),
-        homeColor: sanitizedHomeColor,
-        awayColor: sanitizedAwayColor,
-        elo: getSkillRating(skillLevel), // Set rating based on skill level
-        // coordinator metadata (init with the creating user)
+        createdAt: firestore.FieldValue.serverTimestamp(),
+        homeColor: sanitizeColor(homeColor),
+        awayColor: sanitizeColor(awayColor),
+        elo: getSkillRating(skillLevel),
         coordinators: [coordEntry],
-        coordinatorNames: [coordEntry.name ?? ''],
-      };
+        coordinatorNames: [coordEntry.name],
+      });
 
-      if (!db) throw new Error('Database not initialized');
-      const ref: any = await addDocumentSafe(db, 'teams', payload);
-      const createdId = ref?.id ?? (typeof ref?.path === 'string' ? String(ref.path).split('/').pop() : null);
+      await firestore().collection('users').doc(user.uid).set(
+        { teamId: ref.id, isCoordinator: true, email: user.email ?? '', name: coordEntry.name },
+        { merge: true }
+      );
+
+      try { emitAppEvent('team:created', { teamId: ref.id }); } catch {}
       Toast.show({ type: 'success', text1: 'Team created' });
-
-      if (createdId) {
-        // update the user's profile to attach them to this team and make them a coordinator
-        try {
-          await setDocumentSafe(
-            db, 
-            'users', 
-            user.uid, 
-            { 
-              teamId: createdId, 
-              isCoordinator: true, 
-              email: user.email ?? '', 
-              name: creatorName ?? user.displayName ?? '' 
-            }, 
-            { merge: true }
-          );
-        } catch (uErr) {
-          console.warn('[CreateTeam] failed to upsert users/{uid}', redactSensitiveData({ error: uErr }));
-        }
-
-        // Emit an event so other screens can react (e.g., refresh lists)
-        try { emitAppEvent('team:created', { teamId: createdId }); } catch {}
-
-        // Navigate to the coordinator dashboard so it can load the newly updated user/team
-        router.replace('/(tabs)/CoordinatorDashboardScreen');
-      } else {
-        router.replace('/(tabs)');
-      }
-    } catch (e: any) {
-      console.error('[CreateTeam] create failed', redactSensitiveData({ teamName: sanitizedTeamName, error: e }));
-      // Try to show server-provided error message when available
-      const msg = e?.message ?? String(e);
-      Toast.show({ type: 'error', text1: 'Create failed', text2: msg });
+      router.replace('/(tabs)/CoordinatorDashboardScreen');
+    } catch (e: unknown) {
+      console.error('[CreateTeam] failed', e);
+      Toast.show({ type: 'error', text1: 'Create failed' });
     } finally {
       setLoading(false);
     }
   };
 
+  // ── Sub-components ─────────────────────────────────────────────────────────
+
   const Jersey = ({ color, label }: { color: string; label: string }) => (
     <TouchableOpacity onPress={() => setActivePicker(label.toLowerCase() as 'home' | 'away')}>
       <View style={styles.jerseyCard}>
         <View style={styles.jerseyBox}>
-          <ExpoImage
-            source={require('../../assets/images/jersey_fill.png')}
-            style={[styles.jerseyImg, { tintColor: color }]}
-            contentFit="contain"
-          />
-          <ExpoImage
-            source={require('../../assets/images/jersey_outline.png')}
-            style={styles.jerseyImg}
-            contentFit="contain"
-          />
+          <ExpoImage source={require('@/assets/images/jersey_fill.png')} style={[styles.jerseyImg, { tintColor: color }]} contentFit="contain" />
+          <ExpoImage source={require('@/assets/images/jersey_outline.png')} style={styles.jerseyImg} contentFit="contain" />
         </View>
         <Text style={styles.jerseyLabel}>{label}</Text>
       </View>
     </TouchableOpacity>
   );
 
-  useEffect(() => {
-    let mounted = true;
-    async function checkCoordinator() {
-      try {
-        if (!user?.uid) return;
-        await ensureFirestoreOnline();
+  // ── Blocked state ──────────────────────────────────────────────────────────
 
-        // Try REST helper first (preferred), fall back to SDK if present
-        let udoc: any = null;
-        try {
-          udoc = await getDocument(`users/${user.uid}`);
-        } catch (e) {
-          console.warn('[CreateTeam] getDocument(users) failed during coordinator check', e);
-        }
-        if (!udoc && db && typeof (db as any).collection === 'function') {
-          try {
-            const snap = await (db as any).collection('users').doc(user.uid).get();
-            if (snap?.exists) udoc = { id: snap.id, ...(snap.data() ?? {}) };
-          } catch (sdkErr) {
-            console.warn('[CreateTeam] SDK fallback users/{uid} read failed', sdkErr);
-          }
-        }
-
-        if (!mounted) return;
-
-        if (udoc?.isCoordinator) {
-          setCreateTeamBlocked(true);
-          const tid = udoc.teamId ?? null;
-          setBlockedTeamId(tid);
-
-          // Try to load the friendly team name for display
-          if (tid) {
-            let tdoc: any = null;
-            try {
-              try {
-                tdoc = await getDocument(`teams/${tid}`);
-              } catch (restErr) {
-                // REST failed, try SDK fallback
-                console.warn('[CreateTeam] getDocument(teams) REST failed, trying SDK fallback', restErr);
-              }
-              if (!tdoc && db && typeof (db as any).collection === 'function') {
-                try {
-                  const snap = await (db as any).collection('teams').doc(tid).get();
-                  if (snap?.exists) tdoc = { id: snap.id, ...(snap.data() ?? {}) };
-                } catch (sdkErr) {
-                  console.warn('[CreateTeam] SDK fallback teams/{id} read failed', sdkErr);
-                }
-              }
-            } catch (anyErr) {
-              console.warn('[CreateTeam] loading team doc failed', anyErr);
-            } finally {
-              if (mounted) setBlockedTeamName(tdoc?.teamName ?? null);
-            }
-          } else {
-            setBlockedTeamName(null);
-          }
-        } else {
-          setCreateTeamBlocked(false);
-          setBlockedTeamId(null);
-          setBlockedTeamName(null);
-        }
-      } catch (err) {
-        console.warn('[CreateTeam] coordinator check failed', err);
-      }
-    }
-    checkCoordinator();
-    return () => { mounted = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.uid]);
-
-  // If user is blocked (already a coordinator), show a short message and navigation options.
   if (createTeamBlocked) {
     return (
       <View style={styles.center}>
-        <Text style={{ fontSize: 18, fontWeight: '700', color: '#0a7ea4', marginBottom: 8 }}>
-          You are already a team Coordinator
-        </Text>
-        <Text style={{ color: '#666', textAlign: 'center', marginBottom: 18 }}>
+        <Text style={styles.blockedTitle}>You are already a team Coordinator</Text>
+        <Text style={styles.blockedBody}>
           Leave your current team from the Manage Team screen before creating a new one.
-          {blockedTeamName
-            ? ` (${blockedTeamName})`
-            : blockedTeamId
-              ? ` (Team ID: ${blockedTeamId})`
-              : ''}
+          {blockedTeamName ? ` (${blockedTeamName})` : ''}
         </Text>
-
-        <View style={{ width: '70%', marginBottom: 10 }}>
-          <Button title="Manage Team" onPress={() => router.push('/(tabs)/CoordinatorDashboardScreen')} />
-        </View>
-        <View style={{ width: '70%' }}>
-          <Button title="Back to Home" onPress={() => router.push('/(tabs)')} color="#666" />
-        </View>
+        <TouchableOpacity style={styles.button} onPress={() => router.push('/(tabs)/CoordinatorDashboardScreen')}>
+          <Text style={styles.buttonText}>Manage Team</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.button, styles.secondaryButton]} onPress={() => router.push('/(tabs)')}>
+          <Text style={styles.buttonText}>Back to Home</Text>
+        </TouchableOpacity>
       </View>
     );
   }
 
-  // otherwise continue to render the normal create team UI...
+  // ── Main render ────────────────────────────────────────────────────────────
+
   return (
     <>
-      {/* Modals outside ScrollView for proper overlay behavior */}
-      {/* Create Team tutorial (one-shot per user) */}
-      {createTeamTutorialVisible && (
+      {tutorialVisible && (
         <TutorialModal
-          visible={createTeamTutorialVisible}
-          onClose={async () => {
-            try {
-              const uid = auth?.currentUser?.uid ?? null;
-              if (uid) await AsyncStorage.setItem(newTeamTutorialKey(uid), '1');
-            } catch (e) {
-              console.warn('failed to store create-team tutorial seen', e);
-            } finally {
-              setCreateTeamTutorialVisible(false);
-              setCreateTeamTutorialStep(0);
-            }
-          }}
+          visible={tutorialVisible}
+          onClose={dismissTutorial}
           onPrimary={async () => {
-            if (createTeamTutorialStep < createTeamTutorialSteps.length - 1) {
-              setCreateTeamTutorialStep((s) => s + 1);
-              return;
-            }
-            try {
-              const uid = auth?.currentUser?.uid ?? null;
-              if (uid) await AsyncStorage.setItem(newTeamTutorialKey(uid), '1');
-            } catch (e) {
-              console.warn('failed to store create-team tutorial seen', e);
-            } finally {
-              setCreateTeamTutorialVisible(false);
-              setCreateTeamTutorialStep(0);
+            if (tutorialStep < TUTORIAL_STEPS.length - 1) {
+              setTutorialStep((s) => s + 1);
+            } else {
+              await dismissTutorial();
             }
           }}
-          primaryLabel={createTeamTutorialSteps[createTeamTutorialStep]?.primaryLabel ?? 'Got it'}
-          size={createTeamTutorialSteps[createTeamTutorialStep]?.size ?? 'small'}
-          title={createTeamTutorialSteps[createTeamTutorialStep]?.title}
-          body={createTeamTutorialSteps[createTeamTutorialStep]?.body}
+          primaryLabel={TUTORIAL_STEPS[tutorialStep]?.primaryLabel ?? 'Got it'}
+          size={TUTORIAL_STEPS[tutorialStep]?.size ?? 'small'}
+          title={TUTORIAL_STEPS[tutorialStep]?.title}
+          body={TUTORIAL_STEPS[tutorialStep]?.body}
         />
       )}
 
-      {/* Color Picker Modal */}
       <Modal visible={!!activePicker} animationType="slide" onRequestClose={() => setActivePicker(null)}>
         <View style={styles.modalContainer}>
-          <Text style={styles.modalTitle}>
-            Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
-          </Text>
+          <Text style={styles.modalTitle}>Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color</Text>
           <ColorPicker
             color={activePicker === 'home' ? homeColor : awayColor}
             onColorChangeComplete={(color: string) => {
@@ -587,13 +364,12 @@ export default function CreateTeamScreen() {
             row={false}
             swatches
           />
-          <View style={{ marginTop: 12 }}>
-            <Button title="Done" onPress={() => setActivePicker(null)} />
-          </View>
+          <TouchableOpacity style={[styles.button, { marginTop: 12 }]} onPress={() => setActivePicker(null)}>
+            <Text style={styles.buttonText}>Done</Text>
+          </TouchableOpacity>
         </View>
       </Modal>
 
-      {/* Google Maps Preview Modal */}
       <Modal visible={showMapPreview} animationType="slide" onRequestClose={() => setShowMapPreview(false)}>
         <View style={styles.mapModalContainer}>
           <View style={styles.mapModalHeader}>
@@ -602,14 +378,11 @@ export default function CreateTeamScreen() {
               <Text style={styles.closeButtonText}>✕</Text>
             </TouchableOpacity>
           </View>
-          
           {pickedPlace?.lat && pickedPlace?.lng ? (
             <>
               <View style={styles.mapContainer}>
                 <ExpoImage
-                  source={{
-                    uri: `https://maps.googleapis.com/maps/api/staticmap?center=${pickedPlace.lat},${pickedPlace.lng}&zoom=15&size=600x400&markers=color:red%7C${pickedPlace.lat},${pickedPlace.lng}&key=${API_KEY}`,
-                  }}
+                  source={{ uri: `https://maps.googleapis.com/maps/api/staticmap?center=${pickedPlace.lat},${pickedPlace.lng}&zoom=15&size=600x400&markers=color:red%7C${pickedPlace.lat},${pickedPlace.lng}&key=${API_KEY}` }}
                   style={styles.mapImage}
                   contentFit="cover"
                 />
@@ -618,18 +391,13 @@ export default function CreateTeamScreen() {
                 <Text style={styles.mapInfoText}>{pickedPlace.formattedAddress ?? pickedPlace.name}</Text>
               </View>
               <View style={styles.mapModalButtons}>
-                <TouchableOpacity 
-                  style={[styles.mapButton, styles.confirmButton]} 
-                  onPress={() => setShowMapPreview(false)}
-                >
-                  <Text style={styles.confirmButtonText}>Confirm Location</Text>
+                <TouchableOpacity style={[styles.button, styles.confirmButton]} onPress={() => setShowMapPreview(false)}>
+                  <Text style={styles.buttonText}>Confirm Location</Text>
                 </TouchableOpacity>
               </View>
             </>
           ) : (
-            <View style={styles.center}>
-              <Text>No location data available</Text>
-            </View>
+            <View style={styles.center}><Text>No location data available</Text></View>
           )}
         </View>
       </Modal>
@@ -642,258 +410,122 @@ export default function CreateTeamScreen() {
           placeholder="Team Name"
           value={teamName}
           onChangeText={setTeamName}
+          editable={!loading}
         />
 
-        <View style={{ width: '100%' }}>
+        <View style={styles.fullWidth}>
           <TextInput
             style={styles.input}
             placeholder="Location (rink or arena)"
             value={locationText}
             onChangeText={(text) => {
               setLocationText(text);
-              // If typing after a pickedPlace, clear the picked place so user can choose a different location
-              if (pickedPlace && (pickedPlace.formattedAddress !== text && pickedPlace.name !== text)) {
+              if (pickedPlace && pickedPlace.formattedAddress !== text && pickedPlace.name !== text) {
                 setPickedPlace(null);
               }
             }}
+            editable={!loading}
           />
-
-        {/* Inline suggestions */}
-        {loadingPredictions ? (
-          <View style={styles.suggestions}>
-            <Text style={{ color: '#666' }}>Searching...</Text>
-          </View>
-        ) : null}
-
-        {!loadingPredictions && predictions && predictions.length > 0 ? (
-          <View style={styles.suggestions}>
-            {predictions.map((p) => (
-              <TouchableOpacity
-                key={p.place_id}
-                onPress={() => handleSelectPrediction(p)}
-                style={styles.suggestionItem}
-                activeOpacity={0.7}
-              >
-                <Text style={styles.suggestionMain}>{p.structured_formatting?.main_text ?? p.description}</Text>
-                {p.structured_formatting?.secondary_text ? (
-                  <Text style={styles.suggestionSecondary}>{p.structured_formatting.secondary_text}</Text>
-                ) : null}
-              </TouchableOpacity>
-            ))}
-          </View>
-        ) : null}
-      </View>
-
-      <View style={styles.lookupRow}>
-        <Button title="Find with Google" onPress={handleLookupPlace} disabled={loading} />
-      </View>
-
-      {/* Skill Level Selector */}
-      <View style={styles.skillLevelContainer}>
-        <Text style={styles.skillLevelLabel}>Skill Level:</Text>
-        <View style={styles.pickerContainer}>
-          <Picker
-            selectedValue={skillLevel}
-            onValueChange={(itemValue) => setSkillLevel(itemValue)}
-            style={styles.picker}
-          >
-            <Picker.Item label="Learn to Play" value="learn" />
-            <Picker.Item label="Development" value="development" />
-            <Picker.Item label="Experienced" value="experienced" />
-          </Picker>
+          {loadingPredictions && (
+            <View style={styles.suggestions}>
+              <Text style={styles.searchingText}>Searching...</Text>
+            </View>
+          )}
+          {!loadingPredictions && predictions.length > 0 && (
+            <View style={styles.suggestions}>
+              {predictions.map((p) => (
+                <TouchableOpacity key={p.place_id} onPress={() => handleSelectPrediction(p)} style={styles.suggestionItem} activeOpacity={0.7}>
+                  <Text style={styles.suggestionMain}>{p.structured_formatting?.main_text ?? p.description}</Text>
+                  {p.structured_formatting?.secondary_text && (
+                    <Text style={styles.suggestionSecondary}>{p.structured_formatting.secondary_text}</Text>
+                  )}
+                </TouchableOpacity>
+              ))}
+            </View>
+          )}
         </View>
-        <Text style={styles.skillLevelHint}>
-          {skillLevel === 'learn' && 'Starting rating: 800 (Beginner level)'}
-          {skillLevel === 'development' && 'Starting rating: 1,400 (Intermediate level)'}
-          {skillLevel === 'experienced' && 'Starting rating: 2,400 (Advanced level)'}
-        </Text>
-      </View>
 
-      <View style={styles.kitRow}>
-        <Jersey color={homeColor} label="Home" />
-        <Jersey color={awayColor} label="Away" />
-      </View>
+        <TouchableOpacity style={[styles.button, styles.lookupButton]} onPress={handleLookupPlace} disabled={loading}>
+          <Text style={styles.buttonText}>Find with Google</Text>
+        </TouchableOpacity>
 
-      <View style={{ marginTop: 20 }}>
-        <Button
-          title={loading ? 'Creating...' : 'Create Team'}
+        <View style={styles.skillLevelContainer}>
+          <Text style={styles.skillLevelLabel}>Skill Level:</Text>
+          <View style={styles.pickerContainer}>
+            <Picker selectedValue={skillLevel} onValueChange={(v) => setSkillLevel(v)} style={styles.picker}>
+              <Picker.Item label="Learn to Play" value="learn" />
+              <Picker.Item label="Development" value="development" />
+              <Picker.Item label="Experienced" value="experienced" />
+            </Picker>
+          </View>
+          <Text style={styles.skillLevelHint}>
+            {skillLevel === 'learn' && 'Starting rating: 800 (Beginner level)'}
+            {skillLevel === 'development' && 'Starting rating: 1,400 (Intermediate level)'}
+            {skillLevel === 'experienced' && 'Starting rating: 2,400 (Advanced level)'}
+          </Text>
+        </View>
+
+        <View style={styles.kitRow}>
+          <Jersey color={homeColor} label="Home" />
+          <Jersey color={awayColor} label="Away" />
+        </View>
+
+        <TouchableOpacity
+          style={[styles.button, styles.createButton, loading && styles.buttonDisabled]}
           onPress={handleCreateTeam}
           disabled={loading}
-          color="#0a7ea4"
-        />
-      </View>
+          accessibilityRole="button"
+        >
+          <Text style={styles.buttonText}>{loading ? 'Creating...' : 'Create Team'}</Text>
+        </TouchableOpacity>
 
-      {loading ? <ActivityIndicator style={{ marginTop: 10 }} /> : null}
-    </ScrollView>
+        {loading && <ActivityIndicator style={styles.spinner} />}
+      </ScrollView>
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flexGrow: 1,
-    justifyContent: 'flex-start',
-    alignItems: 'center',
-    padding: 20,
-    backgroundColor: '#fff',
-  },
-  title: {
-    fontSize: 26,
-    fontWeight: 'bold',
-    color: '#0a7ea4',
-    marginBottom: 20,
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    width: '100%',
-    padding: 12,
-    marginBottom: 10,
-    backgroundColor: '#fff',
-  },
-  lookupRow: { width: '100%', marginTop: 8, marginBottom: 12 },
-  skillLevelContainer: {
-    width: '100%',
-    marginTop: 8,
-    marginBottom: 16,
-  },
-  skillLevelLabel: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#333',
-    marginBottom: 8,
-  },
-  pickerContainer: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    backgroundColor: '#fff',
-    overflow: 'hidden',
-  },
-  picker: {
-    width: '100%',
-    height: Platform.OS === 'ios' ? 120 : 50,
-  },
-  skillLevelHint: {
-    fontSize: 13,
-    color: '#666',
-    marginTop: 6,
-    fontStyle: 'italic',
-  },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+  container: { flexGrow: 1, alignItems: 'center', padding: 20, backgroundColor: '#fff' },
+  fullWidth: { width: '100%' },
+  title: { fontSize: 26, fontWeight: 'bold', color: '#0a7ea4', marginBottom: 20 },
+  input: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, width: '100%', padding: 12, marginBottom: 10, backgroundColor: '#fff' },
+  button: { backgroundColor: '#0a7ea4', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 8, alignItems: 'center', width: '100%', marginVertical: 4 },
+  secondaryButton: { backgroundColor: '#666', marginTop: 8 },
+  buttonDisabled: { opacity: 0.6 },
+  buttonText: { color: '#fff', fontWeight: '600', fontSize: 15 },
+  lookupButton: { marginTop: 4, marginBottom: 12 },
+  createButton: { marginTop: 20 },
+  confirmButton: { backgroundColor: '#0a7ea4' },
+  spinner: { marginTop: 10 },
+  blockedTitle: { fontSize: 18, fontWeight: '700', color: '#0a7ea4', marginBottom: 8 },
+  blockedBody: { color: '#666', textAlign: 'center', marginBottom: 18 },
+  skillLevelContainer: { width: '100%', marginBottom: 16 },
+  skillLevelLabel: { fontSize: 16, fontWeight: '600', color: '#333', marginBottom: 8 },
+  pickerContainer: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, backgroundColor: '#fff', overflow: 'hidden' },
+  picker: { width: '100%', height: Platform.OS === 'ios' ? 120 : 50 },
+  skillLevelHint: { fontSize: 13, color: '#666', marginTop: 6, fontStyle: 'italic' },
   kitRow: { flexDirection: 'row', gap: 20, marginTop: 12, marginBottom: 12 },
   jerseyCard: { alignItems: 'center', width: 140 },
   jerseyBox: { width: 120, height: 120, alignItems: 'center', justifyContent: 'center' },
   jerseyImg: { width: 120, height: 120, position: 'absolute' },
   jerseyLabel: { marginTop: 6, fontSize: 14, fontWeight: '600', color: '#333' },
-
   modalContainer: { flex: 1, padding: 20, justifyContent: 'center', backgroundColor: '#fff' },
   modalTitle: { fontSize: 18, fontWeight: '700', marginBottom: 12, color: '#0a7ea4' },
-
-  suggestions: { width: '100%', backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#eee', marginTop: 6, padding: 8 },
+  suggestions: { width: '100%', backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#eee', marginTop: 4, marginBottom: 8, padding: 8 },
+  searchingText: { color: '#666' },
   suggestionItem: { paddingVertical: 8 },
   suggestionMain: { fontWeight: '600' },
   suggestionSecondary: { color: '#666', fontSize: 12 },
-
-  tutorialOverlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    justifyContent: 'center',
-    alignItems: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.7)',
-    zIndex: 1000,
-  },
-  tutorialCard: {
-    width: '80%',
-    maxWidth: 400,
-    backgroundColor: '#fff',
-    borderRadius: 12,
-    padding: 20,
-    elevation: 4,
-  },
-  tutorialTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    marginBottom: 12,
-    color: '#0a7ea4',
-  },
-  tutorialBody: {
-    fontSize: 14,
-    color: '#333',
-    marginBottom: 16,
-  },
-  tutorialButtons: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 10,
-  },
-
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
-  
-  mapModalContainer: {
-    flex: 1,
-    backgroundColor: '#fff',
-  },
-  mapModalHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: '#eee',
-  },
-  mapModalTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#0a7ea4',
-  },
-  closeButton: {
-    padding: 8,
-  },
-  closeButtonText: {
-    fontSize: 24,
-    color: '#666',
-    fontWeight: '300',
-  },
-  mapContainer: {
-    flex: 1,
-    margin: 16,
-    borderRadius: 12,
-    overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#ddd',
-  },
-  mapImage: {
-    width: '100%',
-    height: '100%',
-  },
-  mapInfoContainer: {
-    padding: 16,
-    backgroundColor: '#f9f9f9',
-  },
-  mapInfoText: {
-    fontSize: 14,
-    color: '#333',
-    textAlign: 'center',
-  },
-  mapModalButtons: {
-    padding: 16,
-    paddingBottom: 32,
-  },
-  mapButton: {
-    padding: 16,
-    borderRadius: 8,
-    alignItems: 'center',
-  },
-  confirmButton: {
-    backgroundColor: '#0a7ea4',
-  },
-  confirmButtonText: {
-    color: '#fff',
-    fontSize: 16,
-    fontWeight: '600',
-  },
+  mapModalContainer: { flex: 1, backgroundColor: '#fff' },
+  mapModalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: '#eee' },
+  mapModalTitle: { fontSize: 18, fontWeight: '700', color: '#0a7ea4' },
+  closeButton: { padding: 8 },
+  closeButtonText: { fontSize: 24, color: '#666', fontWeight: '300' },
+  mapContainer: { flex: 1, margin: 16, borderRadius: 12, overflow: 'hidden', borderWidth: 1, borderColor: '#ddd' },
+  mapImage: { width: '100%', height: '100%' },
+  mapInfoContainer: { padding: 16, backgroundColor: '#f9f9f9' },
+  mapInfoText: { fontSize: 14, color: '#333', textAlign: 'center' },
+  mapModalButtons: { padding: 16, paddingBottom: 32 },
 });

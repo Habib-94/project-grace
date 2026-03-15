@@ -1,925 +1,514 @@
-import TutorialModal from '@/components/TutorialModal';
+import { useAuth } from '@/context/AuthContext';
+import TutorialModal from '@/src/components/TutorialModal';
+import { geocodeAddress, haversineDistanceKm } from '@/src/locations';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import firestore from '@react-native-firebase/firestore';
 import Constants from 'expo-constants';
 import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
-import { addDoc, collection } from 'firebase/firestore';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-    ActivityIndicator,
-    Alert,
-    Button,
-    FlatList,
-    ScrollView,
-    StyleSheet,
-    Text,
-    TextInput,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  FlatList,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
-import { app, auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
-import { debugAuthState, getDocument, listTopLevelCollection } from '../../src/firestoreRest';
-import { geocodeAddress, haversineDistanceKm } from '../../src/locations';
 
-// Team type includes rating (previously called ELO)
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const KM_TO_MILES = 0.621371;
+const DEFAULT_RADIUS_MILES = 15;
+const GOOGLE_MAPS_API_KEY = (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? '';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 interface Team {
   id: string;
   teamName: string;
   location?: string;
   homeColor?: string;
   awayColor?: string;
-  elo?: number; // numeric score stored in Firestore; UI label will show "Rating"
+  elo?: number;
+  latitude?: number;
+  longitude?: number;
 }
 
-const KM_TO_MILES = 0.621371;
-const DEFAULT_RADIUS_MILES = 15;
+interface TeamWithDistance extends Team {
+  distanceMiles: number;
+}
 
-export default function FindATeam() {
+// ─── Tutorial steps (defined outside component) ───────────────────────────────
+
+const TUTORIAL_STEPS = [
+  {
+    title: 'Find a Team',
+    body: 'Search for teams by city, rink or team name. Use "Search Area" to geolocate an area. The directory shows nearby or popular clubs. Tap a team to view details and request to join.',
+    size: 'small' as const,
+    primaryLabel: 'Next',
+  },
+  {
+    title: 'Request to Join',
+    body: 'When you find a team you like, tap it and choose "Request to Join". The team coordinator will review your request.',
+    size: 'small' as const,
+    primaryLabel: 'Got it',
+  },
+];
+
+// ── Location ───────────────────────────────────────────────────────────────
+
+const useLocation = () => {
   const [userCoords, setUserCoords] = useState<{ lat: number; lng: number } | null>(null);
   const [loadingLocation, setLoadingLocation] = useState(false);
-  const [teams, setTeams] = useState<any[]>([]);
-  const [loadingTeams, setLoadingTeams] = useState(false);
-  const [radiusMiles, setRadiusMiles] = useState<number>(DEFAULT_RADIUS_MILES);
-  const [searchTerm, setSearchTerm] = useState<string>('');
-  const [searching, setSearching] = useState(false);
-  const [results, setResults] = useState<any[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
-  const [sending, setSending] = useState(false);
-
-  // Directory list (defaults shown when search empty)
-  const [directory, setDirectory] = useState<Team[]>([]);
-  const [dirLoading, setDirLoading] = useState(false);
-
-  // Tutorial: one-shot per-user for Find a Team
-  const [findTeamTutorialVisible, setFindTeamTutorialVisible] = useState(false);
-  const [findTeamTutorialStep, setFindTeamTutorialStep] = useState(0);
-
-  const user = auth.currentUser;
-  const router = useRouter();
-
-  // debounce ref
-  const debounceRef = useRef<number | null>(null);
 
   useEffect(() => {
-    // load initial directory (top teams)
-    fetchDirectory();
-    // cleanup debounce on unmount
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    // Incremental search: debounce user input
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      if (!searchTerm.trim()) {
-        // show directory when empty
-        setResults([]);
-        return;
-      }
-      handleSearch(searchTerm.trim());
-    }, 300) as unknown as number;
-  }, [searchTerm]);
-
-  useEffect(() => {
+    let mounted = true;
     (async () => {
       setLoadingLocation(true);
       try {
         const { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== 'granted') {
-          setError('Location permission not granted');
-          setLoadingLocation(false);
-          return;
-        }
-        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
-        setUserCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
-      } catch (e: any) {
-        console.warn('[FindATeam] getCurrentPosition failed', e);
-        setError(String(e?.message ?? e));
+        if (status !== 'granted') return;
+        const pos = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced });
+        if (mounted) setUserCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+      } catch (e) {
+        console.warn('[FindATeam] location failed', e);
       } finally {
-        setLoadingLocation(false);
+        if (mounted) setLoadingLocation(false);
       }
     })();
+    return () => { mounted = false; };
   }, []);
 
-  const normalizeDocToTeam = (d: any): Team | null => {
-    if (!d || !d.id) return null;
-    return {
-      id: String(d.id),
-      teamName: String(d.teamName ?? ''),
-      location: d.location ?? undefined,
-      homeColor: d.homeColor ?? undefined,
-      awayColor: d.awayColor ?? undefined,
-      elo: d?.elo != null ? Number(d.elo) : undefined,
-    };
-  };
+  return { userCoords, loadingLocation };
+};
 
-  const fetchDirectory = async () => {
-    setDirLoading(true);
-    try {
-      await ensureFirestoreOnline();
+// ── Tutorial one-shot ──────────────────────────────────────────────────────
 
-      // diagnostic: log auth/token presence before query
-      try {
-        const dbg = await debugAuthState('FindATeam.fetchDirectory');
-        console.log('[FindATeam] debugAuthState:', dbg);
-      } catch (dbgErr) {
-        console.warn('[FindATeam] debugAuthState failed', dbgErr);
-      }
-
-      // Use the REST-safe listing to get all teams (supports Expo/web fallback)
-      const docs = await listTopLevelCollection('teams', 1000);
-      const arr = Array.isArray(docs) ? (docs as any[]) : [];
-
-      // Normalize a variety of document shapes (native SDK, web REST mapValue/fields, nested objects)
-      const normalized: Team[] = arr
-        .map((d: any) => {
-          if (!d) return null;
-
-          // id: support native id/_id or REST resource name
-          let id = d.id ?? d._id ?? null;
-          if (!id && typeof d.name === 'string') {
-            const parts = d.name.split('/');
-            id = parts[parts.length - 1] ?? null;
-          }
-
-          // teamName: try multiple places
-          let teamName =
-            d.teamName ??
-            d.name ??
-            (d.fields?.teamName?.stringValue) ??
-            (d.team && (d.team.teamName ?? d.team.name)) ??
-            null;
-
-          // location: try native or REST nested location fields (string)
-          let location =
-            d.location ??
-            (d.fields?.location?.stringValue) ??
-            (d.fields?.location?.mapValue?.fields?.formattedAddress?.stringValue) ??
-            (d.fields?.location?.mapValue?.fields?.address?.stringValue) ??
-            (d.location && (d.location.formattedAddress ?? d.location.address ?? d.location.name)) ??
-            null;
-
-          // colors & elo
-          let homeColor =
-            d.homeColor ??
-            (d.fields?.homeColor?.stringValue) ??
-            null;
-          let awayColor =
-            d.awayColor ??
-            (d.fields?.awayColor?.stringValue) ??
-            null;
-          let elo =
-            (d.elo != null ? Number(d.elo) : null) ??
-            (d.fields?.elo?.integerValue ? Number(d.fields.elo.integerValue) : (d.fields?.elo?.doubleValue ? Number(d.fields.elo.doubleValue) : null));
-
-          if (!id || !teamName) return null;
-
-          return {
-            id: String(id),
-            teamName: String(teamName),
-            location: location ?? undefined,
-            homeColor: homeColor ?? undefined,
-            awayColor: awayColor ?? undefined,
-            elo: elo ?? undefined,
-          } as Team;
-        })
-        .filter(Boolean) as Team[];
-
-      // If we have the user's coords, compute distance for each team (best-effort)
-      // and sort by proximity. Teams without coords will appear at the end alphabetically.
-      let directoryToSet: Team[] = normalized;
-
-      const tryExtractLatLng = (doc: any) => {
-        if (!doc) return null;
-        // common direct fields
-        const candidatesLat = ['lat', 'latitude', 'locationLat', 'lat_dd'];
-        const candidatesLng = ['lng', 'longitude', 'locationLng', 'lng_dd'];
-
-        for (const k of candidatesLat) {
-          const v = doc[k];
-          if (typeof v === 'number') return { lat: v, lng: null as any };
-          if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return { lat: Number(v), lng: null as any };
-        }
-
-        // nested location object like { location: { lat, lng } }
-        if (doc.location && typeof doc.location === 'object') {
-          const lat = (doc.location.lat ?? doc.location.latitude ?? doc.location.latitudeDegrees ?? null);
-          const lng = (doc.location.lng ?? doc.location.longitude ?? doc.location.longitudeDegrees ?? null);
-          if ((lat != null && !Number.isNaN(Number(lat))) && (lng != null && !Number.isNaN(Number(lng)))) {
-            return { lat: Number(lat), lng: Number(lng) };
-          }
-        }
-
-        // REST mapValue shape: fields.location.mapValue.fields.lat.doubleValue etc
-        const locFields = doc.fields?.location?.mapValue?.fields;
-        if (locFields) {
-          const latField = locFields.lat ?? locFields.latitude ?? locFields.lat_dd;
-          const lngField = locFields.lng ?? locFields.longitude ?? locFields.lng_dd;
-          const latVal = latField?.doubleValue ?? latField?.integerValue ?? latField?.stringValue ?? null;
-          const lngVal = lngField?.doubleValue ?? lngField?.integerValue ?? lngField?.stringValue ?? null;
-          if (latVal != null && lngVal != null && !Number.isNaN(Number(latVal)) && !Number.isNaN(Number(lngVal))) {
-            return { lat: Number(latVal), lng: Number(lngVal) };
-          }
-        }
-
-        // Nested team object coordinates fallback
-        if (doc.team && typeof doc.team === 'object') {
-          const lat = doc.team.lat ?? doc.team.latitude ?? null;
-          const lng = doc.team.lng ?? doc.team.longitude ?? null;
-          if (lat != null && lng != null && !Number.isNaN(Number(lat)) && !Number.isNaN(Number(lng))) {
-            return { lat: Number(lat), lng: Number(lng) };
-          }
-        }
-
-        return null;
-      };
-
-      if (userCoords && userCoords.lat != null && userCoords.lng != null && Array.isArray(arr) && arr.length > 0) {
-        // Build a map from normalized id -> raw doc for coordinate lookups
-        const rawById = new Map<string, any>();
-        for (const raw of arr) {
-          const id = raw.id ?? raw._id ?? (typeof raw.name === 'string' ? raw.name.split('/').pop() : null);
-          if (id) rawById.set(String(id), raw);
-        }
-
-        const withDistances = normalized.map((t) => {
-          const raw = rawById.get(String(t.id));
-          const coords = tryExtractLatLng(raw);
-          if (coords && coords.lat != null && coords.lng != null) {
-            const dKm = haversineDistanceKm(userCoords.lat, userCoords.lng, Number(coords.lat), Number(coords.lng));
-            return { team: t, distanceMiles: dKm * KM_TO_MILES, hasCoords: true };
-          }
-          // no coords -> mark as missing
-          return { team: t, distanceMiles: Number.POSITIVE_INFINITY, hasCoords: false };
-        });
-
-        // Sort: teams with coords by distance, then teams without coords alphabetically
-        withDistances.sort((a, b) => {
-          if (a.hasCoords && b.hasCoords) return a.distanceMiles - b.distanceMiles;
-          if (a.hasCoords && !b.hasCoords) return -1;
-          if (!a.hasCoords && b.hasCoords) return 1;
-          // both missing coords -> alphabetical by teamName
-          return (a.team.teamName ?? '').localeCompare(b.team.teamName ?? '');
-        });
-
-        // strip metadata and produce directory
-        directoryToSet = withDistances.map((x) => x.team);
-      } else {
-        // No user coords: keep alphabetical sort for predictability
-        directoryToSet.sort((a, b) => (a.teamName ?? '').localeCompare(b.teamName ?? ''));
-      }
-
-      setDirectory(directoryToSet);
-    } catch (e: any) {
-      console.error('Failed to load directory', e);
-      Toast.show({ type: 'error', text1: 'Failed to load teams', text2: e?.message ?? String(e) });
-      setDirectory([]);
-    } finally {
-      setDirLoading(false);
-    }
-  };
-
-  const handleSearch = async (term?: string) => {
-    const qTerm = (term ?? searchTerm).trim();
-    if (!qTerm) return;
-    setSearching(true);
-    setResults([]);
-    setSelectedTeam(null);
-
-    try {
-      // Ensure we have directory loaded (fetchDirectory sorts by proximity if userCoords exist)
-      if (!Array.isArray(directory) || directory.length === 0) {
-        await fetchDirectory();
-      }
-
-      const low = qTerm.toLowerCase();
-
-      // Filter the client-side directory by teamName or location (case-insensitive)
-      const filtered = (directory ?? []).filter((t) => {
-        const name = (t.teamName ?? '').toLowerCase();
-        const loc = (t.location ?? '').toLowerCase();
-        return name.includes(low) || loc.includes(low);
-      });
-
-      // Preserve directory order (which was nearest-first when location available)
-      setResults(filtered);
-
-      if (filtered.length === 0) {
-        Toast.show({ type: 'info', text1: 'No teams found', text2: 'Try another name or use "Search Area".' });
-      }
-    } catch (e: any) {
-      console.error('❌ Error searching teams (client filter):', e);
-      Toast.show({ type: 'error', text1: 'Error', text2: e.message ?? String(e) });
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  const handleSendRequest = async () => {
-    if (!selectedTeam) {
-      Toast.show({ type: 'info', text1: 'Select a team first' });
-      return;
-    }
-    if (!user) {
-      router.replace('/(auth)/LoginScreen');
-      return;
-    }
-
-    try {
-      setSending(true);
-      await ensureFirestoreOnline();
-
-      // read user via REST helper (ensures user doc exists per your rules)
-      const userDoc = await getDocument(`users/${user.uid}`);
-      if (!userDoc) {
-        Alert.alert('Error', 'User record not found.');
-        return;
-      }
-      const userData = userDoc as any;
-      if (userData.teamId) {
-        Toast.show({
-          type: 'error',
-          text1: 'Already in a team',
-          text2: 'You must leave your current team first.',
-        });
-        return;
-      }
-
-      // Try SDK write first (preferred)
-      try {
-        await addDoc(collection(db, 'requests'), {
-          userId: user.uid,
-          userEmail: user.email ?? '',
-          teamId: selectedTeam.id,
-          teamName: selectedTeam.teamName,
-          requestedBy: user.uid,
-          status: 'pending',
-          createdAt: new Date().toISOString(),
-        });
-
-        Toast.show({
-          type: 'success',
-          text1: 'Request sent!',
-          text2: 'The team coordinator will review your request.',
-        });
-
-        router.replace('/(tabs)');
-        return;
-      } catch (sdkErr: any) {
-        console.warn('[FindATeam] SDK addDoc failed, attempting REST fallback', sdkErr);
-        // fall through to REST fallback below
-      }
-
-      // REST fallback: create document via Firestore REST API using caller ID token
-      try {
-        const projectId = (app as any)?.options?.projectId;
-        const apiKey = (app as any)?.options?.apiKey;
-        if (!projectId) throw new Error('Missing Firebase projectId (cannot use REST fallback)');
-
-        // Build Firestore REST document body (simple string fields)
-        const docBody: any = { fields: {} };
-        const putString = (k: string, v: any) => {
-          if (v === null || v === undefined) return;
-          docBody.fields[k] = { stringValue: String(v) };
-        };
-        putString('userId', user.uid);
-        putString('userEmail', user.email ?? '');
-        putString('teamId', selectedTeam.id);
-        putString('teamName', selectedTeam.teamName);
-        putString('requestedBy', user.uid);
-        putString('status', 'pending');
-        putString('createdAt', new Date().toISOString());
-
-        // Get fresh ID token if available
-        let token: string | null = null;
-        try {
-          token = await (auth as any)?.currentUser?.getIdToken?.(true);
-        } catch (tErr) {
-          try {
-            token = await (auth as any)?.currentUser?.getIdToken?.();
-          } catch {
-            token = null;
-          }
-        }
-
-        const baseUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/requests`;
-        // Prefer auth header; fall back to apiKey query param (less secure but works for public write rules with key)
-        const url = apiKey && !token ? `${baseUrl}?key=${encodeURIComponent(apiKey)}` : baseUrl;
-        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-        if (token) headers['Authorization'] = `Bearer ${token}`;
-
-        const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(docBody) });
-        const text = await res.text().catch(() => '<no body>');
-        if (!res.ok) {
-          console.warn('[FindATeam] REST create failed', { status: res.status, body: text });
-          throw new Error(`REST create failed ${res.status}: ${text}`);
-        }
-
-        console.debug('[FindATeam] REST create response', text);
-
-        Toast.show({
-          type: 'success',
-          text1: 'Request sent (fallback)',
-          text2: 'The team coordinator will review your request.',
-        });
-        router.replace('/(tabs)');
-        return;
-      } catch (restErr: any) {
-        console.error('[FindATeam] REST fallback failed', restErr);
-        throw restErr;
-      }
-    } catch (e: any) {
-      console.error('❌ Error sending request:', e);
-      Toast.show({
-        type: 'error',
-        text1: 'Error sending request',
-        text2: e.message || 'Something went wrong.',
-      });
-    } finally {
-      setSending(false);
-    }
-  };
-
-  const renderTeamCard = ({ item }: { item: Team }) => {
-    const rating = Math.min(Math.max(item.elo ?? 1500, 800), 3000);
-    return (
-      <TouchableOpacity style={styles.teamCard} onPress={() => setSelectedTeam(item)}>
-        <Text style={styles.teamName}>{item.teamName}</Text>
-        {item.location ? <Text style={styles.teamLocation}>{item.location}</Text> : null}
-        <Text style={styles.teamRating}>Rating: {rating}</Text>
-      </TouchableOpacity>
-    );
-  };
-
-  // Flexible extractors to handle native SDK docs and Firestore REST shapes
-  const extractId = (doc: any) => {
-    if (!doc) return null;
-    if (doc.id) return String(doc.id);
-    if (doc._id) return String(doc._id);
-    if (doc.name && typeof doc.name === 'string') {
-      const parts = doc.name.split('/');
-      return parts[parts.length - 1];
-    }
-    return null;
-  };
-
-  const readNumber = (doc: any, ...keys: string[]) => {
-    if (!doc) return null;
-    // direct keys
-    for (const k of keys) {
-      const v = doc[k];
-      if (typeof v === 'number') return v;
-      if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return Number(v);
-    }
-    // fields.<key>.<doubleValue|integerValue|stringValue>
-    if (doc.fields) {
-      for (const k of keys) {
-        const f = doc.fields[k];
-        if (f) {
-          if (f.doubleValue != null) return Number(f.doubleValue);
-          if (f.integerValue != null) return Number(f.integerValue);
-          if (f.stringValue != null && f.stringValue.trim() !== '') return Number(f.stringValue);
-        }
-      }
-      // nested location mapValue
-      const loc = doc.fields.location?.mapValue?.fields;
-      if (loc) {
-        for (const k of keys) {
-          const f = loc[k];
-          if (f) {
-            if (f.doubleValue != null) return Number(f.doubleValue);
-            if (f.integerValue != null) return Number(f.integerValue);
-            if (f.stringValue != null && f.stringValue.trim() !== '') return Number(f.stringValue);
-          }
-        }
-      }
-    }
-    // nested object like doc.location.lat
-    if (doc.location && typeof doc.location === 'object') {
-      for (const k of keys) {
-        const v = (doc.location as any)[k];
-        if (typeof v === 'number') return v;
-        if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return Number(v);
-      }
-    }
-    // fallback to nested team object coordinates
-    if (doc.team && typeof doc.team === 'object') {
-      for (const k of keys) {
-        const v = (doc.team as any)[k];
-        if (typeof v === 'number') return v;
-        if (typeof v === 'string' && v.trim() !== '' && !Number.isNaN(Number(v))) return Number(v);
-      }
-    }
-    return null;
-  };
-
-  const readString = (doc: any, key: string) => {
-    if (!doc) return null;
-    const v = doc[key];
-    if (typeof v === 'string') return v;
-    if (doc.fields?.[key]?.stringValue != null) return String(doc.fields[key].stringValue);
-    // prefer formattedAddress in nested location
-    if (key === 'location' && doc.location && typeof doc.location === 'object') {
-      return doc.location.formattedAddress ?? doc.location.address ?? doc.location.name ?? null;
-    }
-    // nested fields.location.mapValue.fields...
-    if (doc.fields?.location?.mapValue?.fields) {
-      const locF = doc.fields.location.mapValue.fields;
-      if (locF.formattedAddress?.stringValue) return locF.formattedAddress.stringValue;
-      if (locF.address?.stringValue) return locF.address.stringValue;
-      if (locF.name?.stringValue) return locF.name.stringValue;
-    }
-    return null;
-  };
-
-  const firstLineOf = (text: string | undefined | null) => {
-    if (!text) return '';
-    const byLine = String(text).split('\n').map(s => s.trim()).filter(Boolean);
-    if (byLine.length === 0) return '';
-    const first = byLine[0];
-    if (!first) return '';
-    const beforeComma = first.split(',').map(s => s.trim()).filter(Boolean)[0] ?? first;
-    return beforeComma;
-  };
-
-  const loadTeams = async () => {
-    setLoadingTeams(true);
-    try {
-      const docs = await listTopLevelCollection('teams', 1000);
-      const arr = Array.isArray(docs) ? (docs as any[]) : [];
-      setTeams(arr);
-      return arr;
-    } catch (e: any) {
-      console.warn('[FindATeam] loadTeams failed', e);
-      Toast.show({ type: 'error', text1: 'Failed to load teams', text2: e?.message ?? '' });
-      setTeams([]);
-      return [];
-    } finally {
-      setLoadingTeams(false);
-    }
-  };
-
-  // Main search function: targetCoords is either user's coords or geocoded search coords
-  const searchTeamsNearby = async (targetCoords?: { lat: number; lng: number }, useRadius = true) => {
-    setSearching(true);
-    try {
-      const arr = teams.length ? teams : await loadTeams();
-
-      if (!Array.isArray(arr) || arr.length === 0) {
-        setResults([]);
-        return;
-      }
-
-      // Build enriched list with distances
-      const enriched = arr
-        .map((t) => {
-          const lat = readNumber(t, 'lat', 'latitude', 'locationLat') ?? null;
-          const lng = readNumber(t, 'lng', 'longitude', 'locationLng') ?? null;
-
-          // If not found, attempt nested structures
-          const computedLat = lat ?? (t.latitude ?? t.location?.lat ?? null);
-          const computedLng = lng ?? (t.longitude ?? t.location?.lng ?? null);
-
-          // If still missing, try fields.location.mapValue.lat
-          if (computedLat == null || computedLng == null) {
-            // skip if no coords
-            return {
-              ...t,
-              id: extractId(t) ?? t.id ?? t._id ?? null,
-              distanceMiles: Number.POSITIVE_INFINITY,
-              teamLocationFirstLine: firstLineOf(readString(t, 'location') ?? ''),
-              teamName: (readString(t, 'teamName') ?? t.teamName ?? t.name) ?? 'Unknown Team',
-              homeColor: (readString(t, 'homeColor') ?? t.homeColor) ?? '#ffffff',
-            };
-          }
-
-          const target = targetCoords ?? userCoords;
-          const distanceKm = target ? haversineDistanceKm(target.lat, target.lng, Number(computedLat), Number(computedLng)) : Number.POSITIVE_INFINITY;
-          const distanceMiles = distanceKm * KM_TO_MILES;
-
-          return {
-            ...t,
-            id: extractId(t) ?? t.id ?? t._id ?? null,
-            latitude: Number(computedLat),
-            longitude: Number(computedLng),
-            distanceMiles,
-            teamLocationFirstLine: firstLineOf(readString(t, 'location') ?? ''),
-            teamName: (readString(t, 'teamName') ?? t.teamName ?? t.name) ?? 'Unknown Team',
-            homeColor: (readString(t, 'homeColor') ?? t.homeColor) ?? '#ffffff',
-          };
-        })
-        .filter(Boolean);
-
-      // Filter by radius if requested and we have a target; otherwise just sort
-      let withinRadius = useRadius && targetCoords != null;
-      let candidates = withinRadius ? enriched.filter((x) => x.distanceMiles != null && x.distanceMiles <= radiusMiles) : enriched;
-
-      // If no results within radius and we used a search term, fall back to closest to the search coords
-      if ((!Array.isArray(candidates) || candidates.length === 0) && targetCoords != null) {
-        // Show the 20 closest teams to the search coords
-        candidates = enriched.filter((x) => x.distanceMiles != null).sort((a, b) => a.distanceMiles - b.distanceMiles).slice(0, 20);
-        Toast.show({ type: 'info', text1: 'No teams inside radius — showing closest teams to search area' });
-      }
-
-      // If still no results and we have user coords, show closest teams to user (best effort)
-      if ((!Array.isArray(candidates) || candidates.length === 0) && userCoords) {
-        const fallback = enriched.filter((x) => x.distanceMiles != null && isFinite(x.distanceMiles)).sort((a, b) => a.distanceMiles - b.distanceMiles).slice(0, 50);
-        candidates = fallback;
-        if (fallback.length > 0) {
-          Toast.show({ type: 'info', text1: 'No teams found in area — showing teams closest to you' });
-        }
-      }
-
-      // Final sorting: always closest-first
-      const final = (Array.isArray(candidates) ? candidates : enriched).sort((a, b) => {
-        const A = isFinite(a.distanceMiles) ? a.distanceMiles : Number.POSITIVE_INFINITY;
-        const B = isFinite(b.distanceMiles) ? b.distanceMiles : Number.POSITIVE_INFINITY;
-        return A - B;
-      });
-
-      setResults(final);
-    } catch (e: any) {
-      console.warn('[FindATeam] search failed', e);
-      Toast.show({ type: 'error', text1: 'Search failed', text2: e?.message ?? '' });
-      setResults([]);
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  // Handler for "Search Area" (searchTerm -> geocode -> searchTeamsNearby)
-  const handleSearchArea = async () => {
-    if (!searchTerm || searchTerm.trim() === '') {
-      // no search term — just search near user
-      if (!userCoords) {
-        Toast.show({ type: 'info', text1: 'No location available', text2: 'Allow location permissions or enter a search area.' });
-        return;
-      }
-      await searchTeamsNearby(userCoords, true);
-      return;
-    }
-
-    setSearching(true);
-    try {
-      // Ensure we have an API key available (geocode helper uses Constants/expo config)
-      const key = Constants.expoConfig?.extra?.googleMapsApiKey ?? (process.env.GOOGLE_MAPS_API_KEY as string);
-      if (!key) {
-        Toast.show({ type: 'error', text1: 'Search unavailable', text2: 'No Google Maps API key configured.' });
-        setSearching(false);
-        return;
-      }
-
-      const geo = await geocodeAddress(searchTerm);
-      console.debug('[FindATeam] geocode result for "%s":', searchTerm, geo);
-
-      // PlaceDetails type has optional lat/lng and formattedAddress/name
-      const maybeLat = geo?.lat ?? null;
-      const maybeLng = geo?.lng ?? null;
-      const hasCoords = maybeLat != null && maybeLng != null && !Number.isNaN(Number(maybeLat)) && !Number.isNaN(Number(maybeLng));
-      const hasAddress = !!(geo?.formattedAddress || geo?.name || geo?.placeId);
-
-      if (!geo || (!hasCoords && !hasAddress)) {
-        Toast.show({ type: 'info', text1: 'No location found for search' });
-        // fallback to search near user if available
-        if (userCoords) await searchTeamsNearby(userCoords, true);
-        setSearching(false);
-        return;
-      }
-
-      if (hasCoords) {
-        const target = { lat: Number(maybeLat), lng: Number(maybeLng) };
-        await searchTeamsNearby(target, true);
-      } else {
-        // We have an address/place but no direct coords — fall back to user or broad search
-        if (userCoords) {
-          Toast.show({ type: 'info', text1: 'Searching near your location' });
-          await searchTeamsNearby(userCoords, true);
-        } else {
-          // broad search without radius (sorts by name/distance fallback)
-          await searchTeamsNearby(undefined, false);
-        }
-      }
-    } catch (e: any) {
-      console.warn('[FindATeam] geocode failed', e);
-      Toast.show({ type: 'error', text1: 'Geocode failed', text2: e?.message ?? '' });
-    } finally {
-      setSearching(false);
-    }
-  };
-
-  // Quick "Find nearest teams to me" action
-  const handleNearestToMe = async () => {
-    if (!userCoords) {
-      Toast.show({ type: 'info', text1: 'No location available', text2: 'Allow location permissions to enable nearest search.' });
-      return;
-    }
-    await searchTeamsNearby(userCoords, true);
-  };
-
-  const findTeamTutorialKey = (uid?: string) => `tutorial_seen:${uid ?? 'anon'}:find_team`;
-
-  const findTeamTutorialSteps = [
-    {
-      title: 'Find a Team',
-      body:
-        'Search for teams by city, rink or team name. Use "Search Area" to geolocate an area. ' +
-        'The directory shows nearby or popular clubs. Tap a team to view details and request to join.',
-      size: 'small' as const,
-      primaryLabel: 'Next',
-    },
-    {
-      title: 'Request to Join',
-      body:
-        'When you find a team you like, tap it and choose "Request to Join". The team coordinator will review your request.',
-      size: 'small' as const,
-      primaryLabel: 'Got it',
-    },
-  ];
+const useTutorial = (key: string | null) => {
+  const [tutorialVisible, setTutorialVisible] = useState(false);
+  const [tutorialStep, setTutorialStep] = useState(0);
 
   useEffect(() => {
-    let mounted = true;
-    async function maybeShowFindTutorial() {
-      try {
-        const uid = auth?.currentUser?.uid ?? null;
-        if (!uid) return; // only show for signed-in users
-        const seen = await AsyncStorage.getItem(findTeamTutorialKey(uid));
-        if (seen) return;
-        if (!mounted) return;
-        setFindTeamTutorialVisible(true);
-      } catch (e) {
-        console.warn('find-team tutorial check failed', e);
-      }
+    if (!key) return;
+    AsyncStorage.getItem(key)
+      .then((seen) => { if (!seen) setTutorialVisible(true); })
+      .catch(console.warn);
+  }, [key]);
+
+  const dismissTutorial = useCallback(async () => {
+    try { if (key) await AsyncStorage.setItem(key, '1'); } catch {}
+    setTutorialVisible(false);
+    setTutorialStep(0);
+  }, [key]);
+
+  return { tutorialVisible, tutorialStep, setTutorialStep, dismissTutorial };
+};
+
+// ── Component ─────────────────────────────────────────────────────────────
+
+export default function FindATeam() {
+  const router = useRouter();
+  const { user } = useAuth();
+  const { userCoords, loadingLocation } = useLocation();
+
+  const tutorialKey = user?.uid ? `tutorial_seen:${user.uid}:find_team` : null;
+  const { tutorialVisible, tutorialStep, setTutorialStep, dismissTutorial } = useTutorial(tutorialKey);
+
+  const [dirLoading, setDirLoading] = useState(false);
+  const [directory, setDirectory] = useState<Team[]>([]);
+  const [results, setResults] = useState<TeamWithDistance[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [radiusMiles, setRadiusMiles] = useState(DEFAULT_RADIUS_MILES);
+  const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
+  const [sending, setSending] = useState(false);
+  const [searchTerm, setSearchTerm] = useState('');
+
+// ── Fetch directory from Firestore ─────────────────────────────────────────
+
+const fetchDirectory = useCallback(async (coords?: { lat: number; lng: number } | null) => {
+  setDirLoading(true);
+  try {
+    const snap = await firestore().collection('teams').get();
+    const teams: Team[] = snap.docs.map((d) => {
+      const data = d.data();
+      return {
+        id: d.id,
+        teamName: (data.teamName as string) ?? '',
+        ...(data.location != null ? { location: data.location as string } : {}),
+        ...(data.homeColor != null ? { homeColor: data.homeColor as string } : {}),
+        ...(data.awayColor != null ? { awayColor: data.awayColor as string } : {}),
+        ...(data.elo != null ? { elo: data.elo as number } : {}),
+        ...(data.latitude != null ? { latitude: data.latitude as number } : {}),
+        ...(data.longitude != null ? { longitude: data.longitude as number } : {}),
+      };
+    });
+
+    const activeCoords = coords ?? userCoords;
+    if (activeCoords) {
+      teams.sort((a, b) => {
+        const dA = a.latitude != null && a.longitude != null
+          ? haversineDistanceKm(activeCoords.lat, activeCoords.lng, a.latitude, a.longitude)
+          : Infinity;
+        const dB = b.latitude != null && b.longitude != null
+          ? haversineDistanceKm(activeCoords.lat, activeCoords.lng, b.latitude, b.longitude)
+          : Infinity;
+        if (isFinite(dA) && isFinite(dB)) return dA - dB;
+        if (isFinite(dA)) return -1;
+        if (isFinite(dB)) return 1;
+        return (a.teamName).localeCompare(b.teamName);
+      });
+    } else {
+      teams.sort((a, b) => a.teamName.localeCompare(b.teamName));
     }
-    maybeShowFindTutorial();
-    return () => { mounted = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
-  return (
-    <ScrollView contentContainerStyle={styles.container}>
-      <Text style={styles.title}>Find a Team</Text>
+    setDirectory(teams);
+  } catch (e) {
+    console.error('[FindATeam] fetchDirectory failed', e);
+    Toast.show({ type: 'error', text1: 'Failed to load teams' });
+  } finally {
+    setDirLoading(false);
+  }
+}, [userCoords]);
 
-      <View style={{ marginBottom: 12 }}>
-        {loadingLocation ? <ActivityIndicator /> : null}
-        {!loadingLocation && !userCoords ? <Text style={{ color: '#666' }}>Location not available</Text> : null}
-      </View>
+  useEffect(() => { fetchDirectory(userCoords); }, [fetchDirectory]);
 
-      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
-        <TextInput
-          style={styles.input}
-          placeholder="Search area (city, rink)..."
-          value={searchTerm}
-          onChangeText={setSearchTerm}
+// ── Debounced name/location search ─────────────────────────────────────────
+
+const handleSearch = useCallback(
+  (term: string) => {
+    if (!term.trim()) {
+      setResults([]);
+      return;
+    }
+    setSearching(true);
+    try {
+      const low = term.trim().toLowerCase();
+      const filtered = directory.filter((t) =>
+        t.teamName.toLowerCase().includes(low) || (t.location ?? '').toLowerCase().includes(low)
+      );
+      // Attach distance to filtered results
+      const withDist: TeamWithDistance[] = filtered.map((t) => ({
+        ...t,
+        distanceMiles: userCoords && t.latitude != null && t.longitude != null
+          ? haversineDistanceKm(userCoords.lat, userCoords.lng, t.latitude, t.longitude) * KM_TO_MILES
+          : Infinity,
+      }));
+      setResults(withDist);
+      if (withDist.length === 0) Toast.show({ type: 'info', text1: 'No teams found', text2: 'Try "Search Area" for location search.' });
+    } catch (e) {
+      console.warn('[FindATeam] search failed', e);
+      Toast.show({ type: 'error', text1: 'Search failed', text2: e instanceof Error ? e.message : '' });
+    } finally {
+      setSearching(false);
+    }
+  },
+  [directory, userCoords]
+);
+
+// ── Geo search ─────────────────────────────────────────────────────────────
+
+const searchTeamsNearCoords = useCallback((targetCoords: { lat: number; lng: number }) => {
+  const withDist: TeamWithDistance[] = directory
+    .map((t) => ({
+      ...t,
+      distanceMiles: t.latitude != null && t.longitude != null
+        ? haversineDistanceKm(targetCoords.lat, targetCoords.lng, t.latitude, t.longitude) * KM_TO_MILES
+        : Infinity,
+    }))
+    .filter((t) => t.distanceMiles <= radiusMiles)
+    .sort((a, b) => a.distanceMiles - b.distanceMiles);
+
+  if (withDist.length === 0) {
+    const closest = directory
+      .map((t) => ({
+        ...t,
+        distanceMiles: t.latitude != null && t.longitude != null
+          ? haversineDistanceKm(targetCoords.lat, targetCoords.lng, t.latitude, t.longitude) * KM_TO_MILES
+          : Infinity,
+      }))
+      .sort((a, b) => a.distanceMiles - b.distanceMiles)
+      .slice(0, 20);
+    setResults(closest);
+    Toast.show({ type: 'info', text1: 'No teams in radius — showing closest' });
+  } else {
+    setResults(withDist);
+  }
+}, [directory, radiusMiles]);
+
+const handleSearchArea = async () => {
+  if (!GOOGLE_MAPS_API_KEY) {
+    Toast.show({ type: 'error', text1: 'Search unavailable', text2: 'No Google Maps API key configured.' });
+    return;
+  }
+  if (!searchTerm.trim()) {
+    if (userCoords) searchTeamsNearCoords(userCoords);
+    else Toast.show({ type: 'info', text1: 'Enter a search area or allow location access.' });
+    return;
+  }
+  setSearching(true);
+  try {
+    const geo = await geocodeAddress(searchTerm.trim());
+    if (geo?.lat != null && geo?.lng != null) {
+      searchTeamsNearCoords({ lat: geo.lat, lng: geo.lng });
+    } else if (userCoords) {
+      Toast.show({ type: 'info', text1: 'Location not found — searching near you' });
+      searchTeamsNearCoords(userCoords);
+    } else {
+      Toast.show({ type: 'info', text1: 'No location found for search term' });
+    }
+  } catch (e) {
+    console.warn('[FindATeam] geocode failed', e);
+    Toast.show({ type: 'error', text1: 'Geocode failed' });
+  } finally {
+    setSearching(false);
+  }
+};
+
+const handleNearestToMe = () => {
+  if (!userCoords) {
+    Toast.show({ type: 'info', text1: 'Location unavailable', text2: 'Allow location permissions to enable this.' });
+    return;
+  }
+  searchTeamsNearCoords(userCoords);
+};
+
+// ── Send join request ──────────────────────────────────────────────────────
+
+const handleSendRequest = async () => {
+  if (!selectedTeam) { Toast.show({ type: 'info', text1: 'Select a team first' }); return; }
+  if (!user) { router.replace('/(auth)/LoginScreen'); return; }
+
+  setSending(true);
+  try {
+    // Check user is not already in a team
+    const userSnap = await firestore().collection('users').doc(user.uid).get();
+    if (!userSnap.exists) {
+      Toast.show({ type: 'error', text1: 'User record not found' });
+      return;
+    }
+    if (userSnap.data()?.teamId) {
+      Toast.show({ type: 'error', text1: 'Already in a team', text2: 'Leave your current team first.' });
+      return;
+    }
+
+    // Check no existing pending request for this team
+    const existingSnap = await firestore()
+      .collection('requests')
+      .where('userId', '==', user.uid)
+      .where('teamId', '==', selectedTeam.id)
+      .where('status', '==', 'pending')
+      .get();
+
+    if (!existingSnap.empty) {
+      Toast.show({ type: 'info', text1: 'Request already pending', text2: 'You have already requested to join this team.' });
+      return;
+    }
+
+    await firestore().collection('requests').add({
+      userId: user.uid,
+      userEmail: user.email ?? '',
+      teamId: selectedTeam.id,
+      teamName: selectedTeam.teamName,
+      requestedBy: user.uid,
+      status: 'pending',
+      createdAt: firestore.FieldValue.serverTimestamp(),
+    });
+
+    Toast.show({ type: 'success', text1: 'Request sent!', text2: 'The coordinator will review your request.' });
+    router.replace('/(tabs)');
+  } catch (e: unknown) {
+    console.error('[FindATeam] sendRequest failed', e);
+    Toast.show({ type: 'error', text1: 'Failed to send request' });
+  } finally {
+    setSending(false);
+  }
+};
+
+// ── Render helpers ─────────────────────────────────────────────────────────
+
+const renderTeamCard = ({ item }: { item: Team }) => (
+  <TouchableOpacity style={styles.teamCard} onPress={() => setSelectedTeam(item)} accessibilityRole="button">
+    <Text style={styles.teamName}>{item.teamName}</Text>
+    {item.location ? <Text style={styles.teamLocation}>{item.location}</Text> : null}
+    <Text style={styles.teamRating}>Rating: {Math.min(Math.max(item.elo ?? 1500, 800), 3000)}</Text>
+  </TouchableOpacity>
+);
+
+// ── Render ─────────────────────────────────────────────────────────────────
+
+return (
+  <ScrollView contentContainerStyle={styles.container}>
+    <Text style={styles.title}>Find a Team</Text>
+
+    {loadingLocation && <ActivityIndicator style={styles.locationIndicator} />}
+    {!loadingLocation && !userCoords && (
+      <Text style={styles.locationUnavailable}>Location not available</Text>
+    )}
+
+    <View style={styles.searchRow}>
+      <TextInput
+        style={styles.input}
+        placeholder="Search area (city, rink)..."
+        value={searchTerm}
+        onChangeText={(t) => { setSearchTerm(t); handleSearch(t); }}
+        returnKeyType="search"
+        onSubmitEditing={handleSearchArea}
+      />
+      <TouchableOpacity
+        style={[styles.button, (searching || dirLoading) && styles.buttonDisabled]}
+        onPress={handleSearchArea}
+        disabled={searching || dirLoading}
+        accessibilityRole="button"
+      >
+        <Text style={styles.buttonText}>Search Area</Text>
+      </TouchableOpacity>
+    </View>
+
+    <View style={styles.radiusRow}>
+      <TextInput
+        style={styles.radiusInput}
+        value={String(radiusMiles)}
+        keyboardType="numeric"
+        onChangeText={(t) => {
+          const n = Number(t);
+          setRadiusMiles(isFinite(n) ? Math.max(0, n) : DEFAULT_RADIUS_MILES);
+        }}
+      />
+      <Text style={styles.radiusLabel}>miles radius</Text>
+    </View>
+
+    <View style={styles.actionRow}>
+      <TouchableOpacity
+        style={[styles.button, styles.flex1, loadingLocation && styles.buttonDisabled]}
+        onPress={handleNearestToMe}
+        disabled={loadingLocation}
+        accessibilityRole="button"
+      >
+        <Text style={styles.buttonText}>Nearest to me</Text>
+      </TouchableOpacity>
+      <View style={styles.gap} />
+      <TouchableOpacity
+        style={[styles.button, styles.flex1, dirLoading && styles.buttonDisabled]}
+        onPress={() => fetchDirectory(userCoords)}
+        disabled={dirLoading}
+        accessibilityRole="button"
+      >
+        <Text style={styles.buttonText}>Refresh Teams</Text>
+      </TouchableOpacity>
+    </View>
+
+    {searching && <ActivityIndicator size="small" color="#0a7ea4" style={styles.searchingIndicator} />}
+
+    {results.length > 0 && !selectedTeam && (
+      <View style={styles.listSection}>
+        <Text style={styles.sectionTitle}>Search results</Text>
+        <FlatList
+          data={results}
+          keyExtractor={(i) => i.id}
+          renderItem={renderTeamCard}
+          scrollEnabled={false}
         />
-        <View style={{ width: 8 }} />
-        <Button title="Search Area" onPress={handleSearchArea} disabled={searching || loadingTeams} />
       </View>
+    )}
 
-      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
-        <TextInput
-          style={[styles.input, { width: 100 }]}
-          value={String(radiusMiles)}
-          keyboardType="numeric"
-          onChangeText={(t) => {
-            const n = Number(t);
-            if (!Number.isFinite(n)) setRadiusMiles(DEFAULT_RADIUS_MILES);
-            else setRadiusMiles(Math.max(0, n));
-          }}
-        />
-        <Text style={{ marginLeft: 8 }}>miles radius</Text>
-      </View>
-
-      <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 12 }}>
-        <View style={{ flex: 1 }}>
-          <Button title="Nearest to me" onPress={handleNearestToMe} disabled={loadingLocation || loadingTeams} />
-        </View>
-        <View style={{ width: 8 }} />
-        <View style={{ flex: 1 }}>
-          <Button
-            title="Refresh Teams"
-            onPress={() => loadTeams().then(() => searchTeamsNearby(userCoords ?? undefined, true))}
-            disabled={loadingTeams}
-          />
-        </View>
-      </View>
-
-      {/* Preview results when searching */}
-      {searching && <ActivityIndicator size="small" color="#0a7ea4" style={{ marginTop: 12 }} />}
-
-      {results.length > 0 && !selectedTeam ? (
-        <View style={{ marginTop: 12, width: '100%' }}>
-          <Text style={styles.sectionTitle}>Search results</Text>
+    {!searchTerm.trim() && (
+      <View style={styles.listSection}>
+        <Text style={styles.sectionTitle}>Team directory</Text>
+        {dirLoading ? (
+          <ActivityIndicator size="small" color="#0a7ea4" style={styles.searchingIndicator} />
+        ) : directory.length === 0 ? (
+          <Text style={styles.emptyText}>No teams available</Text>
+        ) : (
           <FlatList
-            data={results}
-            keyExtractor={(i) => String(i.id)}
+            data={directory}
+            keyExtractor={(i) => i.id}
             renderItem={renderTeamCard}
             scrollEnabled={false}
           />
-        </View>
-      ) : null}
+        )}
+      </View>
+    )}
 
-      {/* Directory fallback when no search term */}
-      {!searchTerm.trim() && (
-        <View style={{ marginTop: 12, width: '100%' }}>
-          <Text style={styles.sectionTitle}>Team directory</Text>
-          {dirLoading ? (
-            <ActivityIndicator size="small" color="#0a7ea4" style={{ marginTop: 12 }} />
-          ) : directory.length === 0 ? (
-            <Text style={{ color: '#666' }}>No teams available</Text>
-          ) : (
-            <FlatList
-              data={directory}
-              keyExtractor={(i) => String(i.id)}
-              renderItem={renderTeamCard}
-              scrollEnabled={false}
-            />
-          )}
-        </View>
-      )}
+    {selectedTeam && (
+      <View style={styles.selectedContainer}>
+        <Text style={styles.selectedTitle}>Selected Team</Text>
+        <Text style={styles.teamName}>{selectedTeam.teamName}</Text>
+        {selectedTeam.location && <Text style={styles.teamLocation}>{selectedTeam.location}</Text>}
+        <Text style={styles.selectedRating}>
+          Rating: {Math.min(Math.max(selectedTeam.elo ?? 1500, 800), 3000)}
+        </Text>
+        <TouchableOpacity
+          style={[styles.button, styles.requestButton, sending && styles.buttonDisabled]}
+          onPress={handleSendRequest}
+          disabled={sending}
+          accessibilityRole="button"
+        >
+          <Text style={styles.buttonText}>{sending ? 'Sending...' : 'Request to Join'}</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.button, styles.cancelButton]}
+          onPress={() => setSelectedTeam(null)}
+          accessibilityRole="button"
+        >
+          <Text style={styles.buttonText}>Cancel</Text>
+        </TouchableOpacity>
+      </View>
+    )}
 
-      {/* Selected team preview & request button */}
-      {selectedTeam && (
-        <View style={styles.selectedContainer}>
-          <Text style={styles.selectedTitle}>Selected Team</Text>
-          <Text style={styles.teamName}>{selectedTeam.teamName}</Text>
-          {selectedTeam.location && <Text style={styles.teamLocation}>{selectedTeam.location}</Text>}
-          <Text style={{ marginTop: 6 }}>Rating: {Math.min(Math.max(selectedTeam.elo ?? 1500, 800), 3000)}</Text>
-
-          <View style={{ marginTop: 15 }}>
-            <Button
-              title={sending ? 'Sending...' : 'Request to Join'}
-              onPress={handleSendRequest}
-              disabled={sending}
-              color="#0a7ea4"
-            />
-          </View>
-
-          <View style={{ marginTop: 10 }}>
-            <Button title="Cancel" onPress={() => setSelectedTeam(null)} color="#FF3B30" />
-          </View>
-        </View>
-      )}
-
-      {findTeamTutorialVisible && (
-        <TutorialModal
-          visible={findTeamTutorialVisible}
-          onClose={async () => {
-            try {
-              const uid = auth?.currentUser?.uid ?? null;
-              if (uid) await AsyncStorage.setItem(findTeamTutorialKey(uid), '1');
-            } catch (e) {
-              console.warn('failed to store find-team tutorial seen', e);
-            } finally {
-              setFindTeamTutorialVisible(false);
-              setFindTeamTutorialStep(0);
-            }
-          }}
-          onPrimary={async () => {
-            if (findTeamTutorialStep < findTeamTutorialSteps.length - 1) {
-              setFindTeamTutorialStep((s) => s + 1);
-              return;
-            }
-            try {
-              const uid = auth?.currentUser?.uid ?? null;
-              if (uid) await AsyncStorage.setItem(findTeamTutorialKey(uid), '1');
-            } catch (e) {
-              console.warn('failed to store find-team tutorial seen', e);
-            } finally {
-              setFindTeamTutorialVisible(false);
-              setFindTeamTutorialStep(0);
-            }
-          }}
-          primaryLabel={findTeamTutorialSteps[findTeamTutorialStep]?.primaryLabel ?? 'Got it'}
-          size={findTeamTutorialSteps[findTeamTutorialStep]?.size ?? 'small'}
-          title={findTeamTutorialSteps[findTeamTutorialStep]?.title}
-          body={findTeamTutorialSteps[findTeamTutorialStep]?.body}
-        />
-      )}
-    </ScrollView>
-  );
+    {tutorialVisible && (
+      <TutorialModal
+        visible={tutorialVisible}
+        onClose={dismissTutorial}
+        onPrimary={async () => {
+          if (tutorialStep < TUTORIAL_STEPS.length - 1) {
+            setTutorialStep((s) => s + 1);
+          } else {
+            await dismissTutorial();
+          }
+        }}
+        primaryLabel={TUTORIAL_STEPS[tutorialStep]?.primaryLabel ?? 'Got it'}
+        size={TUTORIAL_STEPS[tutorialStep]?.size ?? 'small'}
+        title={TUTORIAL_STEPS[tutorialStep]?.title}
+        body={TUTORIAL_STEPS[tutorialStep]?.body}
+      />
+    )}
+  </ScrollView>
+);
 }
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
 
 const styles = StyleSheet.create({
   container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
   title: { fontSize: 26, fontWeight: 'bold', color: '#0a7ea4', textAlign: 'center', marginBottom: 12 },
   sectionTitle: { fontSize: 16, fontWeight: '600', color: '#0a7ea4', marginBottom: 8 },
-  searchSection: { flexDirection: 'row', gap: 10, alignItems: 'center' },
+  locationIndicator: { marginBottom: 12 },
+  locationUnavailable: { color: '#666', marginBottom: 12 },
+  searchRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12, gap: 8 },
+  radiusRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  radiusInput: { width: 80, borderWidth: 1, borderColor: '#ccc', padding: 10, borderRadius: 6 },
+  radiusLabel: { marginLeft: 8, color: '#333' },
+  actionRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
   input: { flex: 1, borderWidth: 1, borderColor: '#ccc', padding: 10, borderRadius: 6 },
-  teamCard: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    padding: 12,
-    marginBottom: 10,
-    backgroundColor: '#f9f9f9',
-  },
+  button: { backgroundColor: '#0a7ea4', paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: 'center' },
+  buttonDisabled: { opacity: 0.6 },
+  buttonText: { color: '#fff', fontWeight: '600', fontSize: 14 },
+  cancelButton: { backgroundColor: '#FF3B30', marginTop: 8 },
+  requestButton: { marginTop: 16 },
+  flex1: { flex: 1 },
+  gap: { width: 8 },
+  searchingIndicator: { marginTop: 12 },
+  listSection: { marginTop: 12, width: '100%' },
+  emptyText: { color: '#666' },
+  teamCard: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, marginBottom: 10, backgroundColor: '#f9f9f9' },
   teamName: { fontSize: 18, fontWeight: 'bold', color: '#0a7ea4' },
   teamLocation: { fontSize: 14, color: '#666' },
   teamRating: { marginTop: 6, fontSize: 14, color: '#333', fontWeight: '600' },
-  selectedContainer: { marginTop: 20 },
-  selectedTitle: { fontSize: 20, fontWeight: '600', marginBottom: 10, textAlign: 'center' },
+  selectedContainer: { marginTop: 20, borderWidth: 1, borderColor: '#0a7ea4', borderRadius: 12, padding: 16 },
+  selectedTitle: { fontSize: 20, fontWeight: '600', marginBottom: 10, textAlign: 'center', color: '#0a7ea4' },
+  selectedRating: { marginTop: 6, fontSize: 14, color: '#333' },
 });

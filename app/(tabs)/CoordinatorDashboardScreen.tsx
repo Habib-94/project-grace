@@ -1,11 +1,13 @@
+import { useAuth } from '@/context/AuthContext';
+import { emitAppEvent, onAppEvent } from '@/src/appEvents';
+import firestore from '@react-native-firebase/firestore';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
-  Button,
   Dimensions,
   Modal,
   SectionList,
@@ -13,93 +15,16 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
 } from 'react-native';
 import { LineChart } from 'react-native-chart-kit';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
-import { emitAppEvent, onAppEvent } from '../../src/appEvents';
-import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
-import { getDocument, listTopLevelCollection } from '../../src/firestoreRest';
 
-// Read API key from app config or env
-const GOOGLE_MAPS_API_KEY =
-  Constants.expoConfig?.extra?.googleMapsApiKey ??
-  (process.env.GOOGLE_MAPS_API_KEY as string) ??
-  '';
+const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey ?? '';
 
-// --- Safe write helpers (work for native @react-native-firebase and web modular SDK) ---
-async function addDocSafe(collectionPath: string, data: any) {
-  if (db && typeof (db as any).collection === 'function') {
-    // native RN Firebase
-    return (db as any).collection(collectionPath).add(data);
-  } else {
-    const { collection, addDoc } = await import('firebase/firestore');
-    return addDoc(collection(db as any, collectionPath), data);
-  }
-}
+// ─── Types ────────────────────────────────────────────────────────────────────
 
-async function updateDocSafe(path: string, data: any) {
-  const parts = path.split('/');
-  const col = parts[0];
-  const id = parts[1];
-  if (!col || !id) throw new Error('updateDocSafe expects "collection/docId" path');
-
-  if (db && typeof (db as any).collection === 'function') {
-    return (db as any).collection(col).doc(id).update(data);
-  } else {
-    const { doc, updateDoc } = await import('firebase/firestore');
-    return updateDoc(doc(db as any, col, id), data);
-  }
-}
-
-async function deleteDocSafe(path: string) {
-  const parts = path.split('/');
-  const col = parts[0];
-  const id = parts[1];
-  if (!col || !id) throw new Error('deleteDocSafe expects "collection/docId" path');
-
-  if (db && typeof (db as any).collection === 'function') {
-    return (db as any).collection(col).doc(id).delete();
-  } else {
-    const { doc, deleteDoc } = await import('firebase/firestore');
-    return deleteDoc(doc(db as any, col, id));
-  }
-}
-
-/**
- * Run a batch of updates/deletes. On web uses writeBatch for atomic commit;
- * on native it performs the operations sequentially (best-effort fallback).
- * ops: { op: 'update' | 'delete', path: 'collection/docId', data?: any }
- */
-async function runBatchSafe(ops: Array<{ op: 'update' | 'delete'; path: string; data?: any }>) {
-  if (db && typeof (db as any).collection === 'function') {
-    // native: do sequential (no guaranteed atomicity)
-    for (const o of ops) {
-      try {
-        if (o.op === 'update') await updateDocSafe(o.path, o.data);
-        else if (o.op === 'delete') await deleteDocSafe(o.path);
-      } catch (e) {
-        // non-fatal for batch fallback; log and continue
-        console.warn('[runBatchSafe] native op failed', o, e);
-      }
-    }
-    return;
-  } else {
-    const { writeBatch, doc } = await import('firebase/firestore');
-    const batch = writeBatch(db as any);
-    for (const o of ops) {
-      const [col, id] = o.path.split('/');
-      if (!col || !id) continue; // Skip invalid paths
-      if (o.op === 'update') batch.update(doc(db as any, col, id), o.data ?? {});
-      else if (o.op === 'delete') batch.delete(doc(db as any, col, id));
-    }
-    await batch.commit();
-  }
-}
-// --- end helpers ---
-
-// Types
 interface Team {
   id: string;
   teamName?: string;
@@ -111,7 +36,7 @@ interface Team {
   elo?: number;
 }
 
-interface Request {
+interface CoordinatorRequest {
   id: string;
   userEmail: string;
   userId: string;
@@ -119,203 +44,171 @@ interface Request {
   status: string;
 }
 
+interface GameRequest {
+  id: string;
+  teamId?: string;
+  requestingTeamId?: string;
+  requestingTeamName?: string;
+  requestedBy?: string;
+  requestedByName?: string;
+  requestedByEmail?: string;
+  requestedByRating?: number;
+  title?: string;
+  startISO?: string;
+  type?: 'home' | 'away';
+  kitColor?: string;
+  status?: string;
+  createdAt?: string;
+}
+
+interface RatingPoint {
+  x: number;
+  y: number;
+  date: string;
+}
+
+type DashboardItem = CoordinatorRequest | GameRequest | Record<string, unknown>;
+
+// ─── Error Boundary (defined outside component to avoid re-creation) ──────────
+
+interface PlacesErrorBoundaryProps {
+  children: React.ReactNode;
+  onError?: () => void;
+}
+interface PlacesErrorBoundaryState {
+  hasError: boolean;
+}
+
+class PlacesErrorBoundary extends React.Component<PlacesErrorBoundaryProps, PlacesErrorBoundaryState> {
+  constructor(props: PlacesErrorBoundaryProps) {
+    super(props);
+    this.state = { hasError: false };
+  }
+  static getDerivedStateFromError(): PlacesErrorBoundaryState {
+    return { hasError: true };
+  }
+  override componentDidCatch(error: Error) {
+    console.warn('[PlacesErrorBoundary]', error);
+    this.props.onError?.();
+  }
+  override render() {
+    return this.state.hasError ? null : (this.props.children as React.ReactElement);
+  }
+}
+
+// ─── Firestore helpers (native SDK only) ─────────────────────────────────────
+
+async function addDocNative(collection: string, data: Record<string, unknown>) {
+  return firestore().collection(collection).add(data);
+}
+
+async function updateDocNative(collection: string, id: string, data: Record<string, unknown>) {
+  return firestore().collection(collection).doc(id).update(data);
+}
+
+async function deleteDocNative(collection: string, id: string) {
+  return firestore().collection(collection).doc(id).delete();
+}
+
+async function runBatch(ops: Array<{ op: 'update' | 'delete'; col: string; id: string; data?: Record<string, unknown> }>) {
+  const batch = firestore().batch();
+  for (const o of ops) {
+    const ref = firestore().collection(o.col).doc(o.id);
+    if (o.op === 'update') batch.update(ref, o.data ?? {});
+    else batch.delete(ref);
+  }
+  return batch.commit();
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export default function CoordinatorDashboardScreen() {
   const router = useRouter();
-  const user = auth.currentUser;
+  const { user } = useAuth();
 
   const [teamData, setTeamData] = useState<Team | null>(null);
-  const [requests, setRequests] = useState<Request[]>([]);
+  const [requests, setRequests] = useState<CoordinatorRequest[]>([]);
+  const [games, setGames] = useState<Record<string, unknown>[]>([]);
+  const [gameRequests, setGameRequests] = useState<GameRequest[]>([]);
+  const [ratingHistory, setRatingHistory] = useState<RatingPoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
-  const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
-  const [locationCoords, setLocationCoords] = useState<{ latitude: number; longitude: number } | null>(null);
-  const [placesComponent, setPlacesComponent] = useState<any>(null);
-  const autocompleteRef = useRef<any>(null);
-  const [games, setGames] = useState<any[]>([]);
   const [saving, setSaving] = useState(false);
-  const [ratingHistory, setRatingHistory] = useState<Array<{ x: number; y: number; date: string }>>([]);
+  const [activePicker, setActivePicker] = useState<'home' | 'away' | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [placesComponent, setPlacesComponent] = useState<React.ComponentType<any> | null>(null);
+  const [selectedGameRequest, setSelectedGameRequest] = useState<GameRequest | null>(null);
+  const [requestModalVisible, setRequestModalVisible] = useState(false);
 
-  const originalTeamRef = useRef<any>(null);
+  const originalTeamRef = useRef<Team | null>(null);
+  const autocompleteRef = useRef<unknown>(null);
 
-  // Error boundary for Places component
-  class PlacesErrorBoundary extends React.Component<{ children: React.ReactNode; onError?: () => void }, { hasError: boolean }> {
-    constructor(props: any) {
-      super(props);
-      this.state = { hasError: false };
-    }
-    static getDerivedStateFromError() {
-      return { hasError: true };
-    }
-    override componentDidCatch(error: any, info: any) {
-      console.warn('[PlacesErrorBoundary] caught error rendering PlacesComp', error, info);
-      try { this.props.onError?.(); } catch (e) { /* ignore */ }
-    }
-    override render() {
-      if (this.state.hasError) {
-        return null; // fall back to text input in parent
-      }
-      return this.props.children as any;
-    }
-  }
-
-  // Dynamic loader for GooglePlacesAutocomplete
+  // Load GooglePlacesAutocomplete dynamically
   useEffect(() => {
     let mounted = true;
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const mod = require('react-native-google-places-autocomplete');
-      // store the component type directly (not a wrapper)
-      if (mounted) setPlacesComponent(mod?.GooglePlacesAutocomplete ?? mod ?? null);
-    } catch (e) {
-      if (__DEV__) console.warn('GooglePlacesAutocomplete not available:', e);
+      if (mounted) setPlacesComponent(mod?.GooglePlacesAutocomplete ?? null);
+    } catch {
       if (mounted) setPlacesComponent(null);
     }
-    return () => {
-      mounted = false;
-    };
+    return () => { mounted = false; };
   }, []);
 
-  // initial load: wait for auth and fetch team + requests
+  // ── Initial data load ──────────────────────────────────────────────────────
+
   useEffect(() => {
+    if (!user?.uid) return;
     let isMounted = true;
 
     const loadData = async () => {
-      const currentUser = await waitForAuthUser(3000);
-      console.log('[Coordinator] resolved currentUser before loading:', !!currentUser, currentUser?.uid ?? null);
-
-      if (!currentUser) {
-        // No signed-in user after waiting — navigate to login (or show message)
-        router.replace('/(auth)/LoginScreen');
-        return;
-      }
-
       try {
-        await ensureFirestoreOnline();
-
-        // Read user via REST helper (avoids web streaming)
-        // Robust user read: try REST, retry once on failure, then fall back to SDK read if available.
-        let userDoc: any = null;
-        try {
-          userDoc = await getDocument(`users/${currentUser.uid}`);
-        } catch (e1) {
-          console.warn('[Coordinator] initial getDocument(users) failed, will retry once', e1);
-          // brief retry in case of auth token race / propagation
-          await new Promise((r) => setTimeout(r, 700));
-          try {
-            userDoc = await getDocument(`users/${currentUser.uid}`);
-          } catch (e2) {
-            console.warn('[Coordinator] retry getDocument(users) failed, falling back to SDK read if available', e2);
-            userDoc = null;
-          }
-        }
-
-        // Fallback: if REST still failed and native/web SDK `db` is available, try direct SDK read
-        if (!userDoc && db && typeof (db as any).collection === 'function') {
-          try {
-            const snap = await (db as any).collection('users').doc(currentUser.uid).get();
-            if (snap?.exists) userDoc = { id: snap.id, ...(snap.data() ?? {}) };
-          } catch (sdkErr) {
-            console.warn('[Coordinator] SDK fallback read users/{uid} failed', sdkErr);
-            userDoc = null;
-          }
-        }
-
-        if (!userDoc) {
-          if (isMounted) {
-            Toast.show({ type: 'error', text1: 'User record not found' });
-            router.replace('/(tabs)');
-          }
+        const userSnap = await firestore().collection('users').doc(user.uid).get();
+        if (!userSnap.exists) {
+          Toast.show({ type: 'error', text1: 'User record not found' });
+          router.replace('/(tabs)');
           return;
         }
 
-        const userData = userDoc as any;
+        const userData = userSnap.data()!;
 
-        // If the user is not yet marked as coordinator but they have a teamId,
-        // try to fetch the team doc (some writes may be visible earlier than flag propagation).
-        if (!userData?.isCoordinator) {
-          if (userData?.teamId) {
-            try {
-              const maybeTeam = await getDocument(`teams/${userData.teamId}`);
-              if (maybeTeam) {
-                // allow viewing the team (team exists) — set teamData and continue.
-                const team: Team = { id: maybeTeam.id, ...(maybeTeam as any) };
-                if (isMounted) {
-                  setTeamData(team);
-                  if (team.latitude && team.longitude) {
-                    setLocationCoords({ latitude: team.latitude, longitude: team.longitude });
-                  }
-                }
-                // still fetch requests/games below (we'll short-circuit duplicate fetches)
-              } else {
-                // team not found — treat as access denied
-                if (isMounted) {
-                  Toast.show({
-                    type: 'error',
-                    text1: 'Access Denied',
-                    text2: 'You must be a coordinator to access this page.',
-                  });
-                  router.replace('/(tabs)');
-                }
-                return;
-              }
-            } catch (teamErr) {
-              console.warn('[Coordinator] failed reading team while user is not coordinator', teamErr);
-              if (isMounted) {
-                Toast.show({
-                  type: 'error',
-                  text1: 'Access Denied',
-                  text2: 'You must be a coordinator to access this page.',
-                });
-                router.replace('/(tabs)');
-              }
-              return;
-            }
-          } else {
-            // No teamId and not a coordinator — redirect away.
-            if (isMounted) {
-              Toast.show({
-                type: 'error',
-                text1: 'Access Denied',
-                text2: 'You must be a coordinator to access this page.',
-              });
-              router.replace('/(tabs)');
-            }
-            return;
-          }
-        }
-
-        // Read team via REST helper
-        const teamId = userData.teamId;
-        const teamDoc = await getDocument(`teams/${teamId}`);
-        if (!teamDoc) {
-          if (isMounted) {
-            Toast.show({ type: 'error', text1: 'Team not found' });
-            router.replace('/(tabs)');
-          }
+        if (!userData.isCoordinator) {
+          Toast.show({ type: 'error', text1: 'Access Denied', text2: 'You must be a coordinator.' });
+          router.replace('/(tabs)');
           return;
         }
 
-        const team: Team = { id: teamDoc.id, ...(teamDoc as any) };
-        if (isMounted) {
-          setTeamData(team);
-
-          if (team.latitude && team.longitude) {
-            setLocationCoords({
-              latitude: team.latitude,
-              longitude: team.longitude,
-            });
-          }
+        const teamId = userData.teamId as string;
+        if (!teamId) {
+          router.replace('/(tabs)');
+          return;
         }
 
-        // Fetch pending coordinator-join requests from top-level 'requests' and filter client-side
-        const reqDocs = await listTopLevelCollection('requests', 500);
-        const fetchedRequests: Request[] = (reqDocs as any[])
-          .filter((r: any) => r.teamId === team.id && r.status === 'pending')
-          .map((r: any) => ({ id: r.id, ...r }));
+        const teamSnap = await firestore().collection('teams').doc(teamId).get();
+        if (!teamSnap.exists) {
+          Toast.show({ type: 'error', text1: 'Team not found' });
+          router.replace('/(tabs)');
+          return;
+        }
+
+        const team: Team = { id: teamSnap.id, ...teamSnap.data() as Omit<Team, 'id'> };
+        if (isMounted) setTeamData(team);
+
+        const reqSnap = await firestore()
+          .collection('requests')
+          .where('teamId', '==', teamId)
+          .where('status', '==', 'pending')
+          .get();
+
+        const fetchedRequests: CoordinatorRequest[] = reqSnap.docs.map((d) => ({
+          id: d.id,
+          ...(d.data() as Omit<CoordinatorRequest, 'id'>),
+        }));
 
         if (isMounted) setRequests(fetchedRequests);
       } catch (e) {
-        console.error('❌ Error loading data:', e);
+        console.error('[CoordinatorDashboard] loadData failed', e);
         if (isMounted) Toast.show({ type: 'error', text1: 'Error loading team data' });
       } finally {
         if (isMounted) setLoading(false);
@@ -323,254 +216,123 @@ export default function CoordinatorDashboardScreen() {
     };
 
     loadData();
-    return () => {
-      isMounted = false;
-    };
-  }, [user, router]);
+    return () => { isMounted = false; };
+  }, [user?.uid, router]);
 
-  // Fetch games for the current team (uses REST)
-  const fetchGames = async (teamId?: string) => {
-    if (!teamId) return setGames([]);
+  // ── Fetch games ────────────────────────────────────────────────────────────
+
+  const fetchGames = useCallback(async (teamId: string) => {
     try {
-      await ensureFirestoreOnline();
-      // List top-level games and filter for this team
-      const docs = await listTopLevelCollection('games', 500);
-      const all = Array.isArray(docs) ? (docs as any[]) : [];
-
-      // Helper: robustly check whether a game doc belongs to the current teamId
-      const belongsToTeam = (d: any) => {
-        if (!d) return false;
-        const tid = String(teamId);
-        // direct top-level field
-        if (d.teamId != null && String(d.teamId) === tid) return true;
-        // nested team object
-        if (d.team && (String(d.team.id ?? d.team.teamId ?? '') === tid || String(d.teamId ?? '') === tid)) return true;
-        // web/REST shape: fields.teamId.stringValue or fields.teamId.integerValue
-        const teamField = d.fields?.teamId;
-        if (teamField) {
-          if (teamField.stringValue != null && String(teamField.stringValue) === tid) return true;
-          if (teamField.integerValue != null && String(teamField.integerValue) === tid) return true;
-        }
-        // some shapes might store ownerTeam or requestingTeamId
-        if (d.requestingTeamId != null && String(d.requestingTeamId) === tid) return true;
-        if (d.ownerTeam != null && String(d.ownerTeam) === tid) return true;
-        return false;
-      };
-
-      // Keep only games that belong to this team
-      const parsed = all
-        .filter((d) => belongsToTeam(d))
-        .map((d) => ({ id: d.id, ...(d as any) }));
-
-      // Client-side sort by startISO (docs without startISO go to the end)
-      parsed.sort((a, b) => {
-        if (!a.startISO && !b.startISO) return 0;
-        if (!a.startISO) return 1;
-        if (!b.startISO) return -1;
-        return String(a.startISO).localeCompare(String(b.startISO));
-      });
-
-      setGames(parsed);
-    } catch (err: any) {
-      console.warn('Failed to load games', err);
-      const msg = err?.message ?? '';
-      const match = msg.match(/https?:\/\/[^\s)]+create_composite[^\s)]+/);
-      if (match) {
-        console.warn('Create composite index:', match[0]);
-        Toast.show({
-          type: 'error',
-          text1: 'Firestore index required',
-          text2: 'Open the console link printed in DevTools',
-        });
-      } else {
-        Toast.show({ type: 'error', text1: 'Failed to load games' });
-      }
-      setGames([]);
+      const snap = await firestore()
+        .collection('games')
+        .where('teamId', '==', teamId)
+        .orderBy('startISO', 'asc')
+        .get();
+      setGames(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+    } catch (e) {
+      console.warn('[CoordinatorDashboard] fetchGames failed', e);
+      Toast.show({ type: 'error', text1: 'Failed to load games' });
     }
-  };
+  }, []);
 
-  // trigger fetchGames when teamData.id changes
   useEffect(() => {
     if (teamData?.id) fetchGames(teamData.id);
-  }, [teamData?.id]);
+  }, [teamData?.id, fetchGames]);
 
-  // Process rating history from completed games
+  // ── Fetch game requests ────────────────────────────────────────────────────
+
+  const fetchGameRequests = useCallback(async (teamId: string) => {
+    try {
+      const snap = await firestore()
+        .collection('gameRequests')
+        .where('teamId', '==', teamId)
+        .get();
+      setGameRequests(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<GameRequest, 'id'>) })));
+    } catch (e) {
+      console.warn('[CoordinatorDashboard] fetchGameRequests failed', e);
+    }
+  }, []);
+
   useEffect(() => {
-    if (!games || games.length === 0 || !teamData?.id) {
-      setRatingHistory([]);
-      return;
-    }
+    if (teamData?.id) fetchGameRequests(teamData.id);
+    else setGameRequests([]);
+  }, [teamData?.id, fetchGameRequests]);
 
-    // Filter only completed games with results and rating data
-    const completedGames = games
-      .filter((g) => 
-        g.status === 'completed' && 
-        g.homeScore != null && 
-        g.awayScore != null &&
-        (g.homeNewRating != null || g.awayNewRating != null) &&
-        g.startISO
-      )
-      .sort((a, b) => {
-        const dateA = new Date(a.startISO).getTime();
-        const dateB = new Date(b.startISO).getTime();
-        return dateA - dateB;
-      });
+  // ── Listen for game created events ────────────────────────────────────────
 
-    if (completedGames.length === 0) {
-      setRatingHistory([]);
-      return;
-    }
+  useEffect(() => {
+    if (!teamData?.id) return;
+    const unsub = onAppEvent('games:created', (payload: { teamId?: string }) => {
+      if (!payload?.teamId || payload.teamId === teamData.id) {
+        fetchGames(teamData.id!).catch(console.warn);
+        fetchGameRequests(teamData.id!).catch(console.warn);
+      }
+    });
+    return () => { try { if (typeof unsub === 'function') unsub(); } catch {} };
+  }, [teamData?.id, fetchGames, fetchGameRequests]);
 
-    const history: Array<{ x: number; y: number; date: string }> = [];
-    
-    // Add starting rating as first point if we have an initial ELO
-    if (teamData.elo != null) {
-      const firstGameDate = new Date(completedGames[0].startISO);
-      // Add a point for the initial rating slightly before the first game
-      history.push({
-        x: 0,
-        y: teamData.elo,
-        date: 'Initial',
-      });
-    }
+  // ── Rating history ─────────────────────────────────────────────────────────
 
-    // Build history from completed games
-    completedGames.forEach((game, index) => {
-      // Determine if this team was home or away
-      const isHomeTeam = game.homeTeamId === teamData.id || game.teamId === teamData.id;
-      const rating = isHomeTeam ? game.homeNewRating : game.awayNewRating;
-      
+  useEffect(() => {
+    if (!games.length || !teamData?.id) { setRatingHistory([]); return; }
+
+    const completed = (games as Array<Record<string, unknown>>)
+      .filter((g) => g.status === 'completed' && g.homeScore != null && g.awayScore != null && g.startISO)
+      .sort((a, b) => String(a.startISO).localeCompare(String(b.startISO)));
+
+    if (!completed.length) { setRatingHistory([]); return; }
+
+    const history: RatingPoint[] = [];
+    if (teamData.elo != null) history.push({ x: 0, y: teamData.elo, date: 'Initial' });
+
+    completed.forEach((game, index) => {
+      const isHome = game.homeTeamId === teamData.id || game.teamId === teamData.id;
+      const rating = (isHome ? game.homeNewRating : game.awayNewRating) as number | undefined;
       if (rating != null) {
-        const gameDate = new Date(game.startISO);
-        history.push({
-          x: index + 1,
-          y: rating,
-          date: gameDate.toLocaleDateString(),
-        });
+        history.push({ x: index + 1, y: rating, date: new Date(String(game.startISO)).toLocaleDateString() });
       }
     });
 
     setRatingHistory(history);
   }, [games, teamData?.id, teamData?.elo]);
 
-  // --- Game request types + state ---
-  interface GameRequest {
-    id: string;
-    teamId?: string;
-    requestingTeamId?: string;
-    requestingTeamName?: string;
-    requestedBy?: string;
-    requestedByName?: string;
-    title?: string;
-    startISO?: string;
-    type?: 'home' | 'away';
-    kitColor?: string;
-    status?: string;
-    createdAt?: string;
-  }
+  // ── Handlers ───────────────────────────────────────────────────────────────
 
-  const [gameRequests, setGameRequests] = useState<GameRequest[]>([]);
-  const [loadingGameRequests, setLoadingGameRequests] = useState(false);
-  const [selectedGameRequest, setSelectedGameRequest] = useState<GameRequest | null>(null);
-  const [requestModalVisible, setRequestModalVisible] = useState(false);
-
-  // Fetch game requests for this team (REST)
-  const fetchGameRequests = async (teamId?: string) => {
-    if (!teamId) {
-      setGameRequests([]);
-      return;
-    }
-    setLoadingGameRequests(true);
-    try {
-      await ensureFirestoreOnline();
-      const docs = await listTopLevelCollection('gameRequests', 500);
-      const items: GameRequest[] = (docs as any[]).filter((d) => d.teamId === teamId).map((d) => ({ id: d.id, ...(d as any) }));
-      setGameRequests(items);
-    } catch (e: any) {
-      console.warn('Failed to load game requests', e);
-      setGameRequests([]);
-    } finally {
-      setLoadingGameRequests(false);
-    }
-  };
-
-  // trigger fetchGameRequests when teamData.id changes
-  useEffect(() => {
-    if (teamData?.id) fetchGameRequests(teamData.id);
-    else setGameRequests([]);
-  }, [teamData?.id]);
-
-  // Re-fetch games + gameRequests when other screens emit that a game was created
-  useEffect(() => {
-    if (!teamData?.id) return;
-
-    const unsub = onAppEvent('games:created', (payload: any) => {
-      try {
-        // If emitter included teamId, only refresh when relevant.
-        // If payload is absent or has no teamId, refresh unconditionally.
-        if (!payload || !payload.teamId || payload.teamId === teamData.id) {
-          // re-load both games and gameRequests for this team
-          fetchGames(teamData.id).catch((e) => console.warn('[CoordinatorDashboard] fetchGames on event failed', e));
-          fetchGameRequests(teamData.id).catch((e) => console.warn('[CoordinatorDashboard] fetchGameRequests on event failed', e));
-        }
-      } catch (e) {
-        console.warn('[CoordinatorDashboard] games:created handler error', e);
-      }
-    });
-
-    return () => {
-      try {
-        if (typeof unsub === 'function') unsub();
-      } catch {
-        // ignore
-      }
-    };
-  }, [teamData?.id]);
-
-  // Approve a game request: create a game from the request, mark request approved (or delete)
   const handleApproveGameRequest = async (req: GameRequest) => {
-    if (!teamData?.id) return;
+    if (!teamData?.id || !user) return;
     try {
-      await ensureFirestoreOnline();
+      let awayTeamRating = 1500;
+      if (req.requestingTeamId) {
+        const snap = await firestore().collection('teams').doc(req.requestingTeamId).get();
+        awayTeamRating = (snap.data()?.elo as number) ?? 1500;
+      }
 
-      // Get requesting team data
-      const requestingTeam = req.requestingTeamId ? await getDocument(`teams/${req.requestingTeamId}`) : null;
-
-      const payload: any = {
+      const payload: Record<string, unknown> = {
         teamId: teamData.id,
         teamName: teamData.teamName,
         title: req.title ?? 'Game Request',
         type: req.type ?? 'home',
         startISO: req.startISO ?? new Date().toISOString(),
         location: teamData.location ?? '',
-        createdBy: req.requestedBy ?? user?.uid, // uid
-        createdByName: req.requestedByName ?? (user?.displayName ?? ''),
-        createdByEmail: (req as any).requestedByEmail ?? (user?.email ?? ''),
-        // prefer rating from the request (if present); otherwise leave null
-        createdByRating: (req as any).requestedByRating ?? null,
-        createdAt: new Date().toISOString(),
-        // Link opponent team (the team that requested the game)
+        createdBy: req.requestedBy ?? user.uid,
+        createdByName: req.requestedByName ?? user.displayName ?? '',
+        createdByEmail: req.requestedByEmail ?? user.email ?? '',
+        createdByRating: req.requestedByRating ?? null,
+        createdAt: firestore.FieldValue.serverTimestamp(),
         opponentTeamId: req.requestingTeamId ?? null,
         opponentTeamName: req.requestingTeamName ?? null,
         homeTeamRating: teamData.elo ?? 1500,
-        awayTeamRating: requestingTeam?.elo ?? 1500,
+        awayTeamRating,
         completed: false,
       };
-
       if (req.kitColor) payload.kitColor = req.kitColor;
 
-      // create the game (safe helper)
-      await addDocSafe('games', payload);
+      await addDocNative('games', payload);
 
-      // mark request approved (or delete) using safe update/delete
       try {
-        await updateDocSafe(`gameRequests/${req.id}`, { status: 'approved' });
+        await updateDocNative('gameRequests', req.id, { status: 'approved' });
       } catch {
-        try {
-          await deleteDocSafe(`gameRequests/${req.id}`);
-        } catch (err) {
-          console.warn('Failed to remove game request after approval', err);
-        }
+        await deleteDocNative('gameRequests', req.id);
       }
 
       Toast.show({ type: 'success', text1: 'Game created', text2: `${req.requestingTeamName ?? 'Team'} — scheduled` });
@@ -578,72 +340,35 @@ export default function CoordinatorDashboardScreen() {
       await fetchGameRequests(teamData.id);
       setRequestModalVisible(false);
       setSelectedGameRequest(null);
-    } catch (e: any) {
-      console.error('Approve game request failed', e);
-      Toast.show({ type: 'error', text1: 'Approve failed', text2: e?.message || '' });
+    } catch (e: unknown) {
+      console.error('[CoordinatorDashboard] approveGameRequest failed', e);
+      Toast.show({ type: 'error', text1: 'Approve failed' });
     }
   };
 
-  // Reject a game request: mark rejected or delete
   const handleRejectGameRequest = async (reqId: string) => {
     try {
-      await ensureFirestoreOnline();
       try {
-        await updateDocSafe(`gameRequests/${reqId}`, { status: 'rejected' });
+        await updateDocNative('gameRequests', reqId, { status: 'rejected' });
       } catch {
-        await deleteDocSafe(`gameRequests/${reqId}`);
+        await deleteDocNative('gameRequests', reqId);
       }
       Toast.show({ type: 'info', text1: 'Game request rejected' });
       if (teamData?.id) fetchGameRequests(teamData.id);
       setRequestModalVisible(false);
       setSelectedGameRequest(null);
-    } catch (e: any) {
-      console.error('Reject game request failed', e);
-      Toast.show({ type: 'error', text1: 'Reject failed', text2: e?.message || '' });
+    } catch (e: unknown) {
+      console.error('[CoordinatorDashboard] rejectGameRequest failed', e);
+      Toast.show({ type: 'error', text1: 'Reject failed' });
     }
   };
 
-  // Save team changes
   const handleSaveTeam = async () => {
-    if (!teamData?.id) return;
+    if (!teamData?.id || !user?.uid) return;
     setSaving(true);
     try {
-      await ensureFirestoreOnline();
-
-      // VERIFY: make sure current user is coordinator for this team before attempting write.
-      // This avoids triggering a permissions error from Firestore and gives a clearer UX message.
-      try {
-        const currentUser = user;
-        if (!currentUser?.uid) {
-          Toast.show({ type: 'error', text1: 'Not signed in', text2: 'Sign in to save team changes.' });
-          setSaving(false);
-          return;
-        }
-
-        const userDoc = await getDocument(`users/${currentUser.uid}`);
-        if (!userDoc || String(userDoc.teamId ?? '') !== String(teamData.id) || !userDoc.isCoordinator) {
-          Toast.show({
-            type: 'error',
-            text1: 'Permission denied',
-            text2: 'Only a coordinator for this team can save changes. Check your account or contact an admin.',
-          });
-          setSaving(false);
-          return;
-        }
-      } catch (checkErr) {
-        // If reading user doc fails, surface a helpful message and avoid attempting the update blindly.
-        console.warn('[CoordinatorDashboard] could not verify coordinator status before save', checkErr);
-        Toast.show({
-          type: 'error',
-          text1: 'Cannot verify permissions',
-          text2: 'Failed to confirm your coordinator status. Try again or contact support.',
-        });
-        setSaving(false);
-        return;
-      }
-
-      // 1) update the team document
-      await updateDocSafe(`teams/${teamData.id}`, {
+      // Verify coordinator status server-side via Firestore rules — just attempt the write
+      await updateDocNative('teams', teamData.id, {
         teamName: teamData.teamName,
         location: teamData.location ?? '',
         latitude: teamData.latitude ?? null,
@@ -652,36 +377,28 @@ export default function CoordinatorDashboardScreen() {
         awayColor: teamData.awayColor ?? '#ffffff',
       });
 
-      // 2) propagate cached teamName to requests (so HomeScreen and other lists show updated name)
-      try {
-        const reqDocs = await listTopLevelCollection('requests', 1000);
-        const matchingReqs = (reqDocs as any[]).filter((r) => r.teamId === teamData.id);
-        if (matchingReqs.length) {
-          const ops = matchingReqs.map((r: any) => ({ op: 'update' as const, path: `requests/${r.id}`, data: { teamName: teamData.teamName } }));
-          await runBatchSafe(ops);
-        }
-      } catch (propErr) {
-        console.warn('Failed to update cached teamName in requests', propErr);
+      // Propagate teamName to pending requests
+      const reqSnap = await firestore()
+        .collection('requests')
+        .where('teamId', '==', teamData.id)
+        .get();
+      if (!reqSnap.empty) {
+        await runBatch(
+          reqSnap.docs.map((d) => ({ op: 'update' as const, col: 'requests', id: d.id, data: { teamName: teamData.teamName } }))
+        );
       }
 
       Toast.show({ type: 'success', text1: 'Team updated' });
       setEditing(false);
-
-      // after updating team doc and any related caches:
-      try { emitAppEvent('team:updated', { teamId: teamData.id, teamName: teamData.teamName }); } catch (e) { /* ignore */ }
-    } catch (err: any) {
-      console.error('Failed to save team', err);
-      const code = err?.code ?? '';
-      const msg = err?.message ?? String(err);
-      if (code === 'permission-denied' || /permission/i.test(msg)) {
-        Toast.show({
-          type: 'error',
-          text1: 'Save failed — permission denied',
-          text2: 'Your account is not allowed to update this team. Confirm you are a coordinator for this team.',
-        });
+      try { emitAppEvent('team:updated', { teamId: teamData.id, teamName: teamData.teamName }); } catch {}
+    } catch (e: unknown) {
+      const code = (e as { code?: string })?.code ?? '';
+      if (code === 'firestore/permission-denied') {
+        Toast.show({ type: 'error', text1: 'Permission denied', text2: 'Only coordinators can update this team.' });
       } else {
-        Toast.show({ type: 'error', text1: 'Save failed', text2: msg });
+        Toast.show({ type: 'error', text1: 'Save failed' });
       }
+      console.error('[CoordinatorDashboard] handleSaveTeam failed', e);
     } finally {
       setSaving(false);
     }
@@ -692,79 +409,69 @@ export default function CoordinatorDashboardScreen() {
     setEditing(false);
   };
 
-  // Approve coordinator request
-  const handleApprove = async (request: Request) => {
+  const handleApproveCoordinatorRequest = async (request: CoordinatorRequest) => {
     try {
-      await updateDocSafe(`users/${request.userId}`, { isCoordinator: true, teamId: request.teamId });
-      await updateDocSafe(`requests/${request.id}`, { status: 'approved' });
+      await updateDocNative('users', request.userId, { isCoordinator: true, teamId: request.teamId });
+      await updateDocNative('requests', request.id, { status: 'approved' });
 
-      const snapDocs = await listTopLevelCollection('requests', 1000);
+      // Delete other pending requests for this team
+      const snap = await firestore()
+        .collection('requests')
+        .where('teamId', '==', request.teamId)
+        .where('status', '==', 'pending')
+        .get();
+      const others = snap.docs.filter((d) => d.id !== request.id);
+      if (others.length) {
+        await runBatch(others.map((d) => ({ op: 'delete' as const, col: 'requests', id: d.id })));
+      }
 
-      // delete other pending requests (safe delete)
-      const deletes = (snapDocs as any[]).filter((r) => r.teamId === request.teamId && r.id !== request.id).map((r) => ({ op: 'delete' as const, path: `requests/${r.id}` }));
-      if (deletes.length) await runBatchSafe(deletes);
-
-      Toast.show({
-        type: 'success',
-        text1: 'Coordinator Approved',
-        text2: `${request.userEmail} is now a coordinator.`,
-      });
-      setRequests((prev) => (Array.isArray(prev) ? prev.filter((r) => r.id !== request.id) : []));
-    } catch (e: any) {
-      Toast.show({ type: 'error', text1: 'Error approving request', text2: e.message });
+      Toast.show({ type: 'success', text1: 'Coordinator Approved', text2: `${request.userEmail} is now a coordinator.` });
+      setRequests((prev) => prev.filter((r) => r.id !== request.id));
+    } catch (e: unknown) {
+      console.error('[CoordinatorDashboard] approveCoordinatorRequest failed', e);
+      Toast.show({ type: 'error', text1: 'Error approving request' });
     }
   };
 
-  const handleReject = async (id: string) => {
+  const handleRejectCoordinatorRequest = async (id: string) => {
     try {
-      await updateDocSafe(`requests/${id}`, { status: 'rejected' });
-      setRequests((prev) => (Array.isArray(prev) ? prev.filter((r) => r.id !== id) : []));
+      await updateDocNative('requests', id, { status: 'rejected' });
+      setRequests((prev) => prev.filter((r) => r.id !== id));
       Toast.show({ type: 'info', text1: 'Request Rejected' });
-    } catch (e: any) {
-      Toast.show({ type: 'error', text1: 'Error rejecting request', text2: e.message });
+    } catch (e: unknown) {
+      console.error('[CoordinatorDashboard] rejectCoordinatorRequest failed', e);
+      Toast.show({ type: 'error', text1: 'Error rejecting request' });
     }
   };
 
   const handleDeleteGame = async (id: string) => {
     try {
-      await deleteDocSafe(`games/${id}`);
+      await deleteDocNative('games', id);
       Toast.show({ type: 'info', text1: 'Game removed' });
-      setGames((prev) => (Array.isArray(prev) ? prev.filter((g) => g.id !== id) : []));
-    } catch (e: any) {
-      Toast.show({ type: 'error', text1: 'Delete failed', text2: e?.message || '' });
-    }
-  };
-
-  // Count coordinators by querying users for teamId
-  const countCoordinators = async (teamId: string) => {
-    try {
-      // listTopLevelCollection avoids runQuery structuredQuery POST
-      const docs = await listTopLevelCollection('users', 1000);
-      const filtered = (docs as any[]).filter((d) => d.teamId === teamId);
-      return filtered.filter((d: any) => !!d.isCoordinator).length;
-    } catch (e) {
-      console.warn('[countCoordinators] fallback failed', e);
-      // conservative default: 1 (prevent accidental leaves if uncertain)
-      return 1;
+      setGames((prev) => prev.filter((g) => (g as { id: string }).id !== id));
+    } catch (e: unknown) {
+      console.error('[CoordinatorDashboard] deleteGame failed', e);
+      Toast.show({ type: 'error', text1: 'Delete failed' });
     }
   };
 
   const handleLeaveTeam = async () => {
     if (!user?.uid || !teamData?.id) return;
     try {
-      const coordCount = await countCoordinators(teamData.id);
-      if (coordCount <= 1) {
-        Toast.show({
-          type: 'info',
-          text1: 'Cannot leave',
-          text2: 'You are the last coordinator — delete the team instead.',
-        });
+      const coordSnap = await firestore()
+        .collection('users')
+        .where('teamId', '==', teamData.id)
+        .where('isCoordinator', '==', true)
+        .get();
+
+      if (coordSnap.size <= 1) {
+        Toast.show({ type: 'info', text1: 'Cannot leave', text2: 'You are the last coordinator — delete the team instead.' });
         return;
       }
 
       Alert.alert(
         'Leave Team',
-        'Are you sure you want to leave this team as a coordinator? You will lose coordinator privileges.',
+        'Are you sure? You will lose coordinator privileges.',
         [
           { text: 'Cancel', style: 'cancel' },
           {
@@ -772,52 +479,39 @@ export default function CoordinatorDashboardScreen() {
             style: 'destructive',
             onPress: async () => {
               try {
-                await ensureFirestoreOnline();
-                await updateDocSafe(`users/${user.uid}`, { teamId: '', isCoordinator: false });
+                await updateDocNative('users', user.uid, { teamId: '', isCoordinator: false });
                 Toast.show({ type: 'success', text1: 'You left the team' });
                 router.replace('/(tabs)');
-              } catch (e: any) {
-                console.error('Leave failed', e);
-                Toast.show({ type: 'error', text1: 'Leave failed', text2: e?.message || '' });
+              } catch (e: unknown) {
+                console.error('[CoordinatorDashboard] leaveTeam failed', e);
+                Toast.show({ type: 'error', text1: 'Leave failed' });
               }
             },
           },
         ],
         { cancelable: true }
       );
-    } catch (e: any) {
-      console.error('Count coordinators failed', e);
-      Toast.show({ type: 'error', text1: 'Action failed', text2: e?.message || '' });
+    } catch (e: unknown) {
+      console.error('[CoordinatorDashboard] handleLeaveTeam failed', e);
+      Toast.show({ type: 'error', text1: 'Action failed' });
     }
   };
 
-  // Delete team: destructive — removes team doc + games + requests, and clears teamId for users
   const handleDeleteTeam = async () => {
     if (!user?.uid || !teamData?.id) return;
-
-    // Check for outstanding game availabilities (future games)
     const nowMs = Date.now();
-    const outstandingGames = games.filter((g) => {
-      // Check if game has expired based on expiresAt or startISO
-      if (g.expiresAt) {
-        const t = new Date(g.expiresAt).getTime();
-        if (!isNaN(t) && t > nowMs) return true;
-      }
-      if (g.startISO) {
-        const t = new Date(g.startISO).getTime();
-        if (!isNaN(t) && t > nowMs) return true;
-      }
-      return false;
-    });
+    const outstandingCount = games.filter((g) => {
+      const t = new Date(String((g as Record<string, unknown>).startISO ?? '')).getTime();
+      return !isNaN(t) && t > nowMs;
+    }).length;
 
-    // Build warning message based on outstanding games
-    const gameWarning = outstandingGames.length > 0
-      ? `\n\nThis includes ${outstandingGames.length} outstanding game ${outstandingGames.length === 1 ? 'availability' : 'availabilities'} that will also be deleted.`
+    const warningMsg = outstandingCount > 0
+      ? `\n\nIncludes ${outstandingCount} upcoming game(s) that will also be deleted.`
       : '';
 
     Alert.alert(
       'Delete Team',
-      `This will permanently delete the team, all its games${gameWarning ? ' (including active game availabilities)' : ''}, all requests, and remove the team from member profiles. This action cannot be undone.${gameWarning}\n\nContinue?`,
+      `This permanently deletes the team, all games, and all requests. This cannot be undone.${warningMsg}\n\nContinue?`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -825,39 +519,19 @@ export default function CoordinatorDashboardScreen() {
           style: 'destructive',
           onPress: async () => {
             try {
-              await ensureFirestoreOnline();
+              const ops: Array<{ op: 'update' | 'delete'; col: string; id: string; data?: Record<string, unknown> }> = [];
+              games.forEach((g) => { if ((g as { id: string }).id) ops.push({ op: 'delete', col: 'games', id: (g as { id: string }).id }); });
+              requests.forEach((r) => { if (r.id) ops.push({ op: 'delete', col: 'requests', id: r.id }); });
+              ops.push({ op: 'update', col: 'users', id: user.uid, data: { teamId: '', isCoordinator: false } });
+              ops.push({ op: 'delete', col: 'teams', id: teamData.id });
+              await runBatch(ops);
 
-              const ops: Array<{ op: 'update' | 'delete'; path: string; data?: any }> = [];
-
-              // Delete all games using the already-loaded games state
-              games.forEach((g: any) => {
-                if (g.id) ops.push({ op: 'delete', path: `games/${g.id}` });
-              });
-
-              // Delete all join requests using the already-loaded requests state
-              requests.forEach((r: any) => {
-                if (r.id) ops.push({ op: 'delete', path: `requests/${r.id}` });
-              });
-
-              // Clear current user's team association
-              ops.push({ 
-                op: 'update', 
-                path: `users/${user.uid}`, 
-                data: { teamId: '', isCoordinator: false } 
-              });
-
-              // Delete the team doc
-              ops.push({ op: 'delete', path: `teams/${teamData.id}` });
-
-              await runBatchSafe(ops);
-
-              Toast.show({ type: 'success', text1: 'Team deleted', text2: 'All games and requests have been removed.' });
-              router.replace('/(tabs)/HomeScreen');
-
-              try { emitAppEvent('team:deleted', { teamId: teamData.id }); } catch (e) {}
-            } catch (e: any) {
-              console.error('Delete team failed', e);
-              Toast.show({ type: 'error', text1: 'Delete failed', text2: e?.message || '' });
+              Toast.show({ type: 'success', text1: 'Team deleted' });
+              try { emitAppEvent('team:deleted', { teamId: teamData.id }); } catch {}
+              router.replace('/(tabs)');
+            } catch (e: unknown) {
+              console.error('[CoordinatorDashboard] deleteTeam failed', e);
+              Toast.show({ type: 'error', text1: 'Delete failed' });
             }
           },
         },
@@ -866,93 +540,64 @@ export default function CoordinatorDashboardScreen() {
     );
   };
 
-  const PlacesComp: any = (placesComponent as any) ?? null;
+  // ── Render helpers ─────────────────────────────────────────────────────────
 
-  const Jersey = ({
-    color,
-    label,
-    onPress,
-  }: {
-    color: string;
-    label: string;
-    onPress?: () => void;
-  }) => {
-    return (
-      <TouchableOpacity
-        onPress={onPress}
-        disabled={!onPress}
-        activeOpacity={onPress ? 0.8 : 1}
-        style={{ opacity: onPress ? 1 : 0.85 }}
-      >
-        <View style={styles.jerseyCard}>
-          <View style={styles.jerseyBox}>
-            <ExpoImage
-              source={require('../../assets/images/jersey_fill.png')}
-              style={[styles.jerseyImg, { tintColor: color }]}
-              contentFit="contain"
-            />
-            <ExpoImage
-              source={require('../../assets/images/jersey_outline.png')}
-              style={styles.jerseyImg}
-              contentFit="contain"
-            />
-          </View>
-          <Text style={styles.jerseyLabel}>{label}</Text>
+  const Jersey = ({ color, label, onPress }: { color: string; label: string; onPress?: () => void }) => (
+    <TouchableOpacity onPress={onPress} disabled={!onPress} activeOpacity={onPress ? 0.8 : 1} style={styles.jerseyTouchable}>
+      <View style={styles.jerseyCard}>
+        <View style={styles.jerseyBox}>
+          <ExpoImage source={require('@/assets/images/jersey_fill.png')} style={[styles.jerseyImg, { tintColor: color }]} contentFit="contain" />
+          <ExpoImage source={require('@/assets/images/jersey_outline.png')} style={styles.jerseyImg} contentFit="contain" />
         </View>
-      </TouchableOpacity>
-    );
-  };
+        <Text style={styles.jerseyLabel}>{label}</Text>
+      </View>
+    </TouchableOpacity>
+  );
+
+  // ── Guards ─────────────────────────────────────────────────────────────────
 
   if (loading) {
     return (
       <View style={styles.center}>
         <ActivityIndicator size="large" color="#0a7ea4" />
-        <Text style={{ marginTop: 10 }}>Loading dashboard...</Text>
+        <Text style={styles.loadingText}>Loading dashboard...</Text>
       </View>
     );
-  }
-
-  if (!user) {
-    router.replace('/(auth)/LoginScreen');
-    return null;
   }
 
   if (!teamData?.id) {
     return (
       <View style={styles.center}>
-        <Text style={{ fontSize: 18, color: '#444', textAlign: 'center', marginBottom: 12 }}>
-          No team data available. Create or join a team to manage it.
-        </Text>
-        <Button title="Create Team" onPress={() => router.push('/(tabs)/CreateTeamScreen')} />
-        <View style={{ height: 8 }} />
-        <Button title="Find a Team" onPress={() => router.push('/(tabs)/FindATeam')} />
+        <Text style={styles.emptyText}>No team data available. Create or join a team.</Text>
+        <TouchableOpacity style={styles.actionButton} onPress={() => router.push('/(tabs)/CreateTeamScreen')}>
+          <Text style={styles.buttonText}>Create Team</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={[styles.actionButton, styles.secondaryButton]} onPress={() => router.push('/(tabs)/FindATeam')}>
+          <Text style={styles.buttonText}>Find a Team</Text>
+        </TouchableOpacity>
       </View>
     );
   }
 
-  const sections: Array<{ key: string; title: string; data: any[] }> = [
-    { key: 'requests', title: 'Pending Coordinator Requests', data: requests },
-    { key: 'gameRequests', title: 'Game Requests', data: gameRequests },
-    { key: 'games', title: 'Created Game Events', data: games },
+  const PlacesComp = placesComponent;
+
+  const sections: Array<{ key: string; title: string; data: DashboardItem[] }> = [
+    { key: 'requests', title: 'Pending Coordinator Requests', data: requests as DashboardItem[] },
+    { key: 'gameRequests', title: 'Game Requests', data: gameRequests as DashboardItem[] },
+    { key: 'games', title: 'Created Game Events', data: games as DashboardItem[] },
   ];
+
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <>
-      {/* Keep modals outside so they overlay the whole screen */}
       <Modal visible={!!activePicker} animationType="slide">
         <View style={styles.modalContainer}>
-          <Text style={styles.modalTitle}>
-            Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color
-          </Text>
+          <Text style={styles.modalTitle}>Pick {activePicker === 'home' ? 'Home' : 'Away'} Kit Color</Text>
           <ColorPicker
-            color={
-              activePicker === 'home'
-                ? teamData.homeColor ?? '#0a7ea4'
-                : teamData.awayColor ?? '#ffffff'
-            }
+            color={activePicker === 'home' ? (teamData.homeColor ?? '#0a7ea4') : (teamData.awayColor ?? '#ffffff')}
             onColorChangeComplete={(color: string) => {
-              if (activePicker === 'home') setTeamData({ ...teamData, homeColor: color });
-              else setTeamData({ ...teamData, awayColor: color });
+              setTeamData((prev) => prev ? { ...prev, [activePicker === 'home' ? 'homeColor' : 'awayColor']: color } : prev);
             }}
             thumbSize={30}
             sliderSize={30}
@@ -960,7 +605,9 @@ export default function CoordinatorDashboardScreen() {
             row={false}
             swatches
           />
-          <Button title="Done" onPress={() => setActivePicker(null)} />
+          <TouchableOpacity style={styles.actionButton} onPress={() => setActivePicker(null)}>
+            <Text style={styles.buttonText}>Done</Text>
+          </TouchableOpacity>
         </View>
       </Modal>
 
@@ -969,18 +616,22 @@ export default function CoordinatorDashboardScreen() {
           <Text style={styles.modalTitle}>Game Request</Text>
           {selectedGameRequest ? (
             <>
-              <Text style={{ fontSize: 18, fontWeight: '700', marginBottom: 8 }}>{selectedGameRequest.title ?? 'Game'}</Text>
+              <Text style={styles.modalGameTitle}>{selectedGameRequest.title ?? 'Game'}</Text>
               <Text>Requesting Team: {selectedGameRequest.requestingTeamName ?? 'Unknown'}</Text>
               <Text>Requester: {selectedGameRequest.requestedByName ?? selectedGameRequest.requestedBy ?? 'Unknown'}</Text>
               <Text>Type: {(selectedGameRequest.type ?? 'home').toUpperCase()}</Text>
               <Text>Kit Color: {selectedGameRequest.kitColor ?? 'n/a'}</Text>
               <Text>Time: {selectedGameRequest.startISO ? new Date(selectedGameRequest.startISO).toLocaleString() : 'n/a'}</Text>
-
-              <View style={{ height: 12 }} />
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
-                <Button title="Approve" color="#0a7ea4" onPress={() => selectedGameRequest && handleApproveGameRequest(selectedGameRequest)} />
-                <Button title="Reject" color="#FF3B30" onPress={() => selectedGameRequest && handleRejectGameRequest(selectedGameRequest.id)} />
-                <Button title="Close" color="#999" onPress={() => { setRequestModalVisible(false); setSelectedGameRequest(null); }} />
+              <View style={styles.modalActions}>
+                <TouchableOpacity style={[styles.actionButton, { flex: 1 }]} onPress={() => handleApproveGameRequest(selectedGameRequest)}>
+                  <Text style={styles.buttonText}>Approve</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.actionButton, styles.dangerButton, { flex: 1 }]} onPress={() => handleRejectGameRequest(selectedGameRequest.id)}>
+                  <Text style={styles.buttonText}>Reject</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.actionButton, styles.secondaryButton, { flex: 1 }]} onPress={() => { setRequestModalVisible(false); setSelectedGameRequest(null); }}>
+                  <Text style={styles.buttonText}>Close</Text>
+                </TouchableOpacity>
               </View>
             </>
           ) : (
@@ -991,23 +642,20 @@ export default function CoordinatorDashboardScreen() {
 
       <SectionList
         sections={sections}
-        keyExtractor={(item, index) => (item?.id ? String(item.id) : `${index}-${item?.title ?? ''}`)}
+        keyExtractor={(item, index) => ((item as { id?: string })?.id ? String((item as { id: string }).id) : `${index}`)}
         contentContainerStyle={styles.container}
         stickySectionHeadersEnabled={false}
         ListHeaderComponent={() => (
           <>
             <Text style={styles.title}>Coordinator Dashboard</Text>
 
-            {/* Rating History Chart */}
-            {ratingHistory.length > 0 && (
+            {ratingHistory.length > 1 && (
               <View style={styles.chartContainer}>
                 <Text style={styles.chartTitle}>Rating History</Text>
                 <LineChart
                   data={{
-                    labels: ratingHistory.map((_, i) => i === 0 ? 'Start' : i.toString()),
-                    datasets: [{
-                      data: ratingHistory.map(d => d.y),
-                    }],
+                    labels: ratingHistory.map((_, i) => (i === 0 ? 'Start' : String(i))),
+                    datasets: [{ data: ratingHistory.map((d) => d.y) }],
                   }}
                   width={Dimensions.get('window').width - 40}
                   height={220}
@@ -1018,20 +666,10 @@ export default function CoordinatorDashboardScreen() {
                     decimalPlaces: 0,
                     color: (opacity = 1) => `rgba(10, 126, 164, ${opacity})`,
                     labelColor: (opacity = 1) => `rgba(0, 0, 0, ${opacity})`,
-                    style: {
-                      borderRadius: 16,
-                    },
-                    propsForDots: {
-                      r: '4',
-                      strokeWidth: '2',
-                      stroke: '#0a7ea4',
-                    },
+                    propsForDots: { r: '4', strokeWidth: '2', stroke: '#0a7ea4' },
                   }}
                   bezier
-                  style={{
-                    marginVertical: 8,
-                    borderRadius: 16,
-                  }}
+                  style={styles.chart}
                 />
                 <Text style={styles.chartSubtext}>
                   Current: {Math.round(teamData?.elo ?? 1500)} | Games: {ratingHistory.length - 1}
@@ -1039,72 +677,70 @@ export default function CoordinatorDashboardScreen() {
               </View>
             )}
 
-            <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 10, marginBottom: 12 }}>
+            <View style={styles.buttonRow}>
               {!editing ? (
-                <Button
-                  title="Edit Team"
-                  onPress={() => {
-                    originalTeamRef.current = { ...(teamData || {}) };
-                    setEditing(true);
-                  }}
-                  color="#0a7ea4"
-                />
+                <TouchableOpacity
+                  style={styles.actionButton}
+                  onPress={() => { originalTeamRef.current = { ...teamData }; setEditing(true); }}
+                >
+                  <Text style={styles.buttonText}>Edit Team</Text>
+                </TouchableOpacity>
               ) : (
                 <>
-                  <Button title={saving ? 'Saving...' : 'Save'} onPress={handleSaveTeam} disabled={saving} color="#0a7ea4" />
-                  <View style={{ width: 10 }} />
-                  <Button title="Cancel" onPress={handleCancelEdit} color="#FF3B30" />
+                  <TouchableOpacity style={[styles.actionButton, saving && styles.buttonDisabled]} onPress={handleSaveTeam} disabled={saving}>
+                    <Text style={styles.buttonText}>{saving ? 'Saving...' : 'Save'}</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={handleCancelEdit}>
+                    <Text style={styles.buttonText}>Cancel</Text>
+                  </TouchableOpacity>
                 </>
               )}
             </View>
 
-            <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 12, marginBottom: 16 }}>
-              <Button title="Game Results" onPress={() => router.push('/(tabs)/GameResultsScreen')} color="#4CAF50" />
-              <Button title="Leave Team" onPress={handleLeaveTeam} color="#FF9500" />
-              <Button title="Delete Team" onPress={handleDeleteTeam} color="#FF3B30" />
+            <View style={styles.buttonRow}>
+              <TouchableOpacity style={[styles.actionButton, styles.successButton]} onPress={() => router.push('/(tabs)/GameResultsScreen')}>
+                <Text style={styles.buttonText}>Game Results</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.actionButton, styles.warningButton]} onPress={handleLeaveTeam}>
+                <Text style={styles.buttonText}>Leave Team</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={handleDeleteTeam}>
+                <Text style={styles.buttonText}>Delete Team</Text>
+              </TouchableOpacity>
             </View>
 
             {editing ? (
               <TextInput
                 style={styles.input}
                 value={teamData.teamName}
-                onChangeText={(text) => setTeamData({ ...teamData, teamName: text })}
-                editable
+                onChangeText={(text) => setTeamData((prev) => prev ? { ...prev, teamName: text } : prev)}
                 placeholder="Team Name"
               />
             ) : (
               <>
                 <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
-                <Text style={[styles.readOnlyText, { marginTop: 6, fontSize: 14 }]}>
+                <Text style={[styles.readOnlyText, styles.ratingText]}>
                   Rating: {Math.min(Math.max(teamData?.elo ?? 1500, 800), 3000)}
                 </Text>
               </>
             )}
 
             {editing ? (
-              // Location: editable only when editing
-              // Only mount GooglePlacesAutocomplete when we have both the component and an API key.
-              // Otherwise fall back to a plain TextInput. Wrap the third-party comp in an error boundary.np
-              (PlacesComp && GOOGLE_MAPS_API_KEY) ? (
+              PlacesComp && GOOGLE_MAPS_API_KEY ? (
                 <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
                   <PlacesComp
                     ref={autocompleteRef}
                     placeholder="Search ice rink..."
-                    fetchDetails={true}
+                    fetchDetails
                     debounce={400}
-                    predefinedPlaces={[]}
                     nearbyPlacesAPI="GooglePlacesSearch"
-                    onPress={(data: any, details: any = null) => {
+                    onPress={(data: { description: string }, details: { geometry: { location: { lat: number; lng: number } } } | null) => {
                       const lat = details?.geometry?.location?.lat ?? 0;
                       const lng = details?.geometry?.location?.lng ?? 0;
-                      setTeamData({ ...teamData, location: data.description, latitude: lat, longitude: lng });
+                      setTeamData((prev) => prev ? { ...prev, location: data.description, latitude: lat, longitude: lng } : prev);
                     }}
-                    query={{
-                      key: GOOGLE_MAPS_API_KEY,
-                      language: 'en',
-                      types: 'establishment',
-                    }}
-                    styles={{ textInput: styles.input, container: { marginBottom: 10 } }}
+                    query={{ key: GOOGLE_MAPS_API_KEY, language: 'en', types: 'establishment' }}
+                    styles={{ textInput: styles.input, container: styles.placesContainer }}
                   />
                 </PlacesErrorBoundary>
               ) : (
@@ -1112,48 +748,42 @@ export default function CoordinatorDashboardScreen() {
                   style={styles.input}
                   placeholder="Location (rink or arena)"
                   value={teamData?.location ?? ''}
-                  onChangeText={(t) => setTeamData({ ...teamData, location: t })}
+                  onChangeText={(t) => setTeamData((prev) => prev ? { ...prev, location: t } : prev)}
                 />
               )
-             ) : (
-               <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
-             )}
+            ) : (
+              <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
+            )}
 
             <View style={styles.kitRow}>
-              <Jersey
-                color={teamData.homeColor ?? '#0a7ea4'}
-                label="Home"
-                onPress={editing ? () => setActivePicker('home') : undefined}
-              />
-              <Jersey
-                color={teamData.awayColor ?? '#ffffff'}
-                label="Away"
-                onPress={editing ? () => setActivePicker('away') : undefined}
-              />
+              <Jersey color={teamData.homeColor ?? '#0a7ea4'} label="Home" {...(editing ? { onPress: () => setActivePicker('home') } : {})} />
+              <Jersey color={teamData.awayColor ?? '#ffffff'} label="Away" {...(editing ? { onPress: () => setActivePicker('away') } : {})} />
             </View>
           </>
         )}
         renderSectionHeader={({ section }) => (
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
+          <View style={styles.sectionHeaderRow}>
             <Text style={styles.subtitle}>{section.title}</Text>
-            {section.key === 'gameRequests' ? (
-              <Button title="Open Scheduler" onPress={() => router.push('/(tabs)/GameSchedulerScreen')} color="#0a7ea4" />
-            ) : null}
+            {section.key === 'gameRequests' && (
+              <TouchableOpacity style={styles.smallButton} onPress={() => router.push('/(tabs)/GameSchedulerScreen')}>
+                <Text style={styles.buttonText}>Open Scheduler</Text>
+              </TouchableOpacity>
+            )}
           </View>
         )}
         renderItem={({ item, section }) => {
           if (!item) return null;
 
-          // Pending coordinator join requests
           if (section.key === 'requests') {
+            const req = item as CoordinatorRequest;
             return (
               <View style={styles.requestCard}>
-                <Text style={styles.requestEmail}>{item.userEmail}</Text>
+                <Text style={styles.requestEmail}>{req.userEmail}</Text>
                 <View style={styles.requestButtons}>
-                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#0a7ea4' }]} onPress={() => handleApprove(item)}>
+                  <TouchableOpacity style={[styles.actionButton, { flex: 1 }]} onPress={() => handleApproveCoordinatorRequest(req)}>
                     <Text style={styles.buttonText}>Approve</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#FF3B30' }]} onPress={() => handleReject(item.id)}>
+                  <TouchableOpacity style={[styles.actionButton, styles.dangerButton, { flex: 1 }]} onPress={() => handleRejectCoordinatorRequest(req.id)}>
                     <Text style={styles.buttonText}>Reject</Text>
                   </TouchableOpacity>
                 </View>
@@ -1161,38 +791,26 @@ export default function CoordinatorDashboardScreen() {
             );
           }
 
-          // Team game requests
           if (section.key === 'gameRequests') {
-            const dtText = item.startISO ? new Date(item.startISO).toLocaleString() : 'No time';
-            const requesting = item.requestingTeamName ?? item.requestingTeamId ?? 'Unknown Team';
+            const req = item as GameRequest;
             return (
-              <TouchableOpacity
-                style={styles.requestCard}
-                onPress={() => {
-                  setSelectedGameRequest(item);
-                  setRequestModalVisible(true);
-                }}
-              >
-                <Text style={{ fontWeight: '700' }}>Game Request — {requesting}</Text>
-                <Text style={{ color: '#444' }}>{dtText} • {(item.type ?? 'home').toUpperCase()}</Text>
+              <TouchableOpacity style={styles.requestCard} onPress={() => { setSelectedGameRequest(req); setRequestModalVisible(true); }}>
+                <Text style={styles.cardTitle}>Game Request — {req.requestingTeamName ?? req.requestingTeamId ?? 'Unknown'}</Text>
+                <Text style={styles.cardSubtitle}>
+                  {req.startISO ? new Date(req.startISO).toLocaleString() : 'No time'} • {(req.type ?? 'home').toUpperCase()}
+                </Text>
               </TouchableOpacity>
             );
           }
 
-          // Games / availability
           if (section.key === 'games') {
-            const dt = item?.startISO ? new Date(item.startISO) : null;
-            const title = item?.title ?? 'Game';
-            const typeLabel = (item?.type ?? '').toString().toUpperCase() || 'N/A';
-            const recurringFreq = item?.recurring?.freq ?? null;
-
+            const game = item as unknown as Record<string, unknown>;
             return (
               <View style={styles.requestCard}>
-                <Text style={{ fontWeight: '600' }}>{title} — {typeLabel}</Text>
-                <Text>{dt ? dt.toLocaleString() : 'No time set'}</Text>
-                {recurringFreq ? <Text style={{ color: '#666' }}>Recurring: {String(recurringFreq)}</Text> : null}
-                <View style={{ flexDirection: 'row', marginTop: 8 }}>
-                  <TouchableOpacity style={[styles.actionButton, { backgroundColor: '#FF3B30' }]} onPress={() => item?.id && handleDeleteGame(item.id)}>
+                <Text style={styles.cardTitle}>{String(game.title ?? 'Game')} — {String(game.type ?? '').toUpperCase() || 'N/A'}</Text>
+                <Text>{game.startISO ? new Date(String(game.startISO)).toLocaleString() : 'No time set'}</Text>
+                <View style={styles.cardActions}>
+                  <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={() => game.id && handleDeleteGame(String(game.id))}>
                     <Text style={styles.buttonText}>Delete</Text>
                   </TouchableOpacity>
                 </View>
@@ -1203,175 +821,59 @@ export default function CoordinatorDashboardScreen() {
           return null;
         }}
         renderSectionFooter={({ section }) => {
-          if (!section || !Array.isArray(section.data)) return null;
-
-          // Requests (coordinator join requests) empty message
-          if (section.key === 'requests' && section.data.length === 0) {
-            return (
-              <View style={{ paddingVertical: 8 }}>
-                <Text style={{ textAlign: 'center', color: '#666' }}>No pending coordinator requests</Text>
-              </View>
-            );
+          if (!section?.data?.length) {
+            if (section.key === 'requests') return <Text style={styles.emptySection}>No pending coordinator requests</Text>;
+            if (section.key === 'gameRequests') return <Text style={styles.emptySection}>No game requests</Text>;
           }
-
-          // Game requests empty message
-          if (section.key === 'gameRequests' && section.data.length === 0) {
-            return (
-              <View style={{ paddingVertical: 8 }}>
-                <Text style={{ textAlign: 'center', color: '#666' }}>No game requests</Text>
-              </View>
-            );
-          }
-
-          // For other sections, show nothing here
           return null;
         }}
-        ListEmptyComponent={() => (
-          <View style={{ paddingVertical: 12 }}>
-            <Text style={{ textAlign: 'center', color: '#999' }}>No items</Text>
-          </View>
-        )}
       />
     </>
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
 const styles = StyleSheet.create({
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  center: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
+  loadingText: { marginTop: 10, color: '#444' },
+  emptyText: { fontSize: 16, color: '#444', textAlign: 'center', marginBottom: 16 },
   container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
-  title: {
-    fontSize: 26,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 20,
-    color: '#0a7ea4',
-  },
-  subtitle: {
-    fontSize: 20,
-    fontWeight: '600',
-    marginVertical: 15,
-    color: '#0a7ea4',
-  },
-  input: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    padding: 10,
-    marginBottom: 10,
-    borderRadius: 6,
-  },
+  title: { fontSize: 26, fontWeight: 'bold', textAlign: 'center', marginBottom: 20, color: '#0a7ea4' },
+  subtitle: { fontSize: 18, fontWeight: '600', marginVertical: 12, color: '#0a7ea4' },
+  sectionHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 },
+  input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 10, borderRadius: 6 },
+  readOnlyText: { borderWidth: 1, borderColor: '#ddd', padding: 10, marginBottom: 10, borderRadius: 6, backgroundColor: '#f9f9f9', color: '#333', fontSize: 16 },
+  ratingText: { marginTop: 4, fontSize: 14 },
   kitRow: { flexDirection: 'row', justifyContent: 'space-around', marginBottom: 20 },
+  jerseyTouchable: { opacity: 1 },
   jerseyCard: { alignItems: 'center' },
   jerseyBox: { width: 110, height: 110, position: 'relative' },
   jerseyImg: { position: 'absolute', width: '100%', height: '100%' },
   jerseyLabel: { marginTop: 8, fontSize: 16, fontWeight: '600', color: '#000' },
-  modalContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 20,
-    backgroundColor: '#fff',
-  },
-  modalTitle: { fontSize: 20, fontWeight: '600', marginBottom: 20, textAlign: 'center' },
-  requestCard: {
-    borderWidth: 1,
-    borderColor: '#ccc',
-    borderRadius: 8,
-    padding: 10,
-    marginBottom: 10,
-  },
+  buttonRow: { flexDirection: 'row', justifyContent: 'center', gap: 8, marginBottom: 12, flexWrap: 'wrap' },
+  actionButton: { backgroundColor: '#0a7ea4', paddingVertical: 10, paddingHorizontal: 16, borderRadius: 8, alignItems: 'center', marginHorizontal: 4, marginVertical: 4 },
+  smallButton: { backgroundColor: '#0a7ea4', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6, alignItems: 'center' },
+  dangerButton: { backgroundColor: '#FF3B30' },
+  warningButton: { backgroundColor: '#FF9500' },
+  successButton: { backgroundColor: '#4CAF50' },
+  secondaryButton: { backgroundColor: '#444' },
+  buttonDisabled: { opacity: 0.6 },
+  buttonText: { color: '#fff', fontWeight: '600', fontSize: 14 },
+  requestCard: { borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 12, marginBottom: 10 },
   requestEmail: { fontSize: 16, fontWeight: '500', marginBottom: 10 },
-  requestButtons: { flexDirection: 'row', justifyContent: 'space-between' },
-  actionButton: {
-    flex: 1,
-    padding: 10,
-    borderRadius: 6,
-    marginHorizontal: 5,
-    alignItems: 'center',
-  },
-  buttonText: { color: 'white', fontWeight: '600' },
-  noRequests: { textAlign: 'center', color: '#999', fontSize: 16 },
-  readOnlyText: {
-    borderWidth: 1,
-    borderColor: '#ddd',
-    padding: 10,
-    marginBottom: 10,
-    borderRadius: 6,
-    backgroundColor: '#f9f9f9',
-    color: '#333',
-    fontSize: 16,
-  },
-  listPanel: {
-    maxHeight: 220,
-    marginBottom: 12,
-  },
-  chartContainer: {
-    marginBottom: 20,
-    paddingVertical: 16,
-    paddingHorizontal: 8,
-    backgroundColor: '#f9f9f9',
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: '#e0e0e0',
-  },
-  chartTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#0a7ea4',
-    marginBottom: 8,
-    textAlign: 'center',
-  },
-  chartSubtext: {
-    fontSize: 12,
-    color: '#666',
-    textAlign: 'center',
-    marginTop: 8,
-  },
+  requestButtons: { flexDirection: 'row', gap: 8 },
+  cardTitle: { fontWeight: '700', fontSize: 15, marginBottom: 4 },
+  cardSubtitle: { color: '#444' },
+  cardActions: { flexDirection: 'row', marginTop: 8 },
+  emptySection: { textAlign: 'center', color: '#666', paddingVertical: 8 },
+  modalContainer: { flex: 1, justifyContent: 'center', padding: 20, backgroundColor: '#fff' },
+  modalTitle: { fontSize: 20, fontWeight: '600', marginBottom: 20, textAlign: 'center' },
+  modalGameTitle: { fontSize: 18, fontWeight: '700', marginBottom: 8 },
+  modalActions: { flexDirection: 'row', gap: 8, marginTop: 16 },
+  placesContainer: { marginBottom: 10 },
+  chartContainer: { marginBottom: 20, paddingVertical: 16, paddingHorizontal: 8, backgroundColor: '#f9f9f9', borderRadius: 12, borderWidth: 1, borderColor: '#e0e0e0' },
+  chartTitle: { fontSize: 18, fontWeight: '700', color: '#0a7ea4', marginBottom: 8, textAlign: 'center' },
+  chartSubtext: { fontSize: 12, color: '#666', textAlign: 'center', marginTop: 8 },
+  chart: { marginVertical: 8, borderRadius: 16 },
 });
-
-// --- helper: waitForAuthUser ---
-async function waitForAuthUser(timeoutMs = 3000): Promise<any | null> {
-  const a = auth as any;
-  if (!a) return null;
-
-  // fast-path
-  if (a.currentUser) return a.currentUser;
-
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = (u: any) => {
-      if (!done) {
-        done = true;
-        resolve(u ?? null);
-      }
-    };
-
-    try {
-      // Native SDK: auth.onAuthStateChanged exists on the auth object
-      if (typeof a.onAuthStateChanged === 'function') {
-        const unsub = a.onAuthStateChanged((u: any) => {
-          finish(u);
-          try { unsub(); } catch {}
-        });
-        // guaranteed timeout fallback
-        setTimeout(() => { finish(a.currentUser ?? null); try { unsub(); } catch {} }, timeoutMs);
-        return;
-      }
-
-      // Web modular: import onAuthStateChanged and subscribe
-      import('firebase/auth')
-        .then(({ onAuthStateChanged }) => {
-          try {
-            const unsub = onAuthStateChanged(a, (u: any) => {
-              finish(u);
-              try { unsub(); } catch {}
-            });
-            setTimeout(() => { finish(a.currentUser ?? null); try { unsub(); } catch {} }, timeoutMs);
-          } catch {
-            finish(a.currentUser ?? null);
-          }
-        })
-        .catch(() => finish(a.currentUser ?? null));
-    } catch {
-      finish(a.currentUser ?? null);
-    }
-  });
-}

@@ -1,16 +1,17 @@
 import React from 'react';
-import { Image, ImageSourcePropType, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
+import type { ImageSourcePropType } from 'react-native';
+import { Image, Modal, Pressable, StyleSheet, Text, View } from 'react-native';
 
 type Props = {
   visible: boolean;
-  title?: string;
-  body?: string;
-  imageSource?: ImageSourcePropType;
-  onClose: () => void; // fallback close
+  title?: string | undefined;
+  body?: string | undefined;
+  imageSource?: ImageSourcePropType | undefined;
+  onClose: () => void;
   // new:
-  onPrimary?: () => void; // primary button action (Next / Got it)
-  primaryLabel?: string;
-  size?: 'default' | 'small';
+  onPrimary?: (() => void) | undefined;
+  primaryLabel?: string | undefined;
+  size?: ('default' | 'small') | undefined;
 };
 
 const defaultMascot = require('../../assets/images/mascot.png');

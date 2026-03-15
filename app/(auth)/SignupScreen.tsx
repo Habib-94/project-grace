@@ -1,50 +1,39 @@
 // app/(auth)/SignupScreen.tsx
-import { useRouter } from 'expo-router';
-import React, { useState } from 'react';
+import { useAuth } from '@/context/AuthContext';
 import {
-  Alert,
-  Button,
+  checkPasswordRequirements,
+  sanitizeEmail,
+  sanitizeText,
+  validatePassword,
+} from '@/src/utils/security';
+import { useRouter } from 'expo-router';
+import React, { useMemo, useState } from 'react';
+import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
+  TouchableOpacity,
   View,
 } from 'react-native';
-import { auth, db, ensureFirestoreOnline } from '../../src/firebaseConfig';
-import { setDocumentSafe } from '../../src/utils/firebase-helpers';
-import { checkPasswordRequirements, redactSensitiveData, sanitizeEmail, sanitizeText, validatePassword } from '../../src/utils/security';
+import Toast from 'react-native-toast-message';
 
-/**
- * Runtime-safe helpers:
- * - createUserSafe: creates an auth user using the native SDK if present, otherwise web SDK.
- * - setUserDocSafe: writes users/{uid} using native firestore if present, otherwise web SDK.
- */
-
-async function createUserSafe(email: string, password: string) {  
-  if (!auth) throw new Error('Auth not initialized');
-  
-  // Try native SDK first
-  const authInstance = auth as any;
-  if (authInstance && typeof authInstance.createUserWithEmailAndPassword === 'function') {
-    return await authInstance.createUserWithEmailAndPassword(email, password);
+/** Map Firebase Auth error codes to user-friendly messages. */
+function getFriendlyAuthError(code: string): string {
+  switch (code) {
+    case 'auth/email-already-in-use':
+      return 'An account with this email already exists.';
+    case 'auth/invalid-email':
+      return 'Please enter a valid email address.';
+    case 'auth/weak-password':
+      return 'Please choose a stronger password.';
+    case 'auth/network-request-failed':
+      return 'Network error. Please check your connection.';
+    default:
+      return 'Sign up failed. Please try again.';
   }
-
-  // Web modular fallback
-  const { createUserWithEmailAndPassword } = await import('firebase/auth');
-  return await createUserWithEmailAndPassword(auth, email, password);
-}
-
-async function updateProfileSafe(user: any, profile: { displayName?: string }) {
-  if (user && typeof user.updateProfile === 'function') {
-    await user.updateProfile(profile);
-    return;
-  }
-
-  // web fallback
-  const { updateProfile } = await import('firebase/auth');
-  await updateProfile(user, profile);
 }
 
 function PasswordRequirement({ met, text }: { met: boolean; text: string }) {
@@ -66,72 +55,49 @@ export default function SignupScreen() {
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const router = useRouter();
+  const { signUp } = useAuth();
+
+  const passwordChecks = useMemo(
+    () => checkPasswordRequirements(password),
+    [password]
+  );
 
   const handleSignup = async () => {
-    if (!name || !email || !password) {
-      Alert.alert('Missing Fields', 'Please fill in all fields.');
+    const trimmedName = name.trim();
+    const trimmedEmail = email.trim();
+
+    if (!trimmedName || !trimmedEmail || !password) {
+      Toast.show({
+        type: 'error',
+        text1: 'Missing fields',
+        text2: 'Please fill in all fields.',
+      });
+      return;
+    }
+
+    const passwordValidation = validatePassword(password);
+    if (!passwordValidation.valid) {
+      Toast.show({
+        type: 'error',
+        text1: 'Weak password',
+        text2: passwordValidation.error ?? 'Please choose a stronger password.',
+      });
       return;
     }
 
     try {
       setLoading(true);
-
-      // Validate and sanitize inputs
-      const sanitizedName = sanitizeText(name, 100);
-      const sanitizedEmail = sanitizeEmail(email);
-      
-      // Validate password strength
-      const passwordValidation = validatePassword(password);
-      if (!passwordValidation.valid) {
-        Alert.alert('Weak Password', passwordValidation.error || 'Please choose a stronger password.');
-        setLoading(false);
-        return;
-      }
-
-      // Ensure Firestore network is enabled (works for both runtimes)
-      await ensureFirestoreOnline();
-
-      // Create auth user in a runtime-safe way
-      const cred = await createUserSafe(sanitizedEmail, password);
-      const user = cred?.user ?? cred; // native may return different shape
-      const uid = user?.uid;
-      if (!uid) {
-        throw new Error('Failed to create user (no uid returned).');
-      }
-
-      // Update auth display name (runtime-safe)
-      try {
-        await updateProfileSafe(user, { displayName: sanitizedName });
-      } catch (profileErr) {
-        console.warn('[Signup] updateProfile failed', redactSensitiveData({ error: profileErr }));
-      }
-
-      // Create the Firestore user document in a runtime-safe manner
-      try {
-        if (!db) throw new Error('Database not initialized');
-        await setDocumentSafe(db, 'users', uid, {
-          uid,
-          name: sanitizedName,
-          email: sanitizedEmail,
-          role: 'standard',
-          teamId: null,
-          isCoordinator: false,
-          createdAt: new Date().toISOString(),
-        });
-        console.log(`✅ Firestore user created: users/${uid}`);
-      } catch (setErr) {
-        // If writing the user doc fails, surface a warning but don't block login flow.
-        // Dashboard/getDocument will otherwise 404; better to ensure we created the doc.
-        console.warn('[Signup] failed to create users/{uid} doc', redactSensitiveData({ error: setErr }));
-        // Re-throw only if you want to block the flow:
-        // throw setErr;
-      }
-
-      Alert.alert('Account Created', 'You can now create or join a team.');
-      router.replace('/(tabs)');
-    } catch (e: any) {
-      console.error('❌ Signup failed:', redactSensitiveData({ email, error: e }));
-      Alert.alert('Signup Failed', e?.message ?? 'Unknown error occurred.');
+      const sanitizedName = sanitizeText(trimmedName, 100);
+      const sanitizedEmail = sanitizeEmail(trimmedEmail);
+      await signUp(sanitizedEmail, password, sanitizedName);
+      // Navigation handled by auth layout reacting to user state change
+    } catch (e: unknown) {
+      const code = (e as { code?: string })?.code ?? '';
+      Toast.show({
+        type: 'error',
+        text1: 'Sign up failed',
+        text2: getFriendlyAuthError(code),
+      });
     } finally {
       setLoading(false);
     }
@@ -140,7 +106,7 @@ export default function SignupScreen() {
   return (
     <KeyboardAvoidingView
       behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      style={{ flex: 1 }}
+      style={styles.flex}
     >
       <ScrollView contentContainerStyle={styles.container}>
         <Text style={styles.title}>Create Account</Text>
@@ -150,6 +116,10 @@ export default function SignupScreen() {
           placeholder="Full Name"
           value={name}
           onChangeText={setName}
+          autoCorrect={false}
+          textContentType="name"
+          returnKeyType="next"
+          editable={!loading}
         />
 
         <TextInput
@@ -159,6 +129,10 @@ export default function SignupScreen() {
           onChangeText={setEmail}
           keyboardType="email-address"
           autoCapitalize="none"
+          autoCorrect={false}
+          textContentType="emailAddress"
+          returnKeyType="next"
+          editable={!loading}
         />
 
         <TextInput
@@ -167,47 +141,58 @@ export default function SignupScreen() {
           secureTextEntry
           value={password}
           onChangeText={setPassword}
+          textContentType="newPassword"
+          returnKeyType="done"
+          onSubmitEditing={handleSignup}
+          editable={!loading}
         />
 
         {password.length > 0 && (
           <View style={styles.passwordRequirements}>
             <Text style={styles.requirementsTitle}>Password Requirements:</Text>
             <PasswordRequirement
-              met={checkPasswordRequirements(password).minLength}
+              met={passwordChecks.minLength}
               text="At least 8 characters"
             />
             <PasswordRequirement
-              met={checkPasswordRequirements(password).hasUppercase}
+              met={passwordChecks.hasUppercase}
               text="Contains an uppercase letter"
             />
             <PasswordRequirement
-              met={checkPasswordRequirements(password).hasSpecialChar}
+              met={passwordChecks.hasSpecialChar}
               text="Contains a special character (!@#$%^&*)"
             />
           </View>
         )}
 
-        <View style={{ width: '100%', marginTop: 10 }}>
-          <Button
-            title={loading ? 'Creating Account…' : 'Sign Up'}
-            onPress={handleSignup}
-            disabled={loading}
-          />
-        </View>
+        <TouchableOpacity
+          style={[styles.button, loading && styles.buttonDisabled]}
+          onPress={handleSignup}
+          disabled={loading}
+          accessibilityRole="button"
+        >
+          <Text style={styles.buttonText}>
+            {loading ? 'Creating Account…' : 'Sign Up'}
+          </Text>
+        </TouchableOpacity>
 
-        <View style={{ marginTop: 15 }}>
-          <Button
-            title="Back to Login"
-            color="#0a7ea4"
-            onPress={() => router.push('/(auth)/LoginScreen')}
-          />
-        </View>
+        <TouchableOpacity
+          style={[styles.button, styles.secondaryButton]}
+          onPress={() => router.push('/(auth)/LoginScreen')}
+          disabled={loading}
+          accessibilityRole="button"
+        >
+          <Text style={styles.buttonText}>Back to Login</Text>
+        </TouchableOpacity>
       </ScrollView>
     </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
+  flex: {
+    flex: 1,
+  },
   container: {
     flexGrow: 1,
     justifyContent: 'center',
@@ -228,6 +213,25 @@ const styles = StyleSheet.create({
     width: '100%',
     padding: 12,
     marginBottom: 10,
+  },
+  button: {
+    width: '100%',
+    backgroundColor: '#0a7ea4',
+    paddingVertical: 14,
+    borderRadius: 8,
+    marginTop: 10,
+    alignItems: 'center',
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
+  secondaryButton: {
+    backgroundColor: '#444',
+  },
+  buttonText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 16,
   },
   passwordRequirements: {
     width: '100%',
