@@ -1,5 +1,5 @@
 // app/(tabs)/TeamDetailScreen.tsx
-import { auth, ensureFirestoreOnline } from '@/firebaseConfig';
+import { auth, ensureFirestoreOnline } from '@/src/firebaseConfig';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';

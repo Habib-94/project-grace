@@ -1,5 +1,5 @@
 // Lightweight Firestore REST helpers (reads). Attaches ID token when available.
-import { auth, app as firebaseApp } from '@/firebaseConfig';
+import { auth, app as firebaseApp } from '@/src/firebaseConfig';
 
 // Try global vars first (keeps previous behavior)
 const GLOBAL_FIREBASE_CONFIG = (global as any).__FIREBASE_CONFIG__ || (global as any).firebaseConfig || (global as any).FIREBASE_CONFIG;

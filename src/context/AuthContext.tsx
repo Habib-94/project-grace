@@ -1,4 +1,4 @@
-import { auth } from '@/firebaseConfig';
+import { auth } from '@/src/firebaseConfig';
 import React, { createContext, useContext, useEffect, useState } from 'react';
 // Import web onAuthStateChanged as a fallback (we'll only call it when needed)
 import { onAuthStateChanged as webOnAuthStateChanged } from 'firebase/auth';
