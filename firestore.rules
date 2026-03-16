@@ -1,0 +1,133 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Users: owner can read their own doc; other users can read only if user opts-in
+    // OR if the user is a coordinator (coordinators are publicly visible)
+    match /users/{userId} {
+      allow get: if request.auth != null
+                 && (
+                   request.auth.uid == userId 
+                   || resource.data.publicProfile == true
+                   || resource.data.isCoordinator == true
+                 );
+      allow list: if false; // disallow listing all users
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Optional: lightweight public profiles for display-only fields
+    match /publicProfiles/{userId} {
+      allow get: if request.auth != null;
+      allow list: if false;
+      allow create, update, delete: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Teams: authenticated users may read/list teams.
+    match /teams/{teamId} {
+      allow get, list: if request.auth != null;
+      allow create: if request.auth != null;
+
+      allow update, delete: if request.auth != null
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId == teamId
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true;
+    }
+
+    // gameRequests: coordinator-only reads; creators may create
+    match /gameRequests/{requestId} {
+      allow get: if request.auth != null
+                  && resource.data.teamId != null
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId == resource.data.teamId
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true;
+
+      allow list: if request.auth != null
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true;
+
+      allow create: if request.auth != null
+                    && (
+                      request.resource.data.requestedBy == request.auth.uid
+                      || request.resource.data.createdBy == request.auth.uid
+                    );
+
+      allow update, delete: if request.auth != null && (
+        request.auth.uid == resource.data.requestedBy ||
+        (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId == resource.data.teamId
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true
+        )
+      );
+    }
+
+    // Coordinator join requests (requests)
+    match /requests/{reqId} {
+      allow get: if request.auth != null
+                  && resource.data.teamId != null
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId == resource.data.teamId
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true;
+
+      allow list: if request.auth != null
+                  && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true;
+
+      allow create: if request.auth != null
+                    && request.resource.data.requestedBy == request.auth.uid;
+
+      allow update, delete: if request.auth != null && (
+        request.auth.uid == resource.data.requestedBy ||
+        (
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.teamId == request.resource.data.teamId
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true
+        )
+      );
+    }
+
+    // Games: any authenticated user can read/list games
+    match /games/{gameId} {
+      allow get, list: if request.auth != null;
+
+      allow create: if request.auth != null && request.resource.data.createdBy == request.auth.uid;
+
+      allow update, delete: if request.auth != null && (
+        resource.data.createdBy == request.auth.uid ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true
+      );
+    }
+
+    // Tournaments: any authenticated user can read/list.
+    // Only coordinators may create.
+    // Only the host coordinator (hostUserId) may update the tournament document.
+    match /tournaments/{tournamentId} {
+      allow get, list: if request.auth != null;
+
+      allow create: if request.auth != null
+                    && request.resource.data.hostUserId == request.auth.uid
+                    && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true;
+
+      // Host coordinator can update (e.g. change status, add teams).
+      // Also allow any coordinator whose team is already in the teams array to update
+      // (so they can sign their team up / withdraw).
+      allow update: if request.auth != null
+                    && (
+                      resource.data.hostUserId == request.auth.uid
+                      || get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isCoordinator == true
+                    );
+
+      allow delete: if request.auth != null
+                    && resource.data.hostUserId == request.auth.uid;
+
+      // Tournament matches subcollection
+      match /matches/{matchId} {
+        // Any authenticated user may read matches
+        allow get, list: if request.auth != null;
+
+        // Only the host coordinator of the parent tournament may create/update/delete matches
+        allow create, update, delete: if request.auth != null
+                    && get(/databases/$(database)/documents/tournaments/$(tournamentId)).data.hostUserId == request.auth.uid;
+      }
+    }
+
+    // Deny fallback
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

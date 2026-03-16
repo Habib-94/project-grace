@@ -1,7 +1,6 @@
 {
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
-    /* Base Options: */
     "esModuleInterop": true,
     "skipLibCheck": true,
     "target": "es2022",
@@ -10,8 +9,6 @@
     "moduleDetection": "force",
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
-
-    /* Strictness */
     "strict": true,
     "noImplicitAny": true,
     "noImplicitReturns": true,
@@ -20,32 +17,47 @@
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true,
     "forceConsistentCasingInFileNames": true,
-
-    /* If NOT transpiling with TypeScript: */
     "module": "preserve",
     "noEmit": true,
-
-    /* If your code runs in the DOM: */
-    "lib": ["es2022", "dom", "dom.iterable"],
-
-    /* Expo-specific: */
+    "lib": [
+      "es2022",
+      "dom",
+      "dom.iterable"
+    ],
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./*"],
-      "@components/*": ["./components/*"],
-      "@hooks/*": ["./hooks/*"],
-      "@services/*": ["./services/*"],
-      "@constants/*": ["./constants/*"],
-      "@context/*": ["./context/*"],
-      "@utils/*": ["./utils/*"],
-      "@types/*": ["./types/*"]
+      "@/*": [
+        "./*"
+      ],
+      "@components/*": [
+        "./components/*"
+      ],
+      "@hooks/*": [
+        "./hooks/*"
+      ],
+      "@services/*": [
+        "./services/*"
+      ],
+      "@constants/*": [
+        "./constants/*"
+      ],
+      "@context/*": [
+        "./context/*"
+      ],
+      "@utils/*": [
+        "./utils/*"
+      ],
+      "@types/*": [
+        "./types/*"
+      ]
     }
   },
   "include": [
     "**/*.ts",
     "**/*.tsx",
     ".expo/types/**/*.d.ts",
-    "expo-env.d.ts"
+    "expo-env.d.ts",
+    ".expo/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",

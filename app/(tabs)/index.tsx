@@ -2,7 +2,7 @@ import { useAuth } from '@/context/AuthContext';
 import { onAppEvent } from '@/src/appEvents';
 import TutorialModal from '@/src/components/TutorialModal';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import firestore from '@react-native-firebase/firestore';
+import { collection, doc, getDoc, getDocs, getFirestore, query, where } from '@react-native-firebase/firestore';
 import { useIsFocused } from '@react-navigation/native';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
@@ -16,6 +16,8 @@ import {
   TouchableOpacity,
   View,
 } from 'react-native';
+
+const db = getFirestore();
 
 // ─── Tutorial steps ────────────────────────────────────────────────────────────
 
@@ -56,8 +58,8 @@ export default function HomeScreen() {
   const fetchGameRequests = useCallback(async (teamId: string) => {
     setLoadingGameRequests(true);
     try {
-      const snap = await firestore().collection('gameRequests').where('teamId', '==', teamId).get();
-      setGameRequests(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      const snap = await getDocs(query(collection(db, 'gameRequests'), where('teamId', '==', teamId)));
+      setGameRequests((snap.docs as Array<{ id: string; data(): Record<string, unknown> }>).map((d) => ({ id: d.id, ...d.data() })));
     } catch (e) {
       console.warn('[Home] fetchGameRequests failed', e);
       setGameRequests([]);
@@ -70,12 +72,12 @@ export default function HomeScreen() {
     if (!user?.uid) { setUserData(null); setTeamData(null); setLoading(false); return; }
     try {
       setLoading(true);
-      const uSnap = await firestore().collection('users').doc(user.uid).get();
+      const uSnap = await getDoc(doc(db, 'users', user.uid));
       if (!uSnap.exists) { setUserData(null); setTeamData(null); return; }
       const u = uSnap.data() as Record<string, unknown>;
       setUserData(u);
       if (u.teamId) {
-        const tSnap = await firestore().collection('teams').doc(u.teamId as string).get();
+        const tSnap = await getDoc(doc(db, 'teams', u.teamId as string));
         setTeamData(tSnap.data() != null ? { id: tSnap.id, ...tSnap.data() } : null);
       } else {
         setTeamData(null);

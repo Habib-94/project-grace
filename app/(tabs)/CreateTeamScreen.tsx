@@ -1,19 +1,19 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import firestore from '@react-native-firebase/firestore';
+import { addDoc, collection, doc, getDoc, getFirestore, serverTimestamp, setDoc } from '@react-native-firebase/firestore';
 import { Picker } from '@react-native-picker/picker';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
-  Modal,
-  Platform,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    ActivityIndicator,
+    Modal,
+    Platform,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
@@ -23,15 +23,16 @@ import { emitAppEvent } from '@/src/appEvents';
 import TutorialModal from '@/src/components/TutorialModal';
 import { geocodeAddress, getPlaceDetails } from '@/src/locations';
 import {
-  rateLimiter,
-  sanitizeColor,
-  sanitizeLocation,
-  sanitizeText,
-  validateTeamName,
+    rateLimiter,
+    sanitizeColor,
+    sanitizeLocation,
+    sanitizeText,
+    validateTeamName,
 } from '@/src/utils/security';
 import Constants from 'expo-constants';
 
 const API_KEY = (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? '';
+const db = getFirestore();
 
 type Prediction = {
   place_id: string;
@@ -116,14 +117,14 @@ export default function CreateTeamScreen() {
     if (!user?.uid) return;
     let mounted = true;
 
-    firestore().collection('users').doc(user.uid).get().then(async (snap) => {
+    getDoc(doc(db, 'users', user.uid)).then(async (snap) => {
       if (!mounted || !snap.exists) return;
       const data = snap.data()!;
       if (data.isCoordinator) {
         setCreateTeamBlocked(true);
         if (data.teamId) {
           try {
-            const teamSnap = await firestore().collection('teams').doc(data.teamId as string).get();
+            const teamSnap = await getDoc(doc(db, 'teams', data.teamId as string));
             if (mounted) setBlockedTeamName((teamSnap.data()?.teamName as string) ?? null);
           } catch {}
         }
@@ -243,7 +244,7 @@ export default function CreateTeamScreen() {
     setLoading(true);
     try {
       // Check coordinator/team membership via native Firestore
-      const userSnap = await firestore().collection('users').doc(user.uid).get();
+      const userSnap = await getDoc(doc(db, 'users', user.uid));
       const userData = userSnap.data() ?? {};
 
       if (userData.isCoordinator) {
@@ -262,14 +263,14 @@ export default function CreateTeamScreen() {
         email: (userData.email as string) ?? user.email ?? '',
       };
 
-      const ref = await firestore().collection('teams').add({
+      const ref = await addDoc(collection(db, 'teams'), {
         teamName: sanitizedName,
         location: sanitizedLocation,
         latitude: pickedPlace?.lat ?? null,
         longitude: pickedPlace?.lng ?? null,
         placeId: sanitizeText(pickedPlace?.placeId ?? '', 200),
         createdBy: user.uid,
-        createdAt: firestore.FieldValue.serverTimestamp(),
+        createdAt: serverTimestamp(),
         homeColor: sanitizeColor(homeColor),
         awayColor: sanitizeColor(awayColor),
         elo: getSkillRating(skillLevel),
@@ -277,7 +278,7 @@ export default function CreateTeamScreen() {
         coordinatorNames: [coordEntry.name],
       });
 
-      await firestore().collection('users').doc(user.uid).set(
+      await setDoc(doc(db, 'users', user.uid),
         { teamId: ref.id, isCoordinator: true, email: user.email ?? '', name: coordEntry.name },
         { merge: true }
       );

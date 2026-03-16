@@ -2,7 +2,7 @@ import { useAuth } from '@/context/AuthContext';
 import TutorialModal from '@/src/components/TutorialModal';
 import { geocodeAddress, haversineDistanceKm } from '@/src/locations';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import firestore from '@react-native-firebase/firestore';
+import { addDoc, collection, doc, getDoc, getDocs, getFirestore, query, serverTimestamp, where } from '@react-native-firebase/firestore';
 import Constants from 'expo-constants';
 import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
@@ -10,6 +10,9 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  Linking,
+  Modal,
+  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -24,6 +27,7 @@ import Toast from 'react-native-toast-message';
 const KM_TO_MILES = 0.621371;
 const DEFAULT_RADIUS_MILES = 15;
 const GOOGLE_MAPS_API_KEY = (Constants.expoConfig?.extra?.googleMapsApiKey as string) ?? '';
+const db = getFirestore();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -36,10 +40,19 @@ interface Team {
   elo?: number;
   latitude?: number;
   longitude?: number;
+  /** Coordinators who opted to share their email. Keyed by uid. */
+  coordinatorContacts?: Record<string, { name?: string; email: string }>;
 }
 
 interface TeamWithDistance extends Team {
   distanceMiles: number;
+}
+
+interface Coordinator {
+  uid: string;
+  name?: string;
+  email?: string;
+  shareEmail?: boolean;
 }
 
 // ─── Tutorial steps (defined outside component) ───────────────────────────────
@@ -126,14 +139,15 @@ export default function FindATeam() {
   const [selectedTeam, setSelectedTeam] = useState<Team | null>(null);
   const [sending, setSending] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [coordinators, setCoordinators] = useState<Coordinator[]>([]);
 
 // ── Fetch directory from Firestore ─────────────────────────────────────────
 
 const fetchDirectory = useCallback(async (coords?: { lat: number; lng: number } | null) => {
   setDirLoading(true);
   try {
-    const snap = await firestore().collection('teams').get();
-    const teams: Team[] = snap.docs.map((d) => {
+    const snap = await getDocs(collection(db, 'teams'));
+    const teams: Team[] = (snap.docs as Array<{ id: string; data(): Record<string, unknown> }>).map((d) => {
       const data = d.data();
       return {
         id: d.id,
@@ -144,6 +158,7 @@ const fetchDirectory = useCallback(async (coords?: { lat: number; lng: number } 
         ...(data.elo != null ? { elo: data.elo as number } : {}),
         ...(data.latitude != null ? { latitude: data.latitude as number } : {}),
         ...(data.longitude != null ? { longitude: data.longitude as number } : {}),
+        ...(data.coordinatorContacts != null ? { coordinatorContacts: data.coordinatorContacts as Record<string, { name?: string; email: string }> } : {}),
       };
     });
 
@@ -175,6 +190,23 @@ const fetchDirectory = useCallback(async (coords?: { lat: number; lng: number } 
 }, [userCoords]);
 
   useEffect(() => { fetchDirectory(userCoords); }, [fetchDirectory]);
+
+  // ── Derive coordinators from the already-loaded team data ─────────────────
+
+  useEffect(() => {
+    if (!selectedTeam) {
+      setCoordinators([]);
+      return;
+    }
+    const contacts = selectedTeam.coordinatorContacts ?? {};
+    const derived: Coordinator[] = Object.entries(contacts).map(([uid, info]) => {
+      const coord: Coordinator = { uid, shareEmail: true };
+      if (info.name) coord.name = info.name;
+      if (info.email) coord.email = info.email;
+      return coord;
+    });
+    setCoordinators(derived);
+  }, [selectedTeam]);
 
 // ── Debounced name/location search ─────────────────────────────────────────
 
@@ -285,7 +317,7 @@ const handleSendRequest = async () => {
   setSending(true);
   try {
     // Check user is not already in a team
-    const userSnap = await firestore().collection('users').doc(user.uid).get();
+    const userSnap = await getDoc(doc(db, 'users', user.uid));
     if (!userSnap.exists) {
       Toast.show({ type: 'error', text1: 'User record not found' });
       return;
@@ -296,26 +328,26 @@ const handleSendRequest = async () => {
     }
 
     // Check no existing pending request for this team
-    const existingSnap = await firestore()
-      .collection('requests')
-      .where('userId', '==', user.uid)
-      .where('teamId', '==', selectedTeam.id)
-      .where('status', '==', 'pending')
-      .get();
+    const existingSnap = await getDocs(query(
+      collection(db, 'requests'),
+      where('userId', '==', user.uid),
+      where('teamId', '==', selectedTeam.id),
+      where('status', '==', 'pending')
+    ));
 
     if (!existingSnap.empty) {
       Toast.show({ type: 'info', text1: 'Request already pending', text2: 'You have already requested to join this team.' });
       return;
     }
 
-    await firestore().collection('requests').add({
+    await addDoc(collection(db, 'requests'), {
       userId: user.uid,
       userEmail: user.email ?? '',
       teamId: selectedTeam.id,
       teamName: selectedTeam.teamName,
       requestedBy: user.uid,
       status: 'pending',
-      createdAt: firestore.FieldValue.serverTimestamp(),
+      createdAt: serverTimestamp(),
     });
 
     Toast.show({ type: 'success', text1: 'Request sent!', text2: 'The coordinator will review your request.' });
@@ -433,31 +465,77 @@ return (
       </View>
     )}
 
-    {selectedTeam && (
-      <View style={styles.selectedContainer}>
-        <Text style={styles.selectedTitle}>Selected Team</Text>
-        <Text style={styles.teamName}>{selectedTeam.teamName}</Text>
-        {selectedTeam.location && <Text style={styles.teamLocation}>{selectedTeam.location}</Text>}
-        <Text style={styles.selectedRating}>
-          Rating: {Math.min(Math.max(selectedTeam.elo ?? 1500, 800), 3000)}
-        </Text>
-        <TouchableOpacity
-          style={[styles.button, styles.requestButton, sending && styles.buttonDisabled]}
-          onPress={handleSendRequest}
-          disabled={sending}
-          accessibilityRole="button"
-        >
-          <Text style={styles.buttonText}>{sending ? 'Sending...' : 'Request to Join'}</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.button, styles.cancelButton]}
-          onPress={() => setSelectedTeam(null)}
-          accessibilityRole="button"
-        >
-          <Text style={styles.buttonText}>Cancel</Text>
-        </TouchableOpacity>
-      </View>
-    )}
+    <Modal
+      visible={!!selectedTeam}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setSelectedTeam(null)}
+    >
+      <Pressable style={styles.modalOverlay} onPress={() => setSelectedTeam(null)}>
+        <Pressable style={styles.modalCard} onPress={() => {}}>
+          <Text style={styles.selectedTitle}>{selectedTeam?.teamName}</Text>
+          {selectedTeam?.location ? (
+            <Text style={styles.teamLocation}>{selectedTeam.location}</Text>
+          ) : null}
+          <Text style={styles.selectedRating}>
+            Rating: {Math.min(Math.max(selectedTeam?.elo ?? 1500, 800), 3000)}
+          </Text>
+          {(selectedTeam?.homeColor || selectedTeam?.awayColor) && (
+            <View style={styles.colorRow}>
+              {selectedTeam?.homeColor ? (
+                <View style={styles.colorItem}>
+                  <View style={[styles.colorSwatch, { backgroundColor: selectedTeam.homeColor }]} />
+                  <Text style={styles.colorLabel}>Home</Text>
+                </View>
+              ) : null}
+              {selectedTeam?.awayColor ? (
+                <View style={styles.colorItem}>
+                  <View style={[styles.colorSwatch, { backgroundColor: selectedTeam.awayColor }]} />
+                  <Text style={styles.colorLabel}>Away</Text>
+                </View>
+              ) : null}
+            </View>
+          )}
+
+          {/* Coordinator contacts */}
+          <View style={styles.coordinatorsSection}>
+            <Text style={styles.coordinatorsTitle}>Coordinators</Text>
+            {coordinators.length === 0 ? (
+              <Text style={styles.coordinatorsEmpty}>No coordinators have shared their contact details</Text>
+            ) : (
+              coordinators.map((c) => (
+                <View key={c.uid} style={styles.coordinatorRow}>
+                  <Text style={styles.coordinatorName}>{c.name ?? 'Coordinator'}</Text>
+                  {c.shareEmail && c.email ? (
+                    <TouchableOpacity onPress={() => Linking.openURL(`mailto:${c.email}`)} accessibilityRole="link">
+                      <Text style={styles.coordinatorEmail}>{c.email}</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <Text style={styles.coordinatorEmailHidden}>Email not shared</Text>
+                  )}
+                </View>
+              ))
+            )}
+          </View>
+
+          <TouchableOpacity
+            style={[styles.button, styles.requestButton, sending && styles.buttonDisabled]}
+            onPress={handleSendRequest}
+            disabled={sending}
+            accessibilityRole="button"
+          >
+            <Text style={styles.buttonText}>{sending ? 'Sending...' : 'Request to Join'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.button, styles.cancelButton]}
+            onPress={() => setSelectedTeam(null)}
+            accessibilityRole="button"
+          >
+            <Text style={styles.buttonText}>Cancel</Text>
+          </TouchableOpacity>
+        </Pressable>
+      </Pressable>
+    </Modal>
 
     {tutorialVisible && (
       <TutorialModal
@@ -508,7 +586,19 @@ const styles = StyleSheet.create({
   teamName: { fontSize: 18, fontWeight: 'bold', color: '#0a7ea4' },
   teamLocation: { fontSize: 14, color: '#666' },
   teamRating: { marginTop: 6, fontSize: 14, color: '#333', fontWeight: '600' },
-  selectedContainer: { marginTop: 20, borderWidth: 1, borderColor: '#0a7ea4', borderRadius: 12, padding: 16 },
-  selectedTitle: { fontSize: 20, fontWeight: '600', marginBottom: 10, textAlign: 'center', color: '#0a7ea4' },
-  selectedRating: { marginTop: 6, fontSize: 14, color: '#333' },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'center', alignItems: 'center', padding: 24 },
+  modalCard: { width: '100%', backgroundColor: '#fff', borderRadius: 16, padding: 24, elevation: 8, shadowColor: '#000', shadowOpacity: 0.2, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } },
+  selectedTitle: { fontSize: 22, fontWeight: 'bold', color: '#0a7ea4', marginBottom: 8, textAlign: 'center' },
+  selectedRating: { marginTop: 6, fontSize: 14, color: '#333', fontWeight: '600' },
+  colorRow: { flexDirection: 'row', marginTop: 12, gap: 16 },
+  colorItem: { alignItems: 'center', gap: 4 },
+  colorSwatch: { width: 40, height: 40, borderRadius: 20, borderWidth: 1, borderColor: '#ccc' },
+  colorLabel: { fontSize: 12, color: '#555' },
+  coordinatorsSection: { marginTop: 16, width: '100%', borderTopWidth: 1, borderTopColor: '#eee', paddingTop: 12 },
+  coordinatorsTitle: { fontSize: 14, fontWeight: '700', color: '#0a7ea4', marginBottom: 8 },
+  coordinatorsEmpty: { fontSize: 13, color: '#888', fontStyle: 'italic' },
+  coordinatorRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#f0f0f0' },
+  coordinatorName: { fontSize: 14, fontWeight: '600', color: '#333', flex: 1 },
+  coordinatorEmail: { fontSize: 13, color: '#0a7ea4', textDecorationLine: 'underline', flexShrink: 1 },
+  coordinatorEmailHidden: { fontSize: 13, color: '#aaa', fontStyle: 'italic' },
 });

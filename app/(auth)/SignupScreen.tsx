@@ -1,22 +1,22 @@
 // app/(auth)/SignupScreen.tsx
 import { useAuth } from '@/context/AuthContext';
 import {
-  checkPasswordRequirements,
-  sanitizeEmail,
-  sanitizeText,
-  validatePassword,
+    checkPasswordRequirements,
+    sanitizeEmail,
+    sanitizeText,
+    validatePassword,
 } from '@/src/utils/security';
 import { useRouter } from 'expo-router';
 import React, { useMemo, useState } from 'react';
 import {
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    KeyboardAvoidingView,
+    Platform,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 
@@ -114,6 +114,7 @@ export default function SignupScreen() {
         <TextInput
           style={styles.input}
           placeholder="Full Name"
+          placeholderTextColor="#999"
           value={name}
           onChangeText={setName}
           autoCorrect={false}
@@ -125,6 +126,7 @@ export default function SignupScreen() {
         <TextInput
           style={styles.input}
           placeholder="Email"
+          placeholderTextColor="#999"
           value={email}
           onChangeText={setEmail}
           keyboardType="email-address"
@@ -138,6 +140,7 @@ export default function SignupScreen() {
         <TextInput
           style={styles.input}
           placeholder="Password"
+          placeholderTextColor="#999"
           secureTextEntry
           value={password}
           onChangeText={setPassword}
@@ -213,6 +216,7 @@ const styles = StyleSheet.create({
     width: '100%',
     padding: 12,
     marginBottom: 10,
+    color: '#000',
   },
   button: {
     width: '100%',

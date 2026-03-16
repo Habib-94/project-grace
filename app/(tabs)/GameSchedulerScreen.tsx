@@ -1,7 +1,7 @@
 import { useAuth } from '@/context/AuthContext';
 import TutorialModal from '@/src/components/TutorialModal';
 import DateTimePicker from '@react-native-community/datetimepicker';
-import firestore from '@react-native-firebase/firestore';
+import { addDoc, collection, deleteDoc, doc, getDoc, getDocs, getFirestore, query, serverTimestamp, where } from '@react-native-firebase/firestore';
 import { useRouter } from 'expo-router';
 import React, { useEffect, useMemo, useState } from 'react';
 import {
@@ -37,6 +37,8 @@ type Game = {
   createdByEmail?: string | null;
   createdByRating?: number | null;
 };
+
+const db = getFirestore();
 
 export default function GameSchedulerScreen() {
   const router = useRouter();
@@ -127,10 +129,10 @@ export default function GameSchedulerScreen() {
     if (!user?.uid) { setCreatedGames([]); return; }
     setFetchingCreatedGames(true);
     try {
-      const snap = await firestore().collection('games').where('createdBy', '==', user.uid).get();
-      const items: Game[] = snap.docs
+      const snap = await getDocs(query(collection(db, 'games'), where('createdBy', '==', user.uid)));
+      const items: Game[] = (snap.docs as Array<{ id: string; data(): Record<string, unknown> }>)
         .map((d) => ({ id: d.id, ...d.data() } as Game))
-        .sort((a, b) => {
+        .sort((a: Game, b: Game) => {
           if (!a.startISO && !b.startISO) return 0;
           if (!a.startISO) return 1;
           if (!b.startISO) return -1;
@@ -151,7 +153,7 @@ export default function GameSchedulerScreen() {
       {
         text: 'Delete', style: 'destructive', onPress: async () => {
           try {
-            await firestore().collection('games').doc(id).delete();
+            await deleteDoc(doc(db, 'games', id));
             setCreatedGames((prev) => prev.filter((g) => g.id !== id));
             Toast.show({ type: 'info', text1: 'Game removed' });
           } catch (e: unknown) {
@@ -171,7 +173,7 @@ export default function GameSchedulerScreen() {
 
     setCreating(true);
     try {
-      const userSnap = await firestore().collection('users').doc(user.uid).get();
+      const userSnap = await getDoc(doc(db, 'users', user.uid));
       if (!userSnap.exists) { Toast.show({ type: 'error', text1: 'User record missing' }); return; }
       const userDoc = userSnap.data()!;
       const teamId = userDoc.teamId as string;
@@ -180,7 +182,7 @@ export default function GameSchedulerScreen() {
         return;
       }
 
-      const teamSnap = await firestore().collection('teams').doc(teamId).get();
+      const teamSnap = await getDoc(doc(db, 'teams', teamId));
       const teamDoc = teamSnap.data() ?? {};
       const teamName = (teamDoc.teamName as string) ?? '';
       const teamLat = (teamDoc.latitude ?? teamDoc.lat ?? null) as number | null;
@@ -210,7 +212,7 @@ export default function GameSchedulerScreen() {
             placeId: teamPlaceId || null,
             kitColor: null,
             createdBy: user.uid,
-            createdAt: firestore.FieldValue.serverTimestamp(),
+            createdAt: serverTimestamp(),
             createdByName: (userDoc.name ?? user.displayName ?? '') as string,
             createdByEmail: (userDoc.email ?? user.email ?? '') as string,
             createdByRating: (userDoc.rating ?? null) as number | null,
@@ -219,7 +221,7 @@ export default function GameSchedulerScreen() {
             expiresAt: new Date(iso),
           };
 
-          const ref = await firestore().collection('games').add(payload);
+          const ref = await addDoc(collection(db, 'games'), payload);
           const createdItem: Game = {
             id: ref.id,
             title: payload.title,

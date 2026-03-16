@@ -3,15 +3,15 @@ import { sanitizeEmail } from '@/src/utils/security';
 import { useRouter } from 'expo-router';
 import React, { useState } from 'react';
 import {
-  Image,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View,
+    Image,
+    KeyboardAvoidingView,
+    Platform,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 
@@ -88,6 +88,7 @@ export default function LoginScreen() {
         <TextInput
           style={styles.input}
           placeholder="Email"
+          placeholderTextColor="#999"
           value={email}
           onChangeText={setEmail}
           keyboardType="email-address"
@@ -102,6 +103,7 @@ export default function LoginScreen() {
           <TextInput
             style={styles.passwordInput}
             placeholder="Password"
+            placeholderTextColor="#999"
             value={password}
             onChangeText={setPassword}
             secureTextEntry={!showPassword}
@@ -172,6 +174,7 @@ const styles = StyleSheet.create({
     width: '100%',
     padding: 12,
     marginBottom: 10,
+    color: '#000',
   },
   passwordContainer: {
     flexDirection: 'row',
@@ -185,6 +188,7 @@ const styles = StyleSheet.create({
   passwordInput: {
     flex: 1,
     padding: 12,
+    color: '#000',
   },
   eyeButton: {
     padding: 12,
