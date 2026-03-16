@@ -1,5 +1,18 @@
-import auth, { FirebaseAuthTypes } from '@react-native-firebase/auth';
-import firestore from '@react-native-firebase/firestore';
+import type { FirebaseAuthTypes } from '@react-native-firebase/auth';
+import {
+    createUserWithEmailAndPassword,
+    getAuth,
+    onAuthStateChanged,
+    signOut as rnfSignOut,
+    signInWithEmailAndPassword,
+} from '@react-native-firebase/auth';
+import {
+    doc,
+    getDoc,
+    getFirestore,
+    serverTimestamp,
+    setDoc,
+} from '@react-native-firebase/firestore';
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -29,7 +42,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = auth().onAuthStateChanged((u) => {
+    const unsubscribe = onAuthStateChanged(getAuth(), (u) => {
       setUser(u);
       setLoading(false);
     });
@@ -39,17 +52,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const ensureUserDoc = useCallback(
     async (u: FirebaseAuthTypes.User, extra?: Record<string, unknown>) => {
       try {
-        const ref = firestore().collection('users').doc(u.uid);
-        const snap = await ref.get();
-        if (!snap.exists) {
-          await ref.set({
+        const db = getFirestore();
+        const ref = doc(db, 'users', u.uid);
+        const snap = await getDoc(ref);
+        if (!snap.exists()) {
+          await setDoc(ref, {
             uid: u.uid,
             name: u.displayName ?? '',
             email: u.email ?? '',
             role: 'standard',
             teamId: null,
             isCoordinator: false,
-            createdAt: firestore.FieldValue.serverTimestamp(),
+            createdAt: serverTimestamp(),
             ...extra,
           });
         }
@@ -61,13 +75,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const signIn = useCallback(async (email: string, password: string) => {
-    const { user: u } = await auth().signInWithEmailAndPassword(email, password);
+    const { user: u } = await signInWithEmailAndPassword(getAuth(), email, password);
     await ensureUserDoc(u);
   }, [ensureUserDoc]);
 
   const signUp = useCallback(
     async (email: string, password: string, displayName: string) => {
-      const { user: u } = await auth().createUserWithEmailAndPassword(email, password);
+      const { user: u } = await createUserWithEmailAndPassword(getAuth(), email, password);
       await u.updateProfile({ displayName });
       await ensureUserDoc(u, { name: displayName });
     },
@@ -75,7 +89,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const signOut = useCallback(async () => {
-    await auth().signOut();
+    await rnfSignOut(getAuth());
   }, []);
 
   return (

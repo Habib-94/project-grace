@@ -23,18 +23,64 @@ export default function TabsLayout() {
       screenOptions={{
         headerShown: false,
         tabBarActiveTintColor: '#0a7ea4',
+        tabBarStyle: { height: 72 },
+        tabBarIconStyle: { width: 32, height: 32 },
+        tabBarLabelStyle: { marginBottom: 4, flexWrap: 'wrap', textAlign: 'center' },
+        tabBarItemStyle: { paddingTop: 4 },
       }}
     >
+      <Tabs.Screen
+        name="CoordinatorDashboardScreen"
+        options={{
+          title: 'My Dashboard',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="person" color={color} size={size} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="FindATeam"
+        options={{
+          title: 'Find a Team',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="search" color={color} size={size} />
+          ),
+        }}
+      />
       <Tabs.Screen
         name="index"
         options={{
           title: 'Home',
-          tabBarAccessibilityLabel: 'Home tab',
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="home" color={color} size={size} />
           ),
         }}
       />
+      <Tabs.Screen
+        name="TournamentListScreen"
+        options={{
+          title: 'Tournaments',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="trophy" color={color} size={size} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="FindGamesScreen"
+        options={{
+          title: 'Find a Game',
+          tabBarIcon: ({ color, size }) => (
+            <Ionicons name="calendar" color={color} size={size} />
+          ),
+        }}
+      />
+      <Tabs.Screen name="HomeScreen" options={{ href: null }} />
+      <Tabs.Screen name="CreateTeamScreen" options={{ href: null }} />
+      <Tabs.Screen name="GameResultsScreen" options={{ href: null }} />
+      <Tabs.Screen name="GameSchedulerScreen" options={{ href: null }} />
+      <Tabs.Screen name="TeamDetailScreen" options={{ href: null }} />
+      <Tabs.Screen name="CreateTournamentScreen" options={{ href: null }} />
+      <Tabs.Screen name="TournamentDetailScreen" options={{ href: null }} />
     </Tabs>
   );
 }

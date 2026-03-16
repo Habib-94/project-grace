@@ -1,20 +1,20 @@
 // app/(tabs)/GameResultsScreen.tsx
 import { useAuth } from '@/context/AuthContext';
 import { calculateNewRatings, formatRatingChange, getRatingChangeDescription } from '@/src/utils/elo';
-import firestore from '@react-native-firebase/firestore';
+import { collection, doc, getDoc, getDocs, getFirestore, query, serverTimestamp, where, writeBatch } from '@react-native-firebase/firestore';
 import { useRouter } from 'expo-router';
 import React, { useCallback, useEffect, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
-  FlatList,
-  Modal,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  TouchableOpacity,
-  View
+    ActivityIndicator,
+    Alert,
+    FlatList,
+    Modal,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TextInput,
+    TouchableOpacity,
+    View
 } from 'react-native';
 import Toast from 'react-native-toast-message';
 
@@ -46,6 +46,8 @@ interface RatingPreview {
   awayWasUnderdog: boolean;
 }
 
+const db = getFirestore();
+
 export default function GameResultsScreen() {
   const router = useRouter();
   const { user } = useAuth();
@@ -69,19 +71,19 @@ export default function GameResultsScreen() {
     }
     setLoading(true);
     try {
-      const userSnap = await firestore().collection('users').doc(user.uid).get();
+      const userSnap = await getDoc(doc(db, 'users', user.uid));
       const teamId = userSnap.data()?.teamId as string | undefined;
       if (!teamId) {
         Toast.show({ type: 'info', text1: 'No team', text2: 'Join or create a team first' });
         return;
       }
 
-      const teamSnap = await firestore().collection('teams').doc(teamId).get();
+      const teamSnap = await getDoc(doc(db, 'teams', teamId));
       setTeamData(teamSnap.data() != null ? { id: teamSnap.id, ...teamSnap.data() } : null);
 
       const [homeSnap, awaySnap] = await Promise.all([
-        firestore().collection('games').where('teamId', '==', teamId).get(),
-        firestore().collection('games').where('opponentTeamId', '==', teamId).get(),
+        getDocs(query(collection(db, 'games'), where('teamId', '==', teamId))),
+        getDocs(query(collection(db, 'games'), where('opponentTeamId', '==', teamId))),
       ]);
 
       const all = new Map<string, Game>();
@@ -135,23 +137,23 @@ export default function GameResultsScreen() {
           setSubmitting(true);
           try {
             const [homeTeamSnap, awayTeamSnap] = await Promise.all([
-              selectedGame.teamId ? firestore().collection('teams').doc(selectedGame.teamId).get() : Promise.resolve(null),
-              selectedGame.opponentTeamId ? firestore().collection('teams').doc(selectedGame.opponentTeamId).get() : Promise.resolve(null),
+              selectedGame.teamId ? getDoc(doc(db, 'teams', selectedGame.teamId)) : Promise.resolve(null),
+              selectedGame.opponentTeamId ? getDoc(doc(db, 'teams', selectedGame.opponentTeamId)) : Promise.resolve(null),
             ]);
             const homeRating = (homeTeamSnap?.data()?.elo as number) ?? 1500;
             const awayRating = (awayTeamSnap?.data()?.elo as number) ?? 1500;
             const result = calculateNewRatings(homeRating, awayRating, home, away);
 
-            const batch = firestore().batch();
-            batch.update(firestore().collection('games').doc(selectedGame.id), {
+            const batch = writeBatch(db);
+            batch.update(doc(db, 'games', selectedGame.id), {
               homeScore: home, awayScore: away, completed: true,
-              completedAt: firestore.FieldValue.serverTimestamp(),
+              completedAt: serverTimestamp(),
               homeTeamRating: homeRating, awayTeamRating: awayRating,
               homeNewRating: result.team1NewRating, awayNewRating: result.team2NewRating,
               homeRatingChange: result.team1Change, awayRatingChange: result.team2Change,
             });
-            if (selectedGame.teamId) batch.update(firestore().collection('teams').doc(selectedGame.teamId), { elo: result.team1NewRating });
-            if (selectedGame.opponentTeamId && awayTeamSnap?.exists) batch.update(firestore().collection('teams').doc(selectedGame.opponentTeamId), { elo: result.team2NewRating });
+            if (selectedGame.teamId) batch.update(doc(db, 'teams', selectedGame.teamId), { elo: result.team1NewRating });
+            if (selectedGame.opponentTeamId && awayTeamSnap?.exists) batch.update(doc(db, 'teams', selectedGame.opponentTeamId), { elo: result.team2NewRating });
             await batch.commit();
 
             Toast.show({ type: 'success', text1: 'Score submitted', text2: `${formatRatingChange(result.team1Change)} / ${formatRatingChange(result.team2Change)}` });

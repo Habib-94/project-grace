@@ -25,7 +25,7 @@ const withGoogleMapsKey = (config) => {
 
 module.exports = ({ config }) => withGoogleMapsKey({
   ...config,
-  name: 'Project Grace',
+  name: 'Gary Game Scheduler',
   slug: 'project-grace',
   owner: 'kaney94',
   version: '1.0.0',
@@ -39,9 +39,9 @@ module.exports = ({ config }) => withGoogleMapsKey({
   runtimeVersion: {
     policy: 'appVersion',
   },
-  icon: './assets/images/icon.png',
+  icon: './assets/images/mascot.png',
   splash: {
-    image: './assets/images/splash-icon.png',
+    image: './assets/images/mascot.png',
     resizeMode: 'contain',
     backgroundColor: '#ffffff',
   },
@@ -52,7 +52,7 @@ module.exports = ({ config }) => withGoogleMapsKey({
   },
   android: {
     adaptiveIcon: {
-      foregroundImage: './assets/images/android-icon-foreground.png',
+      foregroundImage: './assets/images/mascot.png',
       backgroundImage: './assets/images/android-icon-background.png',
       monochromeImage: './assets/images/android-icon-monochrome.png',
     },
@@ -75,7 +75,7 @@ module.exports = ({ config }) => withGoogleMapsKey({
     [
       'expo-splash-screen',
       {
-        image: './assets/images/splash-icon.png',
+        image: './assets/images/mascot.png',
         imageWidth: 200,
         resizeMode: 'contain',
         backgroundColor: '#ffffff',

@@ -1,6 +1,6 @@
 import { useAuth } from '@/context/AuthContext';
 import { emitAppEvent, onAppEvent } from '@/src/appEvents';
-import firestore from '@react-native-firebase/firestore';
+import { addDoc, collection, deleteDoc, deleteField, doc, getDoc, getDocs, getFirestore, query, serverTimestamp, updateDoc, where, writeBatch } from '@react-native-firebase/firestore';
 import Constants from 'expo-constants';
 import { Image as ExpoImage } from 'expo-image';
 import { useRouter } from 'expo-router';
@@ -10,8 +10,9 @@ import {
   Alert,
   Dimensions,
   Modal,
-  SectionList,
+  ScrollView,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   TouchableOpacity,
@@ -22,6 +23,7 @@ import Toast from 'react-native-toast-message';
 import ColorPicker from 'react-native-wheel-color-picker';
 
 const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey ?? '';
+const db = getFirestore();
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -67,7 +69,18 @@ interface RatingPoint {
   date: string;
 }
 
-type DashboardItem = CoordinatorRequest | GameRequest | Record<string, unknown>;
+interface ScheduledGame {
+  id: string;
+  title?: string;
+  teamId?: string;        // home team
+  teamName?: string;
+  opponentTeamId?: string; // away team
+  opponentTeamName?: string;
+  location?: string;
+  startISO?: string;
+  tournamentId?: string;
+  status?: string;
+}
 
 // ─── Error Boundary (defined outside component to avoid re-creation) ──────────
 
@@ -98,22 +111,22 @@ class PlacesErrorBoundary extends React.Component<PlacesErrorBoundaryProps, Plac
 
 // ─── Firestore helpers (native SDK only) ─────────────────────────────────────
 
-async function addDocNative(collection: string, data: Record<string, unknown>) {
-  return firestore().collection(collection).add(data);
+async function addDocNative(collectionName: string, data: Record<string, unknown>) {
+  return addDoc(collection(db, collectionName), data);
 }
 
-async function updateDocNative(collection: string, id: string, data: Record<string, unknown>) {
-  return firestore().collection(collection).doc(id).update(data);
+async function updateDocNative(collectionName: string, id: string, data: Record<string, unknown>) {
+  return updateDoc(doc(db, collectionName, id), data);
 }
 
-async function deleteDocNative(collection: string, id: string) {
-  return firestore().collection(collection).doc(id).delete();
+async function deleteDocNative(collectionName: string, id: string) {
+  return deleteDoc(doc(db, collectionName, id));
 }
 
 async function runBatch(ops: Array<{ op: 'update' | 'delete'; col: string; id: string; data?: Record<string, unknown> }>) {
-  const batch = firestore().batch();
+  const batch = writeBatch(db);
   for (const o of ops) {
-    const ref = firestore().collection(o.col).doc(o.id);
+    const ref = doc(db, o.col, o.id);
     if (o.op === 'update') batch.update(ref, o.data ?? {});
     else batch.delete(ref);
   }
@@ -139,6 +152,21 @@ export default function CoordinatorDashboardScreen() {
   const [placesComponent, setPlacesComponent] = useState<React.ComponentType<any> | null>(null);
   const [selectedGameRequest, setSelectedGameRequest] = useState<GameRequest | null>(null);
   const [requestModalVisible, setRequestModalVisible] = useState(false);
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [shareEmail, setShareEmail] = useState(false);
+  const [scheduledGames, setScheduledGames] = useState<Record<string, unknown>[]>([]);
+  // Which dashboard sections are collapsed (true = collapsed)
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({
+    requests: false,
+    gameRequests: false,
+    games: false,
+    scheduledGames: false,
+  });
+  const toggleCollapse = (key: string) => setCollapsed((prev) => ({ ...prev, [key]: !prev[key] }));
+  const [selectedScheduledGame, setSelectedScheduledGame] = useState<ScheduledGame | null>(null);
+  const [scheduledGameModalVisible, setScheduledGameModalVisible] = useState(false);
+  const [scheduledGameColors, setScheduledGameColors] = useState<{ homeColor: string; awayColor: string } | null>(null);
+  const [loadingGameColors, setLoadingGameColors] = useState(false);
 
   const originalTeamRef = useRef<Team | null>(null);
   const autocompleteRef = useRef<unknown>(null);
@@ -158,13 +186,22 @@ export default function CoordinatorDashboardScreen() {
 
   // ── Initial data load ──────────────────────────────────────────────────────
 
+  // ── Re-load when a team is created in the same session ──────────────────
+
+  useEffect(() => {
+    const unsub = onAppEvent('team:created', () => {
+      setRefreshKey((k) => k + 1);
+    });
+    return () => { try { if (typeof unsub === 'function') unsub(); } catch {} };
+  }, []);
+
   useEffect(() => {
     if (!user?.uid) return;
     let isMounted = true;
 
     const loadData = async () => {
       try {
-        const userSnap = await firestore().collection('users').doc(user.uid).get();
+        const userSnap = await getDoc(doc(db, 'users', user.uid));
         if (!userSnap.exists) {
           Toast.show({ type: 'error', text1: 'User record not found' });
           router.replace('/(tabs)');
@@ -185,7 +222,7 @@ export default function CoordinatorDashboardScreen() {
           return;
         }
 
-        const teamSnap = await firestore().collection('teams').doc(teamId).get();
+        const teamSnap = await getDoc(doc(db, 'teams', teamId));
         if (!teamSnap.exists) {
           Toast.show({ type: 'error', text1: 'Team not found' });
           router.replace('/(tabs)');
@@ -194,14 +231,11 @@ export default function CoordinatorDashboardScreen() {
 
         const team: Team = { id: teamSnap.id, ...teamSnap.data() as Omit<Team, 'id'> };
         if (isMounted) setTeamData(team);
+        if (isMounted) setShareEmail(userData.shareEmail === true);
 
-        const reqSnap = await firestore()
-          .collection('requests')
-          .where('teamId', '==', teamId)
-          .where('status', '==', 'pending')
-          .get();
+        const reqSnap = await getDocs(query(collection(db, 'requests'), where('teamId', '==', teamId), where('status', '==', 'pending')));
 
-        const fetchedRequests: CoordinatorRequest[] = reqSnap.docs.map((d) => ({
+        const fetchedRequests: CoordinatorRequest[] = (reqSnap.docs as Array<{ id: string; data(): Omit<CoordinatorRequest, 'id'> }>).map((d) => ({
           id: d.id,
           ...(d.data() as Omit<CoordinatorRequest, 'id'>),
         }));
@@ -217,18 +251,17 @@ export default function CoordinatorDashboardScreen() {
 
     loadData();
     return () => { isMounted = false; };
-  }, [user?.uid, router]);
+  }, [user?.uid, router, refreshKey]);
 
   // ── Fetch games ────────────────────────────────────────────────────────────
 
   const fetchGames = useCallback(async (teamId: string) => {
     try {
-      const snap = await firestore()
-        .collection('games')
-        .where('teamId', '==', teamId)
-        .orderBy('startISO', 'asc')
-        .get();
-      setGames(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+      const snap = await getDocs(query(collection(db, 'games'), where('teamId', '==', teamId)));
+      const docs = (snap.docs as Array<{ id: string; data(): Record<string, unknown> }>)
+        .map((d) => ({ id: d.id, ...d.data() } as Record<string, unknown>))
+        .sort((a, b) => String(a['startISO'] ?? '').localeCompare(String(b['startISO'] ?? '')));
+      setGames(docs);
     } catch (e) {
       console.warn('[CoordinatorDashboard] fetchGames failed', e);
       Toast.show({ type: 'error', text1: 'Failed to load games' });
@@ -243,13 +276,39 @@ export default function CoordinatorDashboardScreen() {
 
   const fetchGameRequests = useCallback(async (teamId: string) => {
     try {
-      const snap = await firestore()
-        .collection('gameRequests')
-        .where('teamId', '==', teamId)
-        .get();
-      setGameRequests(snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<GameRequest, 'id'>) })));
+      const snap = await getDocs(query(collection(db, 'gameRequests'), where('teamId', '==', teamId)));
+      setGameRequests((snap.docs as Array<{ id: string; data(): Omit<GameRequest, 'id'> }>).map((d) => ({ id: d.id, ...(d.data() as Omit<GameRequest, 'id'>) })));
     } catch (e) {
       console.warn('[CoordinatorDashboard] fetchGameRequests failed', e);
+    }
+  }, []);
+
+  // ── Fetch scheduled tournament games ──────────────────────────────────────
+
+  const fetchScheduledGames = useCallback(async (teamId: string) => {
+    try {
+      // Query only on teamId (single-field index) — filter type client-side to avoid composite index
+      const snap = await getDocs(query(
+        collection(db, 'games'),
+        where('teamId', '==', teamId)
+      ));
+      type RawLoc = { label?: string; lat?: number; lng?: number } | string | null | undefined;
+      const docs = (snap.docs as Array<{ id: string; data(): Record<string, unknown> }>)
+        .map((d) => {
+          const data = d.data();
+          // Normalise location to a display string
+          const rawLoc = data.location as RawLoc;
+          const locationLabel: string | null =
+            typeof rawLoc === 'string' ? rawLoc
+            : rawLoc && typeof rawLoc === 'object' ? (rawLoc.label ?? null)
+            : null;
+          return { id: d.id, ...data, location: locationLabel } as Record<string, unknown>;
+        })
+        .filter((d) => d['type'] === 'tournament')
+        .sort((a, b) => String(a['startISO'] ?? '').localeCompare(String(b['startISO'] ?? '')));
+      setScheduledGames(docs);
+    } catch (e) {
+      console.warn('[CoordinatorDashboard] fetchScheduledGames failed', e);
     }
   }, []);
 
@@ -257,6 +316,11 @@ export default function CoordinatorDashboardScreen() {
     if (teamData?.id) fetchGameRequests(teamData.id);
     else setGameRequests([]);
   }, [teamData?.id, fetchGameRequests]);
+
+  useEffect(() => {
+    if (teamData?.id) fetchScheduledGames(teamData.id);
+    else setScheduledGames([]);
+  }, [teamData?.id, fetchScheduledGames]);
 
   // ── Listen for game created events ────────────────────────────────────────
 
@@ -303,7 +367,7 @@ export default function CoordinatorDashboardScreen() {
     try {
       let awayTeamRating = 1500;
       if (req.requestingTeamId) {
-        const snap = await firestore().collection('teams').doc(req.requestingTeamId).get();
+        const snap = await getDoc(doc(db, 'teams', req.requestingTeamId));
         awayTeamRating = (snap.data()?.elo as number) ?? 1500;
       }
 
@@ -318,7 +382,7 @@ export default function CoordinatorDashboardScreen() {
         createdByName: req.requestedByName ?? user.displayName ?? '',
         createdByEmail: req.requestedByEmail ?? user.email ?? '',
         createdByRating: req.requestedByRating ?? null,
-        createdAt: firestore.FieldValue.serverTimestamp(),
+        createdAt: serverTimestamp(),
         opponentTeamId: req.requestingTeamId ?? null,
         opponentTeamName: req.requestingTeamName ?? null,
         homeTeamRating: teamData.elo ?? 1500,
@@ -378,13 +442,10 @@ export default function CoordinatorDashboardScreen() {
       });
 
       // Propagate teamName to pending requests
-      const reqSnap = await firestore()
-        .collection('requests')
-        .where('teamId', '==', teamData.id)
-        .get();
+      const reqSnap = await getDocs(query(collection(db, 'requests'), where('teamId', '==', teamData.id)));
       if (!reqSnap.empty) {
         await runBatch(
-          reqSnap.docs.map((d) => ({ op: 'update' as const, col: 'requests', id: d.id, data: { teamName: teamData.teamName } }))
+          reqSnap.docs.map((d: { id: string }) => ({ op: 'update' as const, col: 'requests', id: d.id, data: { teamName: teamData.teamName } }))
         );
       }
 
@@ -415,12 +476,8 @@ export default function CoordinatorDashboardScreen() {
       await updateDocNative('requests', request.id, { status: 'approved' });
 
       // Delete other pending requests for this team
-      const snap = await firestore()
-        .collection('requests')
-        .where('teamId', '==', request.teamId)
-        .where('status', '==', 'pending')
-        .get();
-      const others = snap.docs.filter((d) => d.id !== request.id);
+      const snap = await getDocs(query(collection(db, 'requests'), where('teamId', '==', request.teamId), where('status', '==', 'pending')));
+      const others = (snap.docs as Array<{ id: string }>).filter((d) => d.id !== request.id);
       if (others.length) {
         await runBatch(others.map((d) => ({ op: 'delete' as const, col: 'requests', id: d.id })));
       }
@@ -458,11 +515,7 @@ export default function CoordinatorDashboardScreen() {
   const handleLeaveTeam = async () => {
     if (!user?.uid || !teamData?.id) return;
     try {
-      const coordSnap = await firestore()
-        .collection('users')
-        .where('teamId', '==', teamData.id)
-        .where('isCoordinator', '==', true)
-        .get();
+      const coordSnap = await getDocs(query(collection(db, 'users'), where('teamId', '==', teamData.id), where('isCoordinator', '==', true)));
 
       if (coordSnap.size <= 1) {
         Toast.show({ type: 'info', text1: 'Cannot leave', text2: 'You are the last coordinator — delete the team instead.' });
@@ -540,6 +593,53 @@ export default function CoordinatorDashboardScreen() {
     );
   };
 
+  const handleToggleShareEmail = async (value: boolean) => {
+    if (!user?.uid || !teamData?.id) return;
+    setShareEmail(value);
+    try {
+      await updateDocNative('users', user.uid, { shareEmail: value });
+      // Mirror the contact info on the team doc so FindATeam can read it without
+      // querying the restricted users collection.
+      const contactKey = `coordinatorContacts.${user.uid}`;
+      if (value) {
+        const contactEntry: Record<string, string> = { email: user.email ?? '' };
+        if (user.displayName) contactEntry.name = user.displayName;
+        await updateDoc(doc(db, 'teams', teamData.id), { [contactKey]: contactEntry });
+      } else {
+        await updateDoc(doc(db, 'teams', teamData.id), { [contactKey]: deleteField() });
+      }
+      Toast.show({ type: 'success', text1: value ? 'Email visible to teams' : 'Email hidden from teams' });
+    } catch (e) {
+      console.error('[CoordinatorDashboard] toggleShareEmail failed', e);
+      setShareEmail(!value);
+      Toast.show({ type: 'error', text1: 'Failed to update setting' });
+    }
+  };
+
+  const openScheduledGame = async (game: ScheduledGame) => {
+    setSelectedScheduledGame(game);
+    setScheduledGameColors(null);
+    setScheduledGameModalVisible(true);
+    setLoadingGameColors(true);
+    try {
+      const [homeSnap, awaySnap] = await Promise.all([
+        game.teamId ? getDoc(doc(db, 'teams', game.teamId)) : Promise.resolve(null),
+        game.opponentTeamId ? getDoc(doc(db, 'teams', game.opponentTeamId)) : Promise.resolve(null),
+      ]);
+      const homeColor = (homeSnap?.data() as Record<string, unknown> | undefined)?.homeColor as string | undefined;
+      const awayColor = (awaySnap?.data() as Record<string, unknown> | undefined)?.awayColor as string | undefined;
+      setScheduledGameColors({
+        homeColor: homeColor ?? '#0a7ea4',
+        awayColor: awayColor ?? '#ffffff',
+      });
+    } catch (e) {
+      console.warn('[CoordinatorDashboard] failed to fetch team colours', e);
+      setScheduledGameColors({ homeColor: '#0a7ea4', awayColor: '#ffffff' });
+    } finally {
+      setLoadingGameColors(false);
+    }
+  };
+
   // ── Render helpers ─────────────────────────────────────────────────────────
 
   const Jersey = ({ color, label, onPress }: { color: string; label: string; onPress?: () => void }) => (
@@ -581,11 +681,16 @@ export default function CoordinatorDashboardScreen() {
 
   const PlacesComp = placesComponent;
 
-  const sections: Array<{ key: string; title: string; data: DashboardItem[] }> = [
-    { key: 'requests', title: 'Pending Coordinator Requests', data: requests as DashboardItem[] },
-    { key: 'gameRequests', title: 'Game Requests', data: gameRequests as DashboardItem[] },
-    { key: 'games', title: 'Created Game Events', data: games as DashboardItem[] },
-  ];
+  // ── Collapsible section header helper ─────────────────────────────────────
+  const SectionHeader = ({ sectionKey, title, count, extra }: { sectionKey: string; title: string; count?: number; extra?: React.ReactNode }) => (
+    <TouchableOpacity style={styles.sectionHeaderRow} onPress={() => toggleCollapse(sectionKey)} activeOpacity={0.7}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+        <Text style={styles.subtitle}>{title}{count != null ? ` (${count})` : ''}</Text>
+        {extra}
+      </View>
+      <Text style={styles.chevron}>{collapsed[sectionKey] ? '▶' : '▼'}</Text>
+    </TouchableOpacity>
+  );
 
   // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -640,144 +745,293 @@ export default function CoordinatorDashboardScreen() {
         </View>
       </Modal>
 
-      <SectionList
-        sections={sections}
-        keyExtractor={(item, index) => ((item as { id?: string })?.id ? String((item as { id: string }).id) : `${index}`)}
-        contentContainerStyle={styles.container}
-        stickySectionHeadersEnabled={false}
-        ListHeaderComponent={() => (
-          <>
-            <Text style={styles.title}>Coordinator Dashboard</Text>
+      {/* Scheduled game detail modal */}
+      <Modal
+        visible={scheduledGameModalVisible}
+        animationType="slide"
+        onRequestClose={() => { setScheduledGameModalVisible(false); setSelectedScheduledGame(null); }}
+      >
+        <View style={styles.modalContainer}>
+          <TouchableOpacity onPress={() => { setScheduledGameModalVisible(false); setSelectedScheduledGame(null); }} style={styles.modalCloseRow}>
+            <Text style={styles.modalCloseText}>✕ Close</Text>
+          </TouchableOpacity>
 
-            {ratingHistory.length > 1 && (
-              <View style={styles.chartContainer}>
-                <Text style={styles.chartTitle}>Rating History</Text>
-                <LineChart
-                  data={{
-                    labels: ratingHistory.map((_, i) => (i === 0 ? 'Start' : String(i))),
-                    datasets: [{ data: ratingHistory.map((d) => d.y) }],
-                  }}
-                  width={Dimensions.get('window').width - 40}
-                  height={220}
-                  chartConfig={{
-                    backgroundColor: '#ffffff',
-                    backgroundGradientFrom: '#f9f9f9',
-                    backgroundGradientTo: '#f9f9f9',
-                    decimalPlaces: 0,
-                    color: (opacity = 1) => `rgba(10, 126, 164, ${opacity})`,
-                    labelColor: (opacity = 1) => `rgba(0, 0, 0, ${opacity})`,
-                    propsForDots: { r: '4', strokeWidth: '2', stroke: '#0a7ea4' },
-                  }}
-                  bezier
-                  style={styles.chart}
-                />
-                <Text style={styles.chartSubtext}>
-                  Current: {Math.round(teamData?.elo ?? 1500)} | Games: {ratingHistory.length - 1}
-                </Text>
-              </View>
-            )}
+          {selectedScheduledGame && (
+            <>
+              <Text style={styles.modalTitle}>Match Details</Text>
 
-            <View style={styles.buttonRow}>
-              {!editing ? (
-                <TouchableOpacity
-                  style={styles.actionButton}
-                  onPress={() => { originalTeamRef.current = { ...teamData }; setEditing(true); }}
-                >
-                  <Text style={styles.buttonText}>Edit Team</Text>
-                </TouchableOpacity>
+              {/* Jersey row */}
+              {loadingGameColors ? (
+                <ActivityIndicator color="#0a7ea4" style={{ marginVertical: 24 }} />
               ) : (
-                <>
-                  <TouchableOpacity style={[styles.actionButton, saving && styles.buttonDisabled]} onPress={handleSaveTeam} disabled={saving}>
-                    <Text style={styles.buttonText}>{saving ? 'Saving...' : 'Save'}</Text>
-                  </TouchableOpacity>
-                  <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={handleCancelEdit}>
-                    <Text style={styles.buttonText}>Cancel</Text>
-                  </TouchableOpacity>
-                </>
+                <View style={styles.jerseyMatchRow}>
+                  <View style={styles.jerseyTeamCol}>
+                    <Jersey color={scheduledGameColors?.homeColor ?? '#0a7ea4'} label="" />
+                    <Text style={styles.jerseyTeamName} numberOfLines={2}>{selectedScheduledGame.teamName ?? 'Home Team'}</Text>
+                    <View style={[styles.homeAwayBadge, styles.homeBadge]}>
+                      <Text style={styles.homeAwayBadgeText}>HOME</Text>
+                    </View>
+                  </View>
+
+                  <Text style={styles.jerseyVs}>VS</Text>
+
+                  <View style={styles.jerseyTeamCol}>
+                    <Jersey color={scheduledGameColors?.awayColor ?? '#ffffff'} label="" />
+                    <Text style={styles.jerseyTeamName} numberOfLines={2}>{selectedScheduledGame.opponentTeamName ?? 'Away Team'}</Text>
+                    <View style={[styles.homeAwayBadge, styles.awayBadge]}>
+                      <Text style={styles.homeAwayBadgeText}>AWAY</Text>
+                    </View>
+                  </View>
+                </View>
               )}
-            </View>
 
-            <View style={styles.buttonRow}>
-              <TouchableOpacity style={[styles.actionButton, styles.successButton]} onPress={() => router.push('/(tabs)/GameResultsScreen')}>
-                <Text style={styles.buttonText}>Game Results</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.actionButton, styles.warningButton]} onPress={handleLeaveTeam}>
-                <Text style={styles.buttonText}>Leave Team</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={handleDeleteTeam}>
-                <Text style={styles.buttonText}>Delete Team</Text>
-              </TouchableOpacity>
-            </View>
+              {/* Details */}
+              <View style={styles.gameDetailSection}>
+                {selectedScheduledGame.startISO ? (
+                  <View style={styles.gameDetailRow}>
+                    <Text style={styles.gameDetailLabel}>📅 Date &amp; Time</Text>
+                    <Text style={styles.gameDetailValue}>
+                      {new Date(selectedScheduledGame.startISO).toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+                      {'\n'}
+                      {new Date(selectedScheduledGame.startISO).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </Text>
+                  </View>
+                ) : (
+                  <View style={styles.gameDetailRow}>
+                    <Text style={styles.gameDetailLabel}>📅 Date &amp; Time</Text>
+                    <Text style={[styles.gameDetailValue, { color: '#aaa', fontStyle: 'italic' }]}>To be confirmed</Text>
+                  </View>
+                )}
 
-            {editing ? (
-              <TextInput
-                style={styles.input}
-                value={teamData.teamName}
-                onChangeText={(text) => setTeamData((prev) => prev ? { ...prev, teamName: text } : prev)}
-                placeholder="Team Name"
-              />
-            ) : (
-              <>
-                <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
-                <Text style={[styles.readOnlyText, styles.ratingText]}>
-                  Rating: {Math.min(Math.max(teamData?.elo ?? 1500, 800), 3000)}
-                </Text>
-              </>
-            )}
+                {selectedScheduledGame.location ? (
+                  <View style={styles.gameDetailRow}>
+                    <Text style={styles.gameDetailLabel}>📍 Venue</Text>
+                    <Text style={styles.gameDetailValue}>{String(selectedScheduledGame.location)}</Text>
+                  </View>
+                ) : null}
 
-            {editing ? (
-              PlacesComp && GOOGLE_MAPS_API_KEY ? (
-                <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
-                  <PlacesComp
-                    ref={autocompleteRef}
-                    placeholder="Search ice rink..."
-                    fetchDetails
-                    debounce={400}
-                    nearbyPlacesAPI="GooglePlacesSearch"
-                    onPress={(data: { description: string }, details: { geometry: { location: { lat: number; lng: number } } } | null) => {
-                      const lat = details?.geometry?.location?.lat ?? 0;
-                      const lng = details?.geometry?.location?.lng ?? 0;
-                      setTeamData((prev) => prev ? { ...prev, location: data.description, latitude: lat, longitude: lng } : prev);
-                    }}
-                    query={{ key: GOOGLE_MAPS_API_KEY, language: 'en', types: 'establishment' }}
-                    styles={{ textInput: styles.input, container: styles.placesContainer }}
-                  />
-                </PlacesErrorBoundary>
-              ) : (
-                <TextInput
-                  style={styles.input}
-                  placeholder="Location (rink or arena)"
-                  value={teamData?.location ?? ''}
-                  onChangeText={(t) => setTeamData((prev) => prev ? { ...prev, location: t } : prev)}
-                />
-              )
-            ) : (
-              <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
-            )}
+                <View style={styles.gameDetailRow}>
+                  <Text style={styles.gameDetailLabel}>🏆 Tournament</Text>
+                  <Text style={styles.gameDetailValue}>
+                    {selectedScheduledGame.tournamentId ? 'View in Tournaments tab' : '—'}
+                  </Text>
+                </View>
 
-            <View style={styles.kitRow}>
-              <Jersey color={teamData.homeColor ?? '#0a7ea4'} label="Home" {...(editing ? { onPress: () => setActivePicker('home') } : {})} />
-              <Jersey color={teamData.awayColor ?? '#ffffff'} label="Away" {...(editing ? { onPress: () => setActivePicker('away') } : {})} />
-            </View>
-          </>
-        )}
-        renderSectionHeader={({ section }) => (
-          <View style={styles.sectionHeaderRow}>
-            <Text style={styles.subtitle}>{section.title}</Text>
-            {section.key === 'gameRequests' && (
-              <TouchableOpacity style={styles.smallButton} onPress={() => router.push('/(tabs)/GameSchedulerScreen')}>
-                <Text style={styles.buttonText}>Open Scheduler</Text>
-              </TouchableOpacity>
-            )}
+                <View style={styles.gameDetailRow}>
+                  <Text style={styles.gameDetailLabel}>📊 Status</Text>
+                  <Text style={styles.gameDetailValue}>{selectedScheduledGame.status ?? 'pending'}</Text>
+                </View>
+              </View>
+
+              {/* Colour legend */}
+              {!loadingGameColors && (
+                <View style={styles.colourLegend}>
+                  <View style={styles.colourSwatch}>
+                    <View style={[styles.swatchBox, { backgroundColor: scheduledGameColors?.homeColor ?? '#0a7ea4' }]} />
+                    <Text style={styles.colourSwatchLabel}>{selectedScheduledGame.teamName ?? 'Home'} home kit</Text>
+                  </View>
+                  <View style={styles.colourSwatch}>
+                    <View style={[styles.swatchBox, { backgroundColor: scheduledGameColors?.awayColor ?? '#ffffff', borderWidth: 1, borderColor: '#ccc' }]} />
+                    <Text style={styles.colourSwatchLabel}>{selectedScheduledGame.opponentTeamName ?? 'Away'} away kit</Text>
+                  </View>
+                </View>
+              )}
+
+              {selectedScheduledGame.tournamentId && (
+                <TouchableOpacity
+                  style={[styles.actionButton, styles.tournamentButton, { marginTop: 16 }]}
+                  onPress={() => {
+                    setScheduledGameModalVisible(false);
+                    router.push({ pathname: '/(tabs)/TournamentDetailScreen', params: { tournamentId: selectedScheduledGame.tournamentId } });
+                  }}
+                >
+                  <Text style={styles.buttonText}>View Tournament</Text>
+                </TouchableOpacity>
+              )}
+            </>
+          )}
+        </View>
+      </Modal>
+
+      <ScrollView contentContainerStyle={styles.container}>
+        <Text style={styles.title}>Coordinator Dashboard</Text>
+
+        {ratingHistory.length > 1 && (
+          <View style={styles.chartContainer}>
+            <Text style={styles.chartTitle}>Rating History</Text>
+            <LineChart
+              data={{
+                labels: ratingHistory.map((_, i) => (i === 0 ? 'Start' : String(i))),
+                datasets: [{ data: ratingHistory.map((d) => d.y) }],
+              }}
+              width={Dimensions.get('window').width - 40}
+              height={220}
+              chartConfig={{
+                backgroundColor: '#ffffff',
+                backgroundGradientFrom: '#f9f9f9',
+                backgroundGradientTo: '#f9f9f9',
+                decimalPlaces: 0,
+                color: (opacity = 1) => `rgba(10, 126, 164, ${opacity})`,
+                labelColor: (opacity = 1) => `rgba(0, 0, 0, ${opacity})`,
+                propsForDots: { r: '4', strokeWidth: '2', stroke: '#0a7ea4' },
+              }}
+              bezier
+              style={styles.chart}
+            />
+            <Text style={styles.chartSubtext}>
+              Current: {Math.round(teamData?.elo ?? 1500)} | Games: {ratingHistory.length - 1}
+            </Text>
           </View>
         )}
-        renderItem={({ item, section }) => {
-          if (!item) return null;
 
-          if (section.key === 'requests') {
-            const req = item as CoordinatorRequest;
-            return (
-              <View style={styles.requestCard}>
+        <View style={styles.buttonRow}>
+          {!editing ? (
+            <TouchableOpacity
+              style={styles.actionButton}
+              onPress={() => { originalTeamRef.current = { ...teamData }; setEditing(true); }}
+            >
+              <Text style={styles.buttonText}>Edit Team</Text>
+            </TouchableOpacity>
+          ) : (
+            <>
+              <TouchableOpacity style={[styles.actionButton, saving && styles.buttonDisabled]} onPress={handleSaveTeam} disabled={saving}>
+                <Text style={styles.buttonText}>{saving ? 'Saving...' : 'Save'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={handleCancelEdit}>
+                <Text style={styles.buttonText}>Cancel</Text>
+              </TouchableOpacity>
+            </>
+          )}
+        </View>
+
+        <View style={styles.buttonRow}>
+          <TouchableOpacity style={[styles.actionButton, styles.successButton]} onPress={() => router.push('/(tabs)/GameResultsScreen')}>
+            <Text style={styles.buttonText}>Game Results</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.actionButton, styles.tournamentButton]} onPress={() => router.push('/(tabs)/CreateTournamentScreen')}>
+            <Text style={styles.buttonText}>Create Tournament</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.buttonRow}>
+          <TouchableOpacity style={[styles.actionButton, styles.warningButton]} onPress={handleLeaveTeam}>
+            <Text style={styles.buttonText}>Leave Team</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={handleDeleteTeam}>
+            <Text style={styles.buttonText}>Delete Team</Text>
+          </TouchableOpacity>
+        </View>
+
+        {editing ? (
+          <TextInput
+            style={styles.input}
+            value={teamData.teamName}
+            onChangeText={(text) => setTeamData((prev) => prev ? { ...prev, teamName: text } : prev)}
+            placeholder="Team Name"
+          />
+        ) : (
+          <>
+            <Text style={styles.readOnlyText}>{teamData.teamName}</Text>
+            <Text style={[styles.readOnlyText, styles.ratingText]}>
+              Rating: {Math.min(Math.max(teamData?.elo ?? 1500, 800), 3000)}
+            </Text>
+          </>
+        )}
+
+        {editing ? (
+          PlacesComp && GOOGLE_MAPS_API_KEY ? (
+            <PlacesErrorBoundary onError={() => setPlacesComponent(null)}>
+              <PlacesComp
+                ref={autocompleteRef}
+                placeholder="Search ice rink..."
+                fetchDetails
+                debounce={400}
+                nearbyPlacesAPI="GooglePlacesSearch"
+                onPress={(data: { description: string }, details: { geometry: { location: { lat: number; lng: number } } } | null) => {
+                  const lat = details?.geometry?.location?.lat ?? 0;
+                  const lng = details?.geometry?.location?.lng ?? 0;
+                  setTeamData((prev) => prev ? { ...prev, location: data.description, latitude: lat, longitude: lng } : prev);
+                }}
+                query={{ key: GOOGLE_MAPS_API_KEY, language: 'en', types: 'establishment' }}
+                styles={{ textInput: styles.input, container: styles.placesContainer }}
+              />
+            </PlacesErrorBoundary>
+          ) : (
+            <TextInput
+              style={styles.input}
+              placeholder="Location (rink or arena)"
+              value={teamData?.location ?? ''}
+              onChangeText={(t) => setTeamData((prev) => prev ? { ...prev, location: t } : prev)}
+            />
+          )
+        ) : (
+          <Text style={styles.readOnlyText}>{teamData?.location ?? 'No location set'}</Text>
+        )}
+
+        <View style={styles.kitRow}>
+          <Jersey color={teamData.homeColor ?? '#0a7ea4'} label="Home" {...(editing ? { onPress: () => setActivePicker('home') } : {})} />
+          <Jersey color={teamData.awayColor ?? '#ffffff'} label="Away" {...(editing ? { onPress: () => setActivePicker('away') } : {})} />
+        </View>
+
+        <View style={styles.settingRow}>
+          <View style={styles.settingTextCol}>
+            <Text style={styles.settingLabel}>Share my email as a contact</Text>
+            <Text style={styles.settingHint}>Prospective players can see your email when browsing this team</Text>
+          </View>
+          <Switch
+            value={shareEmail}
+            onValueChange={handleToggleShareEmail}
+            trackColor={{ false: '#ccc', true: '#0a7ea4' }}
+            thumbColor={shareEmail ? '#fff' : '#f4f3f4'}
+          />
+        </View>
+
+        {/* ── Game Requests ─────────────────────────────────────────── */}
+        <SectionHeader sectionKey="gameRequests" title="Game Requests" count={gameRequests.length}
+          extra={
+            <TouchableOpacity style={[styles.smallButton, { marginLeft: 8 }]} onPress={() => router.push('/(tabs)/GameSchedulerScreen')}>
+              <Text style={styles.buttonText}>Scheduler</Text>
+            </TouchableOpacity>
+          }
+        />
+        {!collapsed.gameRequests && (
+          gameRequests.length === 0
+            ? <Text style={styles.emptySection}>No game requests</Text>
+            : gameRequests.map((req) => (
+              <TouchableOpacity key={req.id} style={styles.requestCard} onPress={() => { setSelectedGameRequest(req); setRequestModalVisible(true); }}>
+                <Text style={styles.cardTitle}>Game Request — {req.requestingTeamName ?? req.requestingTeamId ?? 'Unknown'}</Text>
+                <Text style={styles.cardSubtitle}>
+                  {req.startISO ? new Date(req.startISO).toLocaleString() : 'No time'} • {(req.type ?? 'home').toUpperCase()}
+                </Text>
+              </TouchableOpacity>
+            ))
+        )}
+
+        {/* ── Created Game Events ───────────────────────────────────── */}
+        <SectionHeader sectionKey="games" title="Created Game Events" count={games.length} />
+        {!collapsed.games && (
+          games.length === 0
+            ? <Text style={styles.emptySection}>No game events created yet</Text>
+            : (games as Record<string, unknown>[]).map((game) => (
+              <View key={String(game.id)} style={styles.requestCard}>
+                <Text style={styles.cardTitle}>{String(game.title ?? 'Game')} — {String(game.type ?? '').toUpperCase() || 'N/A'}</Text>
+                <Text>{game.startISO ? new Date(String(game.startISO)).toLocaleString() : 'No time set'}</Text>
+                <View style={styles.cardActions}>
+                  <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={() => game.id && handleDeleteGame(String(game.id))}>
+                    <Text style={styles.buttonText}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ))
+        )}
+
+        {/* ── Coordinator Requests ──────────────────────────────────── */}
+        <SectionHeader sectionKey="requests" title="Coordinator Requests" count={requests.length} />
+        {!collapsed.requests && (
+          requests.length === 0
+            ? <Text style={styles.emptySection}>No pending coordinator requests</Text>
+            : requests.map((req) => (
+              <View key={req.id} style={styles.requestCard}>
                 <Text style={styles.requestEmail}>{req.userEmail}</Text>
                 <View style={styles.requestButtons}>
                   <TouchableOpacity style={[styles.actionButton, { flex: 1 }]} onPress={() => handleApproveCoordinatorRequest(req)}>
@@ -788,46 +1042,49 @@ export default function CoordinatorDashboardScreen() {
                   </TouchableOpacity>
                 </View>
               </View>
-            );
-          }
+            ))
+        )}
 
-          if (section.key === 'gameRequests') {
-            const req = item as GameRequest;
-            return (
-              <TouchableOpacity style={styles.requestCard} onPress={() => { setSelectedGameRequest(req); setRequestModalVisible(true); }}>
-                <Text style={styles.cardTitle}>Game Request — {req.requestingTeamName ?? req.requestingTeamId ?? 'Unknown'}</Text>
-                <Text style={styles.cardSubtitle}>
-                  {req.startISO ? new Date(req.startISO).toLocaleString() : 'No time'} • {(req.type ?? 'home').toUpperCase()}
-                </Text>
-              </TouchableOpacity>
-            );
-          }
+        {/* ── Scheduled Games (tournament) ──────────────────────────── */}
+        <SectionHeader sectionKey="scheduledGames" title="Scheduled Games" count={scheduledGames.length} />
+        {!collapsed.scheduledGames && (
+          scheduledGames.length === 0
+            ? <Text style={styles.emptySection}>No scheduled tournament games</Text>
+            : scheduledGames.map((game) => {
+              const sg = game as unknown as ScheduledGame;
+              const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+              const gameDate = sg.startISO ? new Date(sg.startISO) : null;
+              const gameId = sg.id ?? '';
+              const gameTitle = sg.title ?? `${sg.teamName ?? ''} vs ${sg.opponentTeamName ?? 'TBD'}`;
+              const opponent = sg.opponentTeamName ?? null;
+              const location = sg.location ?? null;
+              const dayName = gameDate ? (dayNames[gameDate.getDay()] ?? '') : '';
+              return (
+                <TouchableOpacity key={gameId} style={[styles.requestCard, styles.scheduledGameCard]} onPress={() => openScheduledGame(sg)} activeOpacity={0.75}>
+                  <View style={styles.scheduledGameHeader}>
+                    <Text style={styles.cardTitle}>{gameTitle}</Text>
+                    <View style={styles.tournamentBadge}>
+                      <Text style={styles.tournamentBadgeText}>Tournament</Text>
+                    </View>
+                  </View>
+                  <Text style={styles.cardSubtitle}>
+                    {gameDate
+                      ? `${dayName} ${gameDate.toLocaleDateString()} · ${gameDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+                      : 'Date TBC'}
+                  </Text>
+                  {opponent && (
+                    <Text style={styles.cardSubtitle}>vs {opponent}</Text>
+                  )}
+                  {location && (
+                    <Text style={[styles.cardSubtitle, { color: '#888' }]}>📍 {location}</Text>
+                  )}
+                  <Text style={styles.tapHint}>Tap for details →</Text>
+                </TouchableOpacity>
+              );
+            })
+        )}
 
-          if (section.key === 'games') {
-            const game = item as unknown as Record<string, unknown>;
-            return (
-              <View style={styles.requestCard}>
-                <Text style={styles.cardTitle}>{String(game.title ?? 'Game')} — {String(game.type ?? '').toUpperCase() || 'N/A'}</Text>
-                <Text>{game.startISO ? new Date(String(game.startISO)).toLocaleString() : 'No time set'}</Text>
-                <View style={styles.cardActions}>
-                  <TouchableOpacity style={[styles.actionButton, styles.dangerButton]} onPress={() => game.id && handleDeleteGame(String(game.id))}>
-                    <Text style={styles.buttonText}>Delete</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            );
-          }
-
-          return null;
-        }}
-        renderSectionFooter={({ section }) => {
-          if (!section?.data?.length) {
-            if (section.key === 'requests') return <Text style={styles.emptySection}>No pending coordinator requests</Text>;
-            if (section.key === 'gameRequests') return <Text style={styles.emptySection}>No game requests</Text>;
-          }
-          return null;
-        }}
-      />
+      </ScrollView>
     </>
   );
 }
@@ -841,7 +1098,32 @@ const styles = StyleSheet.create({
   container: { flexGrow: 1, padding: 20, backgroundColor: '#fff' },
   title: { fontSize: 26, fontWeight: 'bold', textAlign: 'center', marginBottom: 20, color: '#0a7ea4' },
   subtitle: { fontSize: 18, fontWeight: '600', marginVertical: 12, color: '#0a7ea4' },
-  sectionHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 },
+  sectionHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 8, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: '#e8e8e8' },
+  chevron: { fontSize: 14, color: '#0a7ea4', fontWeight: '700', paddingLeft: 8 },
+  scheduledGameCard: { backgroundColor: '#f0f7ff', borderColor: '#b3d4f5' },
+  scheduledGameHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 },
+  tournamentBadge: { backgroundColor: '#7c3aed', borderRadius: 6, paddingHorizontal: 8, paddingVertical: 2 },
+  tournamentBadgeText: { color: '#fff', fontSize: 11, fontWeight: '600' },
+  tapHint: { fontSize: 11, color: '#0a7ea4', marginTop: 6, textAlign: 'right' },
+  // Scheduled game detail modal
+  modalCloseRow: { alignSelf: 'flex-start', paddingBottom: 8 },
+  modalCloseText: { color: '#0a7ea4', fontSize: 15, fontWeight: '600' },
+  jerseyMatchRow: { flexDirection: 'row', alignItems: 'flex-start', justifyContent: 'space-around', marginVertical: 20 },
+  jerseyTeamCol: { alignItems: 'center', flex: 1 },
+  jerseyTeamName: { fontSize: 13, fontWeight: '700', color: '#111', textAlign: 'center', marginTop: 6, maxWidth: 110 },
+  jerseyVs: { fontSize: 22, fontWeight: '900', color: '#0a7ea4', alignSelf: 'center', paddingHorizontal: 8 },
+  homeAwayBadge: { marginTop: 6, borderRadius: 6, paddingHorizontal: 10, paddingVertical: 3 },
+  homeBadge: { backgroundColor: '#0a7ea4' },
+  awayBadge: { backgroundColor: '#555' },
+  homeAwayBadgeText: { color: '#fff', fontSize: 11, fontWeight: '700' },
+  gameDetailSection: { borderTopWidth: 1, borderTopColor: '#eee', marginTop: 8, paddingTop: 12 },
+  gameDetailRow: { flexDirection: 'row', justifyContent: 'space-between', paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: '#f4f4f4' },
+  gameDetailLabel: { fontSize: 13, color: '#888', fontWeight: '600', flex: 1 },
+  gameDetailValue: { fontSize: 13, color: '#111', fontWeight: '500', flex: 2, textAlign: 'right' },
+  colourLegend: { flexDirection: 'row', justifyContent: 'space-around', marginTop: 20, padding: 12, backgroundColor: '#f9f9f9', borderRadius: 10, borderWidth: 1, borderColor: '#eee' },
+  colourSwatch: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  swatchBox: { width: 22, height: 22, borderRadius: 4 },
+  colourSwatchLabel: { fontSize: 12, color: '#555' },
   input: { borderWidth: 1, borderColor: '#ccc', padding: 10, marginBottom: 10, borderRadius: 6 },
   readOnlyText: { borderWidth: 1, borderColor: '#ddd', padding: 10, marginBottom: 10, borderRadius: 6, backgroundColor: '#f9f9f9', color: '#333', fontSize: 16 },
   ratingText: { marginTop: 4, fontSize: 14 },
@@ -857,6 +1139,7 @@ const styles = StyleSheet.create({
   dangerButton: { backgroundColor: '#FF3B30' },
   warningButton: { backgroundColor: '#FF9500' },
   successButton: { backgroundColor: '#4CAF50' },
+  tournamentButton: { backgroundColor: '#7c3aed' },
   secondaryButton: { backgroundColor: '#444' },
   buttonDisabled: { opacity: 0.6 },
   buttonText: { color: '#fff', fontWeight: '600', fontSize: 14 },
@@ -872,6 +1155,10 @@ const styles = StyleSheet.create({
   modalGameTitle: { fontSize: 18, fontWeight: '700', marginBottom: 8 },
   modalActions: { flexDirection: 'row', gap: 8, marginTop: 16 },
   placesContainer: { marginBottom: 10 },
+  settingRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderColor: '#e0e0e0', borderRadius: 8, padding: 12, marginBottom: 16, backgroundColor: '#f9f9f9' },
+  settingTextCol: { flex: 1, marginRight: 12 },
+  settingLabel: { fontSize: 15, fontWeight: '600', color: '#333' },
+  settingHint: { fontSize: 12, color: '#777', marginTop: 2 },
   chartContainer: { marginBottom: 20, paddingVertical: 16, paddingHorizontal: 8, backgroundColor: '#f9f9f9', borderRadius: 12, borderWidth: 1, borderColor: '#e0e0e0' },
   chartTitle: { fontSize: 18, fontWeight: '700', color: '#0a7ea4', marginBottom: 8, textAlign: 'center' },
   chartSubtext: { fontSize: 12, color: '#666', textAlign: 'center', marginTop: 8 },
